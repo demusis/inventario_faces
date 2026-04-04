@@ -23,13 +23,17 @@ from inventario_faces.domain.entities import (
     FaceCluster,
     FaceOccurrence,
     FaceSizeStatistics,
+    FaceTrack,
     FileRecord,
     InventoryResult,
+    KeyFrame,
     MediaInfoAttribute,
     MediaInfoTrack,
     MediaType,
     ProcessingSummary,
     ReportArtifacts,
+    SearchArtifacts,
+    TrackQualityStatistics,
 )
 from inventario_faces.reporting.docx_renderer import DocxReportGenerator
 
@@ -55,7 +59,17 @@ class DocxReportGeneratorTests(unittest.TestCase):
             self.assertIn("Resumo Executivo", full_text)
             self.assertIn("Metodologia", full_text)
             self.assertIn("Anexo técnico", full_text)
-            self.assertIn("aplicação de código aberto", full_text)
+            self.assertIn("Metadados técnicos da mídia", full_text)
+            self.assertIn("Estatísticas de tamanho das faces", full_text)
+            self.assertLess(
+                full_text.index("Estatísticas de tamanho das faces"),
+                full_text.index("Anexo técnico"),
+            )
+            self.assertNotIn("Quadro consolidado de relações intergrupos para revisão", full_text)
+            self.assertNotIn("Galeria Visual por Grupo", full_text)
+            self.assertIn("Inventario Faces", full_text)
+            self.assertIn("Emitido em", full_text)
+            self.assertIn("Acesso em: 4 abr. 2026.", full_text)
             self.assertIn("https://github.com/demusis/inventario_faces", full_text)
 
     def _config(self) -> AppConfig:
@@ -90,7 +104,6 @@ class DocxReportGeneratorTests(unittest.TestCase):
                 min_cluster_size=1,
             ),
             reporting=ReportingSettings(
-                max_gallery_faces_per_group=4,
                 compile_pdf=False,
             ),
             forensics=ForensicsSettings(
@@ -113,11 +126,54 @@ class DocxReportGeneratorTests(unittest.TestCase):
             crop_path=None,
             context_image_path=None,
             cluster_id="I001",
+            track_id="T000001",
         )
         cluster = FaceCluster(
             cluster_id="I001",
+            track_ids=["T000001"],
             occurrence_ids=["O000001"],
             centroid_embedding=[1.0, 0.0, 0.0],
+        )
+        track = FaceTrack(
+            track_id="T000001",
+            source_path=Path("evidencia.mp4"),
+            video_path=Path("evidencia.mp4"),
+            media_type=MediaType.VIDEO,
+            sha512="a" * 128,
+            start_frame=10,
+            end_frame=10,
+            start_time=10.0,
+            end_time=10.0,
+            occurrence_ids=["O000001"],
+            keyframe_ids=["K000001"],
+            representative_embeddings=[[1.0, 0.0, 0.0]],
+            average_embedding=[1.0, 0.0, 0.0],
+            best_occurrence_id="O000001",
+            quality_statistics=TrackQualityStatistics(
+                total_detections=1,
+                keyframe_count=1,
+                mean_detection_score=0.83,
+                max_detection_score=0.83,
+                mean_quality_score=0.80,
+                best_quality_score=0.80,
+                mean_sharpness=0.70,
+                mean_brightness=0.55,
+                mean_illumination=0.90,
+                mean_frontality=0.88,
+                duration_seconds=0.0,
+            ),
+            cluster_id="I001",
+        )
+        keyframe = KeyFrame(
+            keyframe_id="K000001",
+            track_id="T000001",
+            occurrence_id="O000001",
+            source_path=Path("evidencia.mp4"),
+            frame_index=10,
+            timestamp_seconds=10.0,
+            selection_reasons=("track_start", "quality_peak"),
+            detection_score=0.83,
+            embedding=[1.0, 0.0, 0.0],
         )
         file_record = FileRecord(
             path=Path("evidencia.mp4"),
@@ -144,6 +200,8 @@ class DocxReportGeneratorTests(unittest.TestCase):
             total_occurrences=1,
             total_clusters=1,
             probable_match_pairs=0,
+            total_tracks=1,
+            total_keyframes=1,
             total_detected_face_sizes=FaceSizeStatistics(count=1, min_pixels=50, max_pixels=50, mean_pixels=50, stddev_pixels=0),
             selected_face_sizes=FaceSizeStatistics(count=1, min_pixels=50, max_pixels=50, mean_pixels=50, stddev_pixels=0),
         )
@@ -159,6 +217,17 @@ class DocxReportGeneratorTests(unittest.TestCase):
             summary=summary,
             logs_directory=logs_dir,
             manifest_path=root / "inventory" / "manifest.json",
+            tracks=[track],
+            keyframes=[keyframe],
+            search=SearchArtifacts(
+                engine="numpy",
+                track_index_path=None,
+                track_metadata_path=None,
+                cluster_index_path=None,
+                cluster_metadata_path=None,
+                track_vector_count=1,
+                cluster_vector_count=1,
+            ),
         )
 
 

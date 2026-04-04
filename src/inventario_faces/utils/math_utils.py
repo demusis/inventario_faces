@@ -4,6 +4,8 @@ from typing import Iterable
 
 import numpy as np
 
+from inventario_faces.domain.entities import BoundingBox
+
 
 def l2_normalize(vector: Iterable[float]) -> list[float]:
     array = np.asarray(list(vector), dtype=np.float32)
@@ -30,3 +32,32 @@ def average_embeddings(embeddings: Iterable[Iterable[float]]) -> list[float]:
     matrix = np.vstack(rows)
     centroid = matrix.mean(axis=0)
     return l2_normalize(centroid.tolist())
+
+
+def bbox_iou(left: BoundingBox, right: BoundingBox) -> float:
+    x1 = max(left.x1, right.x1)
+    y1 = max(left.y1, right.y1)
+    x2 = min(left.x2, right.x2)
+    y2 = min(left.y2, right.y2)
+    intersection_width = max(0.0, x2 - x1)
+    intersection_height = max(0.0, y2 - y1)
+    intersection = intersection_width * intersection_height
+    union = left.area + right.area - intersection
+    if union <= 0.0:
+        return 0.0
+    return float(intersection / union)
+
+
+def normalized_center_distance(
+    left: BoundingBox,
+    right: BoundingBox,
+    frame_width: float,
+    frame_height: float,
+) -> float:
+    left_x, left_y = left.center
+    right_x, right_y = right.center
+    diagonal = float((frame_width ** 2 + frame_height ** 2) ** 0.5)
+    if diagonal == 0.0:
+        return 1.0
+    distance = float(((left_x - right_x) ** 2 + (left_y - right_y) ** 2) ** 0.5)
+    return distance / diagonal

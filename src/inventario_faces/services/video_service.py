@@ -29,6 +29,7 @@ class VideoService:
             frame_index=None,
             timestamp_seconds=None,
             bgr_pixels=image,
+            original_bgr_pixels=image,
         )
 
     def sample_video(self, path: Path) -> Iterator[SampledFrame]:
@@ -60,6 +61,7 @@ class VideoService:
                     frame_index=frame_index,
                     timestamp_seconds=timestamp,
                     bgr_pixels=frame,
+                    original_bgr_pixels=frame,
                 )
         finally:
             capture.release()

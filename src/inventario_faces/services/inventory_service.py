@@ -2,23 +2,29 @@ from __future__ import annotations
 
 import logging
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import replace
 from pathlib import Path
 from typing import Callable
 
 from inventario_faces.domain.config import AppConfig
 from inventario_faces.domain.entities import (
-    FaceSizeStatistics,
+    FaceSearchMatch,
+    FaceSearchQuery,
+    FaceSearchResult,
+    FaceSearchSummary,
     FaceOccurrence,
+    FaceSizeStatistics,
+    FaceTrack,
     FileRecord,
     InventoryResult,
+    KeyFrame,
     MediaType,
     ProcessingSummary,
     ReportArtifacts,
-    SampledFrame,
 )
 from inventario_faces.domain.protocols import (
     FaceAnalyzer,
+    FaceSearchReportGenerator,
     LogCallback,
     MediaInfoExtractor,
     ProgressCallback,
@@ -31,21 +37,16 @@ from inventario_faces.infrastructure.logging_setup import (
     close_file_logger,
 )
 from inventario_faces.services.clustering_service import ClusteringService
+from inventario_faces.services.enhancement_service import EnhancementService
 from inventario_faces.services.export_service import ExportService
 from inventario_faces.services.hashing_service import HashingService
+from inventario_faces.services.quality_service import FaceQualityService
 from inventario_faces.services.scanner_service import ScannerService
+from inventario_faces.services.search_service import SearchIndexService
+from inventario_faces.services.tracking_service import FaceTrackingService, TrackingResult
 from inventario_faces.services.video_service import VideoService
 from inventario_faces.utils.path_utils import ensure_directory
 from inventario_faces.utils.time_utils import as_utc, utc_now
-
-
-@dataclass(frozen=True)
-class FrameProcessingSummary:
-    raw_detection_count: int
-    selected_detection_count: int
-    raw_face_sizes: tuple[float, ...]
-    selected_face_sizes: tuple[float, ...]
-    occurrence_ids: tuple[str, ...]
 
 
 class InventoryService:
@@ -59,6 +60,9 @@ class InventoryService:
         report_generator: ReportGenerator,
         face_analyzer_factory: Callable[[], FaceAnalyzer],
         media_info_extractor: MediaInfoExtractor | None = None,
+        tracking_service: FaceTrackingService | None = None,
+        search_service: SearchIndexService | None = None,
+        face_search_report_generator: FaceSearchReportGenerator | None = None,
     ) -> None:
         self._config = config
         self._scanner_service = scanner_service
@@ -68,6 +72,13 @@ class InventoryService:
         self._report_generator = report_generator
         self._face_analyzer_factory = face_analyzer_factory
         self._media_info_extractor = media_info_extractor
+        self._tracking_service = tracking_service or FaceTrackingService(
+            config=config,
+            enhancement_service=EnhancementService(config.enhancement),
+            quality_service=FaceQualityService(),
+        )
+        self._search_service = search_service or SearchIndexService(config.search)
+        self._face_search_report_generator = face_search_report_generator
 
     def run(
         self,
@@ -98,32 +109,12 @@ class InventoryService:
             self._emit_progress(progress_callback, 0, total_files, "Inicializando analise")
             self._emit_log(text_logger, log_callback, f"Diretorio analisado: {root_directory}")
             self._emit_log(text_logger, log_callback, f"Diretorio de execucao: {run_directory}")
-            self._emit_log(text_logger, log_callback, f"Diretorio de logs: {logs_directory}")
-            self._emit_log(
-                text_logger,
-                log_callback,
-                "Modo de processamento em fluxo ativado para reduzir uso de memoria em acervos extensos.",
-            )
-            self._emit_log(
-                text_logger,
-                log_callback,
-                (
-                    "Varredura concluida: "
-                    f"{total_files} arquivos localizados "
-                    f"({media_counter[MediaType.IMAGE]} imagens, "
-                    f"{media_counter[MediaType.VIDEO]} videos, "
-                    f"{media_counter[MediaType.OTHER]} outros formatos)."
-                ),
-            )
-            self._emit_log(
-                text_logger,
-                log_callback,
-                "Inicializando mecanismo facial e carregando configuracao operacional.",
-            )
+            self._emit_log(text_logger, log_callback, "Pipeline orientado a tracks ativado.")
             analyzer = self._face_analyzer_factory()
             providers = list(getattr(analyzer, "providers", []))
             for line in self._configuration_log_lines(providers):
                 self._emit_log(text_logger, log_callback, line)
+
             event_logger.write(
                 "run_started",
                 root_directory=root_directory,
@@ -132,12 +123,14 @@ class InventoryService:
                 image_files=media_counter[MediaType.IMAGE],
                 video_files=media_counter[MediaType.VIDEO],
                 other_files=media_counter[MediaType.OTHER],
-                providers=providers,
                 configuration=self._config,
+                providers=providers,
             )
 
             file_records: list[FileRecord] = []
             occurrences: list[FaceOccurrence] = []
+            tracks: list[FaceTrack] = []
+            keyframes: list[KeyFrame] = []
             total_detected_face_sizes: list[float] = []
             selected_face_sizes: list[float] = []
 
@@ -158,136 +151,68 @@ class InventoryService:
                     log_callback,
                     f"{file_prefix} Inicio do processamento | tipo={self._media_type_label(media_type)} | caminho={file_path}",
                 )
-                if len(str(file_path)) >= 240:
-                    self._emit_log(
-                        text_logger,
-                        log_callback,
-                        f"{file_prefix} Caminho extenso detectado; rotinas de leitura robusta para Windows foram habilitadas.",
-                    )
 
                 discovered_at_utc = utc_now()
                 sha512 = self._hashing_service.sha512(file_path)
                 stat = file_path.stat()
                 modified_at_utc = as_utc(stat.st_mtime)
                 processing_error: str | None = None
-                media_info_error: str | None = None
                 media_info_tracks = ()
-                initial_occurrence_count = len(occurrences)
-
-                self._emit_log(
-                    text_logger,
-                    log_callback,
-                    (
-                        f"{file_prefix} Hash SHA-512 calculado | "
-                        f"tamanho={self._format_size_bytes(stat.st_size)} | "
-                        f"alteracao={modified_at_utc.isoformat() if modified_at_utc else '-'} | "
-                        f"hash={self._short_hash(sha512)}"
-                    ),
-                )
+                media_info_error: str | None = None
 
                 if media_type in {MediaType.IMAGE, MediaType.VIDEO}:
                     media_info_tracks, media_info_error = self._extract_media_info(file_path)
-                    if media_info_tracks:
-                        self._emit_log(
-                            text_logger,
-                            log_callback,
-                            (
-                                f"{file_prefix} MediaInfo extraido | "
-                                f"fluxos={len(media_info_tracks)}"
-                            ),
-                        )
-                    elif media_info_error:
-                        self._emit_log(
-                            text_logger,
-                            log_callback,
-                            f"{file_prefix} MediaInfo indisponivel | motivo={media_info_error}",
-                        )
 
                 try:
+                    tracking_result: TrackingResult | None = None
                     if media_type == MediaType.IMAGE:
-                        frame_summary = self._process_frame(
-                            analyzer=analyzer,
-                            frame=self._media_service.load_image(file_path),
+                        tracking_result = self._tracking_service.process_media(
+                            source_path=file_path,
                             sha512=sha512,
                             media_type=media_type,
-                            occurrences=occurrences,
+                            frames=[self._media_service.load_image(file_path)],
+                            analyzer=analyzer,
                             artifact_store=artifact_store,
-                            event_logger=event_logger,
-                            logger=text_logger,
-                            log_callback=log_callback,
-                            file_prefix=file_prefix,
+                            id_namespace=f"{index:04d}",
+                            event_callback=lambda event, fields: event_logger.write(event, **fields),
+                            text_callback=lambda message: self._emit_log(text_logger, log_callback, message),
                         )
-                        self._emit_log(
-                            text_logger,
-                            log_callback,
-                            (
-                                f"{file_prefix} Imagem analisada | "
-                                f"faces detectadas={frame_summary.raw_detection_count} | "
-                                f"faces selecionadas={frame_summary.selected_detection_count}"
-                            ),
-                        )
-                        total_detected_face_sizes.extend(frame_summary.raw_face_sizes)
-                        selected_face_sizes.extend(frame_summary.selected_face_sizes)
                     elif media_type == MediaType.VIDEO:
+                        tracking_result = self._tracking_service.process_media(
+                            source_path=file_path,
+                            sha512=sha512,
+                            media_type=media_type,
+                            frames=self._media_service.sample_video(file_path),
+                            analyzer=analyzer,
+                            artifact_store=artifact_store,
+                            id_namespace=f"{index:04d}",
+                            event_callback=lambda event, fields: event_logger.write(event, **fields),
+                            text_callback=lambda message: self._emit_log(text_logger, log_callback, message),
+                        )
+
+                    if tracking_result is not None:
+                        occurrences.extend(tracking_result.occurrences)
+                        tracks.extend(tracking_result.tracks)
+                        keyframes.extend(tracking_result.keyframes)
+                        total_detected_face_sizes.extend(tracking_result.raw_face_sizes)
+                        selected_face_sizes.extend(tracking_result.selected_face_sizes)
                         self._emit_log(
                             text_logger,
                             log_callback,
                             (
-                                f"{file_prefix} Video identificado | "
-                                f"intervalo de amostragem={self._config.video.sampling_interval_seconds:.2f}s | "
-                                f"limite de quadros="
-                                f"{self._config.video.max_frames_per_video if self._config.video.max_frames_per_video is not None else 'sem limite'}"
+                                f"{file_prefix} Midia analisada | "
+                                f"deteccoes={tracking_result.raw_detection_count} | "
+                                f"selecionadas={tracking_result.selected_detection_count} | "
+                                f"tracks={len(tracking_result.tracks)} | "
+                                f"keyframes={len(tracking_result.keyframes)} | "
+                                f"embeddings_calculados={tracking_result.embedded_detection_count}"
                             ),
                         )
-                        sampled_frames = 0
-                        frames_with_faces = 0
-                        detected_faces = 0
-                        selected_faces = 0
-                        for frame in self._media_service.sample_video(file_path):
-                            sampled_frames += 1
-                            self._emit_progress(
-                                progress_callback,
-                                index - 1,
-                                total_files,
-                                f"Processando {file_path.name} | quadro amostrado {sampled_frames}",
-                            )
-                            frame_summary = self._process_frame(
-                                analyzer=analyzer,
-                                frame=frame,
-                                sha512=sha512,
-                                media_type=media_type,
-                                occurrences=occurrences,
-                                artifact_store=artifact_store,
-                                event_logger=event_logger,
-                                logger=text_logger,
-                                log_callback=log_callback,
-                                file_prefix=file_prefix,
-                            )
-                            total_detected_face_sizes.extend(frame_summary.raw_face_sizes)
-                            selected_face_sizes.extend(frame_summary.selected_face_sizes)
-                            detected_faces += frame_summary.raw_detection_count
-                            selected_faces += frame_summary.selected_detection_count
-                            if frame_summary.selected_detection_count > 0:
-                                frames_with_faces += 1
+                    elif media_type == MediaType.OTHER:
                         self._emit_log(
                             text_logger,
                             log_callback,
-                            (
-                                f"{file_prefix} Video analisado | "
-                                f"quadros amostrados={sampled_frames} | "
-                                f"quadros com faces={frames_with_faces} | "
-                                f"faces detectadas={detected_faces} | "
-                                f"faces selecionadas={selected_faces}"
-                            ),
-                        )
-                    else:
-                        self._emit_log(
-                            text_logger,
-                            log_callback,
-                            (
-                                f"{file_prefix} Arquivo fora do escopo da analise facial. "
-                                "O item foi mantido apenas no inventario forense."
-                            ),
+                            f"{file_prefix} Arquivo fora do escopo da analise facial.",
                         )
 
                     event_logger.write(
@@ -296,26 +221,17 @@ class InventoryService:
                         media_type=media_type,
                         sha512=sha512,
                         size_bytes=stat.st_size,
-                        occurrences_generated=len(occurrences) - initial_occurrence_count,
                         media_info_tracks=media_info_tracks,
                         media_info_error=media_info_error,
                     )
-                    self._emit_log(
-                        text_logger,
-                        log_callback,
-                        (
-                            f"{file_prefix} Processamento concluido | "
-                            f"novas ocorrencias={len(occurrences) - initial_occurrence_count}"
-                        ),
-                    )
                 except Exception as exc:
                     processing_error = str(exc)
+                    text_logger.exception("Falha ao processar %s", file_path)
                     self._emit_log(
                         text_logger,
                         log_callback,
                         f"{file_prefix} Erro de processamento: {processing_error}",
                     )
-                    text_logger.exception("Falha ao processar %s", file_path)
                     event_logger.write(
                         "file_processing_error",
                         path=file_path,
@@ -344,35 +260,23 @@ class InventoryService:
             self._emit_log(
                 text_logger,
                 log_callback,
-                f"[Agrupamento] Iniciando consolidacao de {len(occurrences)} ocorrencias faciais em possiveis individuos.",
+                f"[Agrupamento] Consolidando {len(tracks)} tracks em possiveis grupos.",
             )
-            clusters = self._clustering_service.cluster(occurrences)
+            clusters = self._clustering_service.cluster(tracks)
+            self._propagate_cluster_membership(occurrences, tracks)
+            search_artifacts = self._search_service.build(run_directory, tracks, clusters)
+
             finished_at_utc = utc_now()
-            summary = self._build_summary(file_records, occurrences, clusters, total_detected_face_sizes, selected_face_sizes)
-            self._emit_log(
-                text_logger,
-                log_callback,
-                (
-                    f"[Agrupamento] Concluido | possiveis individuos={summary.total_clusters} | "
-                    f"pares possivelmente correlatos={summary.probable_match_pairs}"
-                ),
+            summary = self._build_summary(
+                file_records=file_records,
+                occurrences=occurrences,
+                tracks=tracks,
+                keyframes=keyframes,
+                clusters=clusters,
+                total_detected_face_sizes=total_detected_face_sizes,
+                selected_face_sizes=selected_face_sizes,
             )
-            self._emit_log(
-                text_logger,
-                log_callback,
-                self._face_size_statistics_log_line(
-                    "Faces detectadas antes dos filtros",
-                    summary.total_detected_face_sizes,
-                ),
-            )
-            self._emit_log(
-                text_logger,
-                log_callback,
-                self._face_size_statistics_log_line(
-                    "Faces selecionadas apos os filtros",
-                    summary.selected_face_sizes,
-                ),
-            )
+
             report_stub = ReportArtifacts(
                 tex_path=run_directory / "report" / "relatorio_forense.tex",
                 pdf_path=None,
@@ -391,38 +295,30 @@ class InventoryService:
                 summary=summary,
                 logs_directory=logs_directory,
                 manifest_path=manifest_path,
+                tracks=tracks,
+                keyframes=keyframes,
+                search=search_artifacts,
             )
 
-            self._emit_log(
-                text_logger,
-                log_callback,
-                f"[Exportacao] Gravando inventario estruturado em {export_service.inventory_directory}.",
-            )
             files_csv_path = export_service.write_files_csv(file_records)
             occurrences_csv_path = export_service.write_occurrences_csv(occurrences)
+            tracks_csv_path = export_service.write_tracks_csv(tracks)
+            keyframes_csv_path = export_service.write_keyframes_csv(keyframes)
             clusters_json_path = export_service.write_clusters_json(clusters)
             media_info_json_path = export_service.write_media_info_json(file_records)
+            search_json_path = export_service.write_search_json(search_artifacts)
             self._emit_log(
                 text_logger,
                 log_callback,
                 (
-                    f"[Exportacao] Artefatos estruturados gerados | "
-                    f"arquivos={files_csv_path.name} | ocorrencias={occurrences_csv_path.name} | "
-                    f"grupos={clusters_json_path.name} | mediainfo={media_info_json_path.name}"
-                ),
-            )
-            self._emit_log(text_logger, log_callback, "[Relatorio] Gerando relatorio tecnico.")
-            report_artifacts = self._report_generator.generate(preliminary_result)
-            self._emit_log(
-                text_logger,
-                log_callback,
-                (
-                    f"[Relatorio] Artefatos gerados | TEX={report_artifacts.tex_path} | "
-                    f"PDF={report_artifacts.pdf_path if report_artifacts.pdf_path is not None else 'nao compilado'} | "
-                    f"DOCX={report_artifacts.docx_path if report_artifacts.docx_path is not None else 'nao gerado'}"
+                    f"[Exportacao] Inventario atualizado | arquivos={files_csv_path.name} | "
+                    f"ocorrencias={occurrences_csv_path.name} | tracks={tracks_csv_path.name} | "
+                    f"keyframes={keyframes_csv_path.name} | grupos={clusters_json_path.name} | "
+                    f"metadados={media_info_json_path.name} | busca={search_json_path.name}"
                 ),
             )
 
+            report_artifacts = self._report_generator.generate(preliminary_result)
             result = InventoryResult(
                 run_directory=run_directory,
                 started_at_utc=started_at_utc,
@@ -435,6 +331,9 @@ class InventoryService:
                 summary=summary,
                 logs_directory=logs_directory,
                 manifest_path=manifest_path,
+                tracks=tracks,
+                keyframes=keyframes,
+                search=search_artifacts,
             )
             manifest_output_path = export_service.write_manifest(result)
             self._emit_log(
@@ -442,170 +341,176 @@ class InventoryService:
                 log_callback,
                 f"[Exportacao] Manifesto consolidado em {manifest_output_path}.",
             )
-
             event_logger.write(
                 "run_finished",
                 summary=summary,
                 report_pdf=report_artifacts.pdf_path,
                 report_tex=report_artifacts.tex_path,
                 report_docx=report_artifacts.docx_path,
-            )
-            self._emit_log(
-                text_logger,
-                log_callback,
-                (
-                    "Processamento concluido. "
-                    f"Arquivos catalogados={summary.total_files} | "
-                    f"midias suportadas={summary.media_files} | "
-                    f"faces detectadas={summary.total_occurrences} | "
-                    f"possiveis individuos={summary.total_clusters}."
-                ),
+                search=search_artifacts,
             )
             return result
         finally:
             close_file_logger(text_logger)
 
-    def _process_frame(
+    def run_face_search(
         self,
-        analyzer: FaceAnalyzer,
-        frame: SampledFrame,
-        sha512: str,
-        media_type: MediaType,
-        occurrences: list[FaceOccurrence],
-        artifact_store: ArtifactStore,
-        event_logger: StructuredEventLogger,
-        logger: logging.Logger,
-        log_callback: LogCallback | None,
-        file_prefix: str,
-    ) -> FrameProcessingSummary:
-        minimum_face_quality = self._config.face_model.minimum_face_quality
-        minimum_face_size_pixels = self._config.face_model.minimum_face_size_pixels
-        raw_detections = analyzer.analyze(frame)
-        raw_face_sizes = tuple(min(detection.bbox.width, detection.bbox.height) for detection in raw_detections)
-        quality_filtered_detections = [
-            detection for detection in raw_detections if detection.detection_score >= minimum_face_quality
-        ]
-        discarded_low_quality = len(raw_detections) - len(quality_filtered_detections)
-        detections = [
-            detection
-            for detection in quality_filtered_detections
-            if min(detection.bbox.width, detection.bbox.height) >= minimum_face_size_pixels
-        ]
-        selected_sizes = tuple(min(detection.bbox.width, detection.bbox.height) for detection in detections)
-        discarded_small_faces = len(quality_filtered_detections) - len(detections)
-        occurrence_ids: list[str] = []
-        if detections and media_type == MediaType.VIDEO:
-            artifact_store.save_frame(frame.image_name, frame.bgr_pixels)
+        root_directory: Path,
+        query_image_path: Path,
+        progress_callback: ProgressCallback | None = None,
+        log_callback: LogCallback | None = None,
+    ) -> FaceSearchResult:
+        query_path = Path(query_image_path).resolve()
+        if not query_path.exists():
+            raise FileNotFoundError(f"Imagem de consulta nao encontrada: {query_path}")
 
-        if discarded_low_quality > 0:
-            self._emit_log(
-                logger,
-                log_callback,
-                (
-                    f"{file_prefix} {self._frame_description(frame)} | "
-                    f"faces descartadas por qualidade insuficiente={discarded_low_quality} | "
-                    f"limiar={minimum_face_quality:.3f}"
-                ),
-            )
-            event_logger.write(
-                "face_rejected_low_quality",
-                source_path=frame.source_path,
-                frame_index=frame.frame_index,
-                frame_timestamp_seconds=frame.timestamp_seconds,
-                discarded_count=discarded_low_quality,
-                minimum_face_quality=minimum_face_quality,
-                sha512=sha512,
-            )
+        def inventory_progress(current: int, total: int, message: str) -> None:
+            if progress_callback is None:
+                return
+            scaled = 0 if total == 0 else int((current / total) * 85)
+            progress_callback(scaled, 100, message)
 
-        if discarded_small_faces > 0:
-            self._emit_log(
-                logger,
-                log_callback,
-                (
-                    f"{file_prefix} {self._frame_description(frame)} | "
-                    f"faces descartadas por tamanho insuficiente={discarded_small_faces} | "
-                    f"minimo={minimum_face_size_pixels}px"
-                ),
-            )
-            event_logger.write(
-                "face_rejected_small_size",
-                source_path=frame.source_path,
-                frame_index=frame.frame_index,
-                frame_timestamp_seconds=frame.timestamp_seconds,
-                discarded_count=discarded_small_faces,
-                minimum_face_size_pixels=minimum_face_size_pixels,
-                sha512=sha512,
-            )
-
-        if detections:
-            self._emit_log(
-                logger,
-                log_callback,
-                (
-                    f"{file_prefix} {self._frame_description(frame)} | "
-                    f"faces detectadas={len(raw_detections)} | "
-                    f"faces selecionadas={len(detections)}"
-                ),
-            )
-
-        for detection in detections:
-            occurrence_id = f"O{len(occurrences) + 1:06d}"
-            crop_path = artifact_store.save_crop(occurrence_id, detection.crop_bgr)
-            context_image_path = artifact_store.save_context(
-                occurrence_id,
-                frame.image_name,
-                frame.bgr_pixels,
-                detection.bbox,
-            )
-            occurrence = FaceOccurrence(
-                occurrence_id=occurrence_id,
-                source_path=frame.source_path,
-                sha512=sha512,
-                media_type=media_type,
-                analysis_timestamp_utc=utc_now(),
-                frame_index=frame.frame_index,
-                frame_timestamp_seconds=frame.timestamp_seconds,
-                bbox=detection.bbox,
-                detection_score=detection.detection_score,
-                embedding=detection.embedding,
-                crop_path=crop_path,
-                context_image_path=context_image_path,
-            )
-            occurrences.append(occurrence)
-            occurrence_ids.append(occurrence_id)
-            event_logger.write(
-                "face_detected",
-                occurrence_id=occurrence_id,
-                source_path=frame.source_path,
-                frame_index=frame.frame_index,
-                frame_timestamp_seconds=frame.timestamp_seconds,
-                detection_score=detection.detection_score,
-                bbox=detection.bbox,
-                sha512=sha512,
-            )
-            self._emit_log(
-                logger,
-                log_callback,
-                (
-                    f"{file_prefix} Ocorrencia {occurrence_id} registrada | "
-                    f"pontuacao={detection.detection_score:.3f} | "
-                    f"caixa={detection.bbox.x1:.1f},{detection.bbox.y1:.1f},"
-                    f"{detection.bbox.x2:.1f},{detection.bbox.y2:.1f}"
-                ),
-            )
-
-        return FrameProcessingSummary(
-            raw_detection_count=len(raw_detections),
-            selected_detection_count=len(detections),
-            raw_face_sizes=raw_face_sizes,
-            selected_face_sizes=selected_sizes,
-            occurrence_ids=tuple(occurrence_ids),
+        inventory_result = self.run(
+            root_directory,
+            progress_callback=inventory_progress,
+            log_callback=log_callback,
         )
+
+        if progress_callback is not None:
+            progress_callback(88, 100, "Analisando imagem de consulta")
+
+        logger = build_file_logger(inventory_result.logs_directory, self._config.app.log_level)
+        event_logger = StructuredEventLogger(inventory_result.logs_directory / "events.jsonl")
+        export_service = ExportService(inventory_result.run_directory)
+        try:
+            self._emit_log(logger, log_callback, f"[Busca por face] Imagem de consulta: {query_path}")
+            analyzer = self._face_analyzer_factory()
+            query_sha512 = self._hashing_service.sha512(query_path)
+            query_tracking = self._tracking_service.process_media(
+                source_path=query_path,
+                sha512=query_sha512,
+                media_type=MediaType.IMAGE,
+                frames=[self._media_service.load_image(query_path)],
+                analyzer=analyzer,
+                artifact_store=ArtifactStore(inventory_result.run_directory / "face_search_query"),
+                id_namespace="Q",
+                event_callback=lambda event, fields: event_logger.write(event, **fields),
+                text_callback=lambda message: self._emit_log(logger, log_callback, message),
+            )
+            query_track, query_occurrence = self._select_query_face(query_tracking)
+            query_keyframe = next(
+                (item for item in query_tracking.keyframes if item.track_id == query_track.track_id),
+                None,
+            )
+            event_logger.write(
+                "face_search_query_selected",
+                query_path=query_path,
+                query_track_id=query_track.track_id,
+                query_occurrence_id=query_occurrence.occurrence_id,
+                query_keyframe_id=query_keyframe.keyframe_id if query_keyframe is not None else None,
+                detected_faces=len(query_tracking.tracks),
+            )
+
+            if progress_callback is not None:
+                progress_callback(94, 100, "Executando busca vetorial")
+
+            raw_hits = self._search_service.search(
+                query_track.average_embedding,
+                inventory_result.tracks,
+                inventory_result.clusters,
+                inventory_result.occurrences,
+            )
+            matches = self._resolve_face_search_matches(inventory_result, raw_hits)
+            summary = FaceSearchSummary(
+                query_faces_detected=len(query_tracking.tracks),
+                compatible_clusters=len({item.cluster_id for item in matches if item.cluster_id is not None}),
+                compatible_tracks=len(matches),
+                compatible_occurrences=len([item for item in matches if item.occurrence_id is not None]),
+                compatibility_threshold=self._config.clustering.candidate_similarity,
+            )
+
+            if self._face_search_report_generator is None:
+                raise RuntimeError("Gerador de relatório de busca por face nao configurado.")
+
+            preliminary = FaceSearchResult(
+                inventory_result=inventory_result,
+                query=FaceSearchQuery(
+                    source_path=query_path,
+                    sha512=query_sha512,
+                    detected_face_count=len(query_tracking.tracks),
+                    selected_track_id=query_track.track_id,
+                    selected_occurrence_id=query_occurrence.occurrence_id,
+                    selected_keyframe_id=query_keyframe.keyframe_id if query_keyframe is not None else None,
+                    crop_path=query_occurrence.crop_path,
+                    context_image_path=query_occurrence.context_image_path,
+                    quality_score=(
+                        query_occurrence.quality_metrics.score
+                        if query_occurrence.quality_metrics is not None
+                        else None
+                    ),
+                ),
+                matches=matches,
+                summary=summary,
+                report=ReportArtifacts(
+                    tex_path=inventory_result.run_directory / "report" / "relatorio_busca_por_face.tex",
+                    pdf_path=None,
+                    docx_path=inventory_result.run_directory / "report" / "relatorio_busca_por_face.docx",
+                ),
+                export_path=export_service.inventory_directory / "face_search.json",
+            )
+
+            if progress_callback is not None:
+                progress_callback(97, 100, "Gerando relatórios da busca")
+
+            report_artifacts = self._face_search_report_generator.generate(preliminary)
+            final_result = replace(preliminary, report=report_artifacts)
+            export_service.write_face_search_json(final_result)
+            self._emit_log(
+                logger,
+                log_callback,
+                (
+                    f"[Busca por face] Compatibilidades encontradas | grupos={summary.compatible_clusters} | "
+                    f"tracks={summary.compatible_tracks} | ocorrencias={summary.compatible_occurrences}"
+                ),
+            )
+            event_logger.write(
+                "face_search_finished",
+                query_path=query_path,
+                compatible_clusters=summary.compatible_clusters,
+                compatible_tracks=summary.compatible_tracks,
+                compatible_occurrences=summary.compatible_occurrences,
+                report_pdf=report_artifacts.pdf_path,
+                report_tex=report_artifacts.tex_path,
+                report_docx=report_artifacts.docx_path,
+                export_path=final_result.export_path,
+            )
+            if progress_callback is not None:
+                progress_callback(100, 100, "Busca por face concluída")
+            return final_result
+        finally:
+            close_file_logger(logger)
+
+    def _propagate_cluster_membership(
+        self,
+        occurrences: list[FaceOccurrence],
+        tracks: list[FaceTrack],
+    ) -> None:
+        track_map = {track.track_id: track for track in tracks}
+        for occurrence in occurrences:
+            if occurrence.track_id is None:
+                continue
+            track = track_map.get(occurrence.track_id)
+            if track is None:
+                continue
+            occurrence.cluster_id = track.cluster_id
+            occurrence.suggested_cluster_ids = list(track.candidate_cluster_ids)
 
     def _build_summary(
         self,
         file_records: list[FileRecord],
         occurrences: list[FaceOccurrence],
+        tracks: list[FaceTrack],
+        keyframes: list[KeyFrame],
         clusters: list[object],
         total_detected_face_sizes: list[float],
         selected_face_sizes: list[float],
@@ -624,13 +529,154 @@ class InventoryService:
             total_occurrences=len(occurrences),
             total_clusters=len(clusters),
             probable_match_pairs=len(probable_pairs),
+            total_tracks=len(tracks),
+            total_keyframes=len(keyframes),
             total_detected_face_sizes=self._calculate_face_size_statistics(total_detected_face_sizes),
             selected_face_sizes=self._calculate_face_size_statistics(selected_face_sizes),
         )
 
+    def _select_query_face(self, tracking_result: TrackingResult) -> tuple[FaceTrack, FaceOccurrence]:
+        if not tracking_result.tracks:
+            raise ValueError("Nenhuma face elegivel foi encontrada na imagem de consulta.")
+        occurrence_map = {
+            occurrence.track_id: occurrence
+            for occurrence in tracking_result.occurrences
+            if occurrence.track_id is not None
+        }
+        ranked_tracks = sorted(
+            tracking_result.tracks,
+            key=lambda track: (
+                track.quality_statistics.best_quality_score,
+                track.quality_statistics.mean_detection_score,
+                len(track.occurrence_ids),
+            ),
+            reverse=True,
+        )
+        for track in ranked_tracks:
+            if not track.average_embedding:
+                continue
+            occurrence = occurrence_map.get(track.track_id)
+            if occurrence is not None:
+                return track, occurrence
+        raise ValueError("A face de consulta nao gerou embedding utilizavel para a busca.")
+
+    def _resolve_face_search_matches(
+        self,
+        result: InventoryResult,
+        raw_hits: dict[str, list[object]],
+    ) -> list[FaceSearchMatch]:
+        compatibility_threshold = self._config.clustering.candidate_similarity
+        track_hits = [
+            hit for hit in raw_hits.get("tracks", [])
+            if getattr(hit, "score", -1.0) >= compatibility_threshold
+        ]
+        if not track_hits:
+            return []
+
+        cluster_scores = {
+            hit.entity_id: hit.score
+            for hit in raw_hits.get("clusters", [])
+            if getattr(hit, "score", -1.0) >= compatibility_threshold
+        }
+        occurrence_hits = {
+            hit.entity_id: hit
+            for hit in raw_hits.get("occurrences", [])
+            if getattr(hit, "score", -1.0) >= compatibility_threshold
+        }
+
+        tracks_by_id = {track.track_id: track for track in result.tracks}
+        occurrences_by_id = {occurrence.occurrence_id: occurrence for occurrence in result.occurrences}
+        keyframes_by_track: dict[str, list[KeyFrame]] = {}
+        for keyframe in result.keyframes:
+            keyframes_by_track.setdefault(keyframe.track_id, []).append(keyframe)
+
+        resolved: list[FaceSearchMatch] = []
+        for rank, hit in enumerate(track_hits, start=1):
+            track = tracks_by_id.get(hit.entity_id)
+            if track is None:
+                continue
+            occurrence = self._best_match_occurrence(track, occurrences_by_id, occurrence_hits)
+            keyframe = self._representative_keyframe(track, keyframes_by_track)
+            crop_path = (
+                occurrence.crop_path
+                if occurrence is not None and occurrence.crop_path is not None
+                else keyframe.preview_path if keyframe is not None else track.preview_path
+            )
+            context_path = (
+                occurrence.context_image_path
+                if occurrence is not None and occurrence.context_image_path is not None
+                else keyframe.context_image_path if keyframe is not None else None
+            )
+            occurrence_hit = occurrence_hits.get(occurrence.occurrence_id) if occurrence is not None else None
+            resolved.append(
+                FaceSearchMatch(
+                    rank=rank,
+                    cluster_id=track.cluster_id,
+                    track_id=track.track_id,
+                    occurrence_id=occurrence.occurrence_id if occurrence is not None else None,
+                    cluster_score=cluster_scores.get(track.cluster_id or ""),
+                    track_score=hit.score,
+                    occurrence_score=occurrence_hit.score if occurrence_hit is not None else None,
+                    source_path=track.source_path,
+                    frame_index=(
+                        occurrence.frame_index
+                        if occurrence is not None
+                        else keyframe.frame_index if keyframe is not None else None
+                    ),
+                    timestamp_seconds=(
+                        occurrence.frame_timestamp_seconds
+                        if occurrence is not None
+                        else keyframe.timestamp_seconds if keyframe is not None else None
+                    ),
+                    track_start_time=track.start_time,
+                    track_end_time=track.end_time,
+                    crop_path=crop_path,
+                    context_image_path=context_path,
+                )
+            )
+        return resolved
+
+    def _best_match_occurrence(
+        self,
+        track: FaceTrack,
+        occurrences_by_id: dict[str, FaceOccurrence],
+        occurrence_hits: dict[str, object],
+    ) -> FaceOccurrence | None:
+        ranked_hits = sorted(
+            (
+                occurrence_hits[occurrence_id]
+                for occurrence_id in track.occurrence_ids
+                if occurrence_id in occurrence_hits
+            ),
+            key=lambda item: item.score,
+            reverse=True,
+        )
+        if ranked_hits:
+            return occurrences_by_id.get(ranked_hits[0].entity_id)
+        if track.best_occurrence_id is not None:
+            return occurrences_by_id.get(track.best_occurrence_id)
+        for occurrence_id in track.occurrence_ids:
+            occurrence = occurrences_by_id.get(occurrence_id)
+            if occurrence is not None:
+                return occurrence
+        return None
+
+    def _representative_keyframe(
+        self,
+        track: FaceTrack,
+        keyframes_by_track: dict[str, list[KeyFrame]],
+    ) -> KeyFrame | None:
+        keyframes = keyframes_by_track.get(track.track_id, [])
+        if not keyframes:
+            return None
+        for keyframe in keyframes:
+            if track.best_occurrence_id is not None and keyframe.occurrence_id == track.best_occurrence_id:
+                return keyframe
+        return keyframes[0]
+
     def _extract_media_info(self, file_path: Path) -> tuple[tuple[object, ...], str | None]:
         if self._media_info_extractor is None:
-            return (), "MediaInfo nao configurado."
+            return (), "Extrator interno de metadados nao configurado."
         return self._media_info_extractor.extract(file_path)
 
     def _emit_progress(
@@ -655,48 +701,40 @@ class InventoryService:
 
     def _configuration_log_lines(self, providers: list[str]) -> list[str]:
         provider_label = ", ".join(providers) if providers else "selecao automatica"
-        max_frames = (
-            str(self._config.video.max_frames_per_video)
-            if self._config.video.max_frames_per_video is not None
-            else "sem limite"
-        )
         return [
             (
-                "[Configuracao] Aplicacao | "
-                f"nome={self._config.app.name} | "
-                f"saida={self._config.app.output_directory_name} | "
-                f"nivel de log={self._config.app.log_level}"
-            ),
-            (
-                "[Configuracao] Midias | "
-                f"imagens={', '.join(self._config.media.image_extensions)} | "
-                f"videos={', '.join(self._config.media.video_extensions)}"
-            ),
-            (
                 "[Configuracao] Video | "
-                f"intervalo de amostragem={self._config.video.sampling_interval_seconds:.2f}s | "
-                f"maximo de quadros por video={max_frames}"
+                f"amostragem={self._config.video.sampling_interval_seconds:.2f}s | "
+                f"intervalo de keyframe={self._config.video.keyframe_interval_seconds:.2f}s | "
+                f"mudanca significativa={self._config.video.significant_change_threshold:.2f}"
+            ),
+            (
+                "[Configuracao] Tracking | "
+                f"iou={self._config.tracking.iou_threshold:.2f} | "
+                f"distancia={self._config.tracking.spatial_distance_threshold:.2f} | "
+                f"embedding={self._config.tracking.embedding_similarity_threshold:.2f} | "
+                f"perda maxima={self._config.tracking.max_missed_detections}"
             ),
             (
                 "[Configuracao] Analise facial | "
-                f"mecanismo={self._config.face_model.backend} | "
+                f"backend={self._config.face_model.backend} | "
                 f"modelo={self._config.face_model.model_name} | "
-                f"tamanho de deteccao={self._detection_size_label()} | "
-                f"qualidade minima={self._config.face_model.minimum_face_quality:.3f} | "
-                f"tamanho minimo da face={self._config.face_model.minimum_face_size_pixels}px | "
-                f"contexto={self._config.face_model.ctx_id} | "
-                f"mecanismos de execucao={provider_label}"
+                f"qualidade minima={self._config.face_model.minimum_face_quality:.2f} | "
+                f"face minima={self._config.face_model.minimum_face_size_pixels}px | "
+                f"provedores={provider_label}"
             ),
             (
-                "[Configuracao] Agrupamento | "
-                f"limiar de atribuicao={self._config.clustering.assignment_similarity:.3f} | "
-                f"limiar de sugestao={self._config.clustering.candidate_similarity:.3f} | "
-                f"tamanho minimo do grupo={self._config.clustering.min_cluster_size}"
+                "[Configuracao] Clustering | "
+                f"atribuicao={self._config.clustering.assignment_similarity:.2f} | "
+                f"sugestao={self._config.clustering.candidate_similarity:.2f} | "
+                f"grupo minimo={self._config.clustering.min_cluster_size}"
             ),
             (
-                "[Configuracao] Relatorio | "
-                f"faces na galeria por possivel individuo={self._config.reporting.max_gallery_faces_per_group} | "
-                f"compilar PDF={'sim' if self._config.reporting.compile_pdf else 'nao'}"
+                "[Configuracao] Busca | "
+                f"habilitada={'sim' if self._config.search.enabled else 'nao'} | "
+                f"preferir_faiss={'sim' if self._config.search.prefer_faiss else 'nao'} | "
+                f"coarse={self._config.search.coarse_top_k} | "
+                f"refino={self._config.search.refine_top_k}"
             ),
         ]
 
@@ -707,38 +745,6 @@ class InventoryService:
             MediaType.OTHER: "outro",
         }
         return labels[media_type]
-
-    def _short_hash(self, sha512: str) -> str:
-        if len(sha512) <= 24:
-            return sha512
-        return f"{sha512[:12]}...{sha512[-12:]}"
-
-    def _format_size_bytes(self, size_bytes: int) -> str:
-        units = ["B", "KB", "MB", "GB", "TB"]
-        size = float(size_bytes)
-        for unit in units:
-            if size < 1024.0 or unit == units[-1]:
-                if unit == "B":
-                    return f"{int(size)} {unit}"
-                return f"{size:.2f} {unit}"
-            size /= 1024.0
-        return f"{size_bytes} B"
-
-    def _frame_description(self, frame: SampledFrame) -> str:
-        if frame.frame_index is None:
-            return "Imagem integral analisada"
-        return (
-            f"Quadro {frame.frame_index:06d} | "
-            f"marca temporal={self._format_seconds(frame.timestamp_seconds)}"
-        )
-
-    def _format_seconds(self, value: float | None) -> str:
-        if value is None:
-            return "-"
-        total_seconds = int(value)
-        hours, remainder = divmod(total_seconds, 3600)
-        minutes, seconds = divmod(remainder, 60)
-        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
     def _calculate_face_size_statistics(self, face_sizes: list[float]) -> FaceSizeStatistics:
         if not face_sizes:
@@ -753,20 +759,3 @@ class InventoryService:
             mean_pixels=mean_value,
             stddev_pixels=variance ** 0.5,
         )
-
-    def _face_size_statistics_log_line(self, label: str, statistics: FaceSizeStatistics) -> str:
-        if statistics.count == 0:
-            return f"[Estatisticas] {label} | quantidade=0"
-        return (
-            f"[Estatisticas] {label} | "
-            f"quantidade={statistics.count} | "
-            f"minimo={statistics.min_pixels:.1f}px | "
-            f"maximo={statistics.max_pixels:.1f}px | "
-            f"media={statistics.mean_pixels:.1f}px | "
-            f"desvio padrao={statistics.stddev_pixels:.1f}px"
-        )
-
-    def _detection_size_label(self) -> str:
-        if self._config.face_model.det_size is None:
-            return "resolucao original"
-        return f"{self._config.face_model.det_size[0]}x{self._config.face_model.det_size[1]}"

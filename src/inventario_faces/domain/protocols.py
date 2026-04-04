@@ -5,6 +5,7 @@ from typing import Protocol
 
 from inventario_faces.domain.entities import (
     DetectedFace,
+    FaceSearchResult,
     InventoryResult,
     MediaInfoTrack,
     ReportArtifacts,
@@ -13,12 +14,23 @@ from inventario_faces.domain.entities import (
 
 
 class FaceAnalyzer(Protocol):
+    def detect(self, frame: SampledFrame) -> list[DetectedFace]:
+        ...
+
+    def embed(self, frame: SampledFrame, detection: DetectedFace, reason: str = "keyframe") -> list[float]:
+        ...
+
     def analyze(self, frame: SampledFrame) -> list[DetectedFace]:
         ...
 
 
 class ReportGenerator(Protocol):
     def generate(self, result: InventoryResult) -> ReportArtifacts:
+        ...
+
+
+class FaceSearchReportGenerator(Protocol):
+    def generate(self, result: FaceSearchResult) -> ReportArtifacts:
         ...
 
 

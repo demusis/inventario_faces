@@ -1,22 +1,27 @@
 from __future__ import annotations
 
-from pathlib import Path
-
 from docx import Document
-from docx.enum.section import WD_SECTION_START
+from docx.enum.table import WD_ALIGN_VERTICAL, WD_TABLE_ALIGNMENT
 from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.oxml import OxmlElement
-from docx.oxml.ns import qn
 from docx.shared import Inches, Pt
 
-from inventario_faces import __version__
 from inventario_faces.domain.config import AppConfig
-from inventario_faces.domain.entities import FileRecord, FaceCluster, FaceOccurrence, InventoryResult, ReportArtifacts
+from inventario_faces.domain.entities import FaceTrack, FileRecord, InventoryResult, KeyFrame, MediaInfoAttribute, ReportArtifacts
+from inventario_faces.reporting.report_context import (
+    keyframes_by_track,
+    tracks_by_cluster,
+)
+from inventario_faces.reporting.report_support import (
+    candidate_cluster_map,
+    inventory_methodology_items,
+    keyframe_reference_text,
+    media_track_type_label,
+    software_reference_abnt_text,
+    technical_parameter_items,
+)
 from inventario_faces.utils.latex import format_seconds
 from inventario_faces.utils.path_utils import ensure_directory
-
-
-PROJECT_URL = "https://github.com/demusis/inventario_faces"
+from inventario_faces.utils.time_utils import format_local_datetime
 
 
 class DocxReportGenerator:
@@ -28,163 +33,219 @@ class DocxReportGenerator:
         docx_path = report_directory / "relatorio_forense.docx"
         document = self._build_document(result)
         document.save(docx_path)
-        return ReportArtifacts(tex_path=report_directory / "relatorio_forense.tex", pdf_path=None, docx_path=docx_path)
+        return ReportArtifacts(
+            tex_path=report_directory / "relatorio_forense.tex",
+            pdf_path=None,
+            docx_path=docx_path,
+        )
 
     def _build_document(self, result: InventoryResult) -> Document:
         document = Document()
         self._configure_styles(document)
-        self._add_cover(document, result)
-        document.add_page_break()
-        self._add_heading(document, "Resumo Executivo", level=1)
-        self._add_paragraph(document, self._executive_summary_text(result))
+        self._add_report_header(document, self._config.app.report_title, result.finished_at_utc)
+
+        self._add_heading(document, "Resumo Executivo", 1)
+        self._add_paragraph(
+            document,
+            (
+                f"Foram catalogados {result.summary.total_files} arquivo(s), com "
+                f"{result.summary.total_occurrences} detecção(ões), {result.summary.total_tracks} track(s), "
+                f"{result.summary.total_keyframes} keyframe(s) e {result.summary.total_clusters} grupo(s) "
+                f"de possíveis correspondências."
+            ),
+        )
         self._add_notice_box(
             document,
             "Advertência pericial",
             (
-                "Os resultados são probabilísticos e não constituem identificação conclusiva de indivíduos. "
-                "Qualquer inferência deve ser submetida à revisão humana especializada e correlacionada com outros elementos de prova."
+                "Correspondência facial automatizada não constitui prova conclusiva de identidade; "
+                "os resultados são probabilísticos e exigem validação humana especializada."
             ),
         )
-        self._add_notice_box(document, "Cadeia de custódia", self._config.forensics.chain_of_custody_note)
+        self._add_notice_box(document, "Rastreabilidade forense", self._config.forensics.chain_of_custody_note)
 
-        self._add_heading(document, "Metodologia", level=1)
-        for step in self._methodology_items(result):
-            self._add_list_item(document, step)
+        self._add_heading(document, "Metodologia", 1)
+        for item in self._methodology_items(result):
+            self._add_list_item(document, item)
 
-        self._add_heading(document, "Resultados", level=1)
-        self._add_heading(document, "Estatísticas de tamanho das faces", level=2)
-        self._add_face_statistics_table(document, result)
-        self._add_heading(document, "Possíveis indivíduos", level=2)
-        self._add_cluster_overview_table(document, result.clusters)
-        for cluster in result.clusters:
-            occurrences = [item for item in result.occurrences if item.cluster_id == cluster.cluster_id]
-            self._add_cluster_section(document, cluster, occurrences)
+        self._add_heading(document, "Resultados por Grupo", 1)
+        self._add_group_sections(document, result)
 
-        self._add_heading(document, "Anexo técnico", level=1)
-        self._add_heading(document, "Hashes SHA-512", level=2)
+        self._add_heading(document, "Estatísticas de tamanho das faces", 1)
+        self._add_face_size_statistics(document, result)
+
+        self._add_heading(document, "Anexo técnico", 1)
+        self._add_heading(document, "Hashes SHA-512", 2)
         self._add_hashes_table(document, result.files)
-        self._add_heading(document, "Características de imagens e vídeos (MediaInfo)", level=2)
-        self._add_media_info_table(document, result.files)
-        self._add_heading(document, "Parâmetros do modelo e da execução", level=2)
+        self._add_heading(document, "Metadados técnicos da mídia", 2)
+        self._add_media_metadata_table(document, result.files)
+        self._add_heading(document, "Parâmetros e melhorias aplicadas", 2)
         for item in self._technical_parameter_items(result):
             self._add_list_item(document, item)
-        self._add_heading(document, "Registros de execução", level=2)
+        self._add_list_item(document, f"Referência do software: {software_reference_abnt_text()}")
+        self._add_heading(document, "Registros de execução", 2)
         self._add_log_excerpt(document, result.logs_directory / "run.log")
-
         return document
 
     def _configure_styles(self, document: Document) -> None:
-        normal_style = document.styles["Normal"]
-        normal_style.font.name = "Cambria"
-        normal_style.font.size = Pt(11)
-        heading1 = document.styles["Heading 1"]
-        heading1.font.name = "Cambria"
-        heading1.font.size = Pt(16)
-        heading1.font.bold = True
-        heading2 = document.styles["Heading 2"]
-        heading2.font.name = "Cambria"
-        heading2.font.size = Pt(13)
-        heading2.font.bold = True
+        document.styles["Normal"].font.name = "Cambria"
+        document.styles["Normal"].font.size = Pt(11)
 
-    def _add_cover(self, document: Document, result: InventoryResult) -> None:
-        section = document.sections[0]
-        section.top_margin = Inches(0.8)
-        section.bottom_margin = Inches(0.8)
-        section.left_margin = Inches(0.9)
-        section.right_margin = Inches(0.9)
-
+    def _add_report_header(self, document: Document, title_text: str, finished_at_utc) -> None:
         title = document.add_paragraph()
         title.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        run = title.add_run(self._config.app.report_title)
-        run.bold = True
-        run.font.size = Pt(24)
+        title_run = title.add_run(title_text)
+        title_run.bold = True
+        title_run.font.size = Pt(16)
 
-        organization = document.add_paragraph()
-        organization.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        organization.add_run(self._config.app.organization).font.size = Pt(16)
-
-        generated = document.add_paragraph()
-        generated.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        generated.add_run(f"Gerado em {result.finished_at_utc.strftime('%Y-%m-%d %H:%M:%SZ')}").font.size = Pt(12)
-
-        document.add_paragraph()
-        note = document.add_paragraph()
-        note.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        note.add_run("Relatório técnico para apoio investigativo assistido por IA").italic = True
-
-        caveat = document.add_paragraph()
-        caveat.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        caveat.add_run("Este documento não deve ser interpretado como identificação conclusiva de indivíduos.")
-
-    def _executive_summary_text(self, result: InventoryResult) -> str:
-        summary = result.summary
-        return (
-            f"O presente relatório registra o processamento automatizado do diretório {result.root_directory}. "
-            f"Foram catalogados e submetidos a cálculo de hash {summary.total_files} arquivo(s). No conjunto "
-            f"catalogado, há {summary.media_files} mídia(s) suportada(s) para análise facial automatizada, com "
-            f"a seguinte composição: {summary.image_files} imagem(ns) e {summary.video_files} vídeo(s). "
-            f"A etapa de detecção registrou {summary.total_occurrences} ocorrência(s) facial(is). A etapa de "
-            f"agrupamento resultou em {summary.total_clusters} possível(is) indivíduo(s). Foram assinalados "
-            f"{summary.probable_match_pairs} par(es) como possivelmente correlato(s), sem caráter conclusivo de identificação."
+        meta = document.add_paragraph()
+        meta.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        meta_run = meta.add_run(
+            f"{self._config.app.organization} | Emitido em {format_local_datetime(finished_at_utc)}"
         )
+        meta_run.font.size = Pt(10)
 
     def _methodology_items(self, result: InventoryResult) -> list[str]:
-        detection_size = self._detection_size_label()
-        max_frames_text = (
-            str(self._config.video.max_frames_per_video)
-            if self._config.video.max_frames_per_video is not None
-            else "sem limite"
-        )
-        return [
-            "Varredura recursiva do diretório de entrada, com registro individual de caminho, tamanho e hash SHA-512 para cada arquivo encontrado.",
-            "Classificação de mídia em imagem, vídeo ou outro formato, sem alteração dos arquivos originais.",
-            f"Para vídeos, amostragem temporal a cada {self._config.video.sampling_interval_seconds:.2f} segundos, limitada a {max_frames_text} quadros por arquivo.",
-            f"Detecção facial e extração de vetores de características normalizados com mecanismo configurado em {self._config.face_model.backend} / {self._config.face_model.model_name}, com tamanho de detecção definido em {detection_size}.",
-            f"Seleção de faces condicionada a qualidade mínima de {self._config.face_model.minimum_face_quality:.2f}, aferida pela pontuação de detecção do mecanismo facial.",
-            f"Seleção complementar por tamanho mínimo da face, exigindo ao menos {self._config.face_model.minimum_face_size_pixels} pixels na menor dimensão da caixa delimitadora.",
-            f"Agrupamento incremental por similaridade de cosseno, com limiar de atribuição {self._config.clustering.assignment_similarity:.2f} e limiar de sugestão entre possíveis indivíduos {self._config.clustering.candidate_similarity:.2f}.",
-            f"Consolidação de vestígios forenses, registros e artefatos derivados em diretório dedicado de execução: {result.run_directory}.",
-        ]
+        return inventory_methodology_items(self._config, result.search)
 
     def _technical_parameter_items(self, result: InventoryResult) -> list[str]:
-        max_frames_text = (
-            str(self._config.video.max_frames_per_video)
-            if self._config.video.max_frames_per_video is not None
-            else "sem limite"
-        )
-        providers = ", ".join(self._config.face_model.providers) or "automatico"
-        mediainfo_directory = (
-            self._config.app.mediainfo_directory or "nao configurado; resolucao automatica pelo PATH do sistema"
-        )
-        return [
-            f"Aplicação: versão={__version__}; diretório de saída={self._config.app.output_directory_name}; nível de log={self._config.app.log_level}.",
-            f"Mídias: extensões de imagem={', '.join(self._config.media.image_extensions)}; extensões de vídeo={', '.join(self._config.media.video_extensions)}.",
-            f"Vídeo: intervalo de amostragem={self._config.video.sampling_interval_seconds:.2f} s; máximo de quadros por arquivo={max_frames_text}.",
+        return technical_parameter_items(self._config, result.search)
+
+    def _add_group_sections(self, document: Document, result: InventoryResult) -> None:
+        grouped_tracks = tracks_by_cluster(result)
+        keyframes_map = keyframes_by_track(result)
+        candidate_map = candidate_cluster_map(result.clusters)
+        if not result.clusters:
+            self._add_paragraph(document, "Nenhum grupo consolidado.")
+            return
+        for cluster in result.clusters:
+            tracks = grouped_tracks.get(cluster.cluster_id, [])
+            keyframe_count = sum(len(keyframes_map.get(track.track_id, [])) for track in tracks)
+            self._add_heading(document, f"Grupo {cluster.cluster_id}", 2)
+            self._add_paragraph(
+                document,
+                (
+                    f"Tracks={len(tracks)}; keyframes={keyframe_count}; ocorrências={len(cluster.occurrence_ids)}; "
+                    "a tabela abaixo consolida as ocorrências representativas do grupo."
+                ),
+            )
+            related_groups = candidate_map.get(cluster.cluster_id, [])
+            self._add_paragraph(
+                document,
+                "Relações intergrupos sugeridas para revisão: "
+                + (", ".join(related_groups) if related_groups else "nenhuma acima do limiar configurado."),
+            )
+            self._add_group_track_table(document, tracks, keyframes_map)
+
+    def _add_group_track_table(
+        self,
+        document: Document,
+        tracks: list[FaceTrack],
+        keyframes_map: dict[str, list[KeyFrame]],
+    ) -> None:
+        if not tracks:
+            self._add_paragraph(document, "Nenhum track consolidado para este grupo.")
+            return
+
+        table = document.add_table(rows=1, cols=4)
+        table.style = "Table Grid"
+        table.alignment = WD_TABLE_ALIGNMENT.CENTER
+        headers = table.rows[0].cells
+        self._set_cell_text(headers[0], "Track", alignment=WD_ALIGN_PARAGRAPH.CENTER, bold=True)
+        self._set_cell_text(headers[1], "Recorte", alignment=WD_ALIGN_PARAGRAPH.CENTER, bold=True)
+        self._set_cell_text(headers[2], "Quadro de origem", alignment=WD_ALIGN_PARAGRAPH.CENTER, bold=True)
+        self._set_cell_text(headers[3], "Metadados", alignment=WD_ALIGN_PARAGRAPH.CENTER, bold=True)
+
+        for track in tracks[: self._config.reporting.max_tracks_per_group]:
+            row = table.add_row().cells
+            keyframe = self._select_representative_keyframe(track, keyframes_map)
+            crop_path = keyframe.preview_path if keyframe is not None and keyframe.preview_path is not None else track.preview_path
+            context_path = keyframe.context_image_path if keyframe is not None else None
+
+            self._set_cell_text(row[0], track.track_id, alignment=WD_ALIGN_PARAGRAPH.CENTER)
+            self._add_cell_image(row[1], crop_path, width=Inches(1.35))
+            self._add_cell_image(row[2], context_path, width=Inches(2.2))
+
+            metadata_lines = [
+                f"Origem: {track.source_path.name}",
+                f"Intervalo: {self._track_interval(track)}",
+                f"Frames: {self._frame_interval(track)}",
+                f"Detecções: {len(track.occurrence_ids)}",
+                f"Keyframes: {len(track.keyframe_ids)}",
+                f"Qualidade média: {track.quality_statistics.mean_quality_score:.3f}",
+            ]
+            if keyframe is not None:
+                metadata_lines.append(keyframe_reference_text(keyframe))
+            self._set_cell_text(
+                row[3],
+                "\n".join(metadata_lines),
+                alignment=WD_ALIGN_PARAGRAPH.LEFT,
+            )
+
+        document.add_paragraph()
+
+    def _add_face_size_statistics(self, document: Document, result: InventoryResult) -> None:
+        table = document.add_table(rows=1, cols=4)
+        table.style = "Table Grid"
+        table.alignment = WD_TABLE_ALIGNMENT.CENTER
+        headers = table.rows[0].cells
+        self._set_cell_text(headers[0], "Conjunto", alignment=WD_ALIGN_PARAGRAPH.CENTER, bold=True)
+        self._set_cell_text(headers[1], "Quantidade", alignment=WD_ALIGN_PARAGRAPH.CENTER, bold=True)
+        self._set_cell_text(headers[2], "Média (px)", alignment=WD_ALIGN_PARAGRAPH.CENTER, bold=True)
+        self._set_cell_text(headers[3], "Desvio padrão (px)", alignment=WD_ALIGN_PARAGRAPH.CENTER, bold=True)
+
+        rows = [
             (
-                f"Análise facial: mecanismo={self._config.face_model.backend}; modelo={self._config.face_model.model_name}; "
-                f"tamanho de detecção={self._detection_size_label()}; qualidade mínima={self._config.face_model.minimum_face_quality:.2f}; "
-                f"tamanho mínimo da face={self._config.face_model.minimum_face_size_pixels} px; contexto={self._config.face_model.ctx_id}; "
-                f"mecanismos de execução={providers}."
+                "Todas as faces detectadas",
+                result.summary.total_detected_face_sizes.count,
+                result.summary.total_detected_face_sizes.mean_pixels,
+                result.summary.total_detected_face_sizes.stddev_pixels,
             ),
             (
-                f"Agrupamento: limiar de atribuição={self._config.clustering.assignment_similarity:.2f}; "
-                f"limiar de sugestão entre possíveis indivíduos={self._config.clustering.candidate_similarity:.2f}; "
-                f"tamanho mínimo do grupo={self._config.clustering.min_cluster_size}."
+                "Faces filtradas e mantidas",
+                result.summary.selected_face_sizes.count,
+                result.summary.selected_face_sizes.mean_pixels,
+                result.summary.selected_face_sizes.stddev_pixels,
             ),
-            (
-                f"Relatório: faces máximas por possível indivíduo na galeria={self._config.reporting.max_gallery_faces_per_group}; "
-                f"compilação automática do PDF={'sim' if self._config.reporting.compile_pdf else 'nao'}."
-            ),
-            f"MediaInfo: {self._mediainfo_status(result.files)}; diretório configurado={mediainfo_directory}.",
-            f"Software utilizado: aplicação de código aberto disponível em {PROJECT_URL}.",
         ]
+        for label, count, mean_pixels, stddev_pixels in rows:
+            cells = table.add_row().cells
+            self._set_cell_text(cells[0], label)
+            self._set_cell_text(cells[1], str(count), alignment=WD_ALIGN_PARAGRAPH.CENTER)
+            self._set_cell_text(cells[2], self._format_face_size_value(mean_pixels), alignment=WD_ALIGN_PARAGRAPH.CENTER)
+            self._set_cell_text(
+                cells[3],
+                self._format_face_size_value(stddev_pixels),
+                alignment=WD_ALIGN_PARAGRAPH.CENTER,
+            )
+        document.add_paragraph()
+
+    def _select_representative_keyframe(
+        self,
+        track: FaceTrack,
+        keyframes_map: dict[str, list[KeyFrame]],
+    ) -> KeyFrame | None:
+        keyframes = keyframes_map.get(track.track_id, [])
+        if not keyframes:
+            return None
+        for keyframe in keyframes:
+            if track.best_occurrence_id is not None and keyframe.occurrence_id == track.best_occurrence_id:
+                return keyframe
+        return keyframes[0]
+
+    def _track_interval(self, track: FaceTrack) -> str:
+        return f"{format_seconds(track.start_time)} - {format_seconds(track.end_time)}"
+
+    def _frame_interval(self, track: FaceTrack) -> str:
+        start = "-" if track.start_frame is None else f"{track.start_frame:06d}"
+        end = "-" if track.end_frame is None else f"{track.end_frame:06d}"
+        return f"{start} - {end}"
 
     def _add_heading(self, document: Document, text: str, level: int) -> None:
         document.add_heading(text, level=level)
 
     def _add_paragraph(self, document: Document, text: str) -> None:
-        paragraph = document.add_paragraph(text)
-        paragraph.paragraph_format.space_after = Pt(8)
+        document.add_paragraph(text)
 
     def _add_list_item(self, document: Document, text: str) -> None:
         paragraph = document.add_paragraph(style="List Number")
@@ -193,6 +254,7 @@ class DocxReportGenerator:
     def _add_notice_box(self, document: Document, title: str, body: str) -> None:
         table = document.add_table(rows=1, cols=1)
         table.style = "Table Grid"
+        table.alignment = WD_TABLE_ALIGNMENT.CENTER
         cell = table.cell(0, 0)
         paragraph = cell.paragraphs[0]
         title_run = paragraph.add_run(f"{title}. ")
@@ -200,205 +262,108 @@ class DocxReportGenerator:
         paragraph.add_run(body)
         document.add_paragraph()
 
-    def _add_face_statistics_table(self, document: Document, result: InventoryResult) -> None:
-        table = document.add_table(rows=1, cols=6)
-        table.style = "Table Grid"
-        headers = [
-            "Conjunto",
-            "Número de faces",
-            "Mínimo (px)",
-            "Máximo (px)",
-            "Média (px)",
-            "Desvio padrão (px)",
-        ]
-        for index, header in enumerate(headers):
-            table.rows[0].cells[index].text = header
-        for label, stats in [
-            ("Faces detectadas antes dos filtros", result.summary.total_detected_face_sizes),
-            ("Faces selecionadas após os filtros", result.summary.selected_face_sizes),
-        ]:
-            row = table.add_row().cells
-            row[0].text = label
-            if stats.count == 0:
-                row[1].text = "0"
-                row[2].text = "-"
-                row[3].text = "-"
-                row[4].text = "-"
-                row[5].text = "-"
-            else:
-                row[1].text = str(stats.count)
-                row[2].text = f"{stats.min_pixels:.1f}"
-                row[3].text = f"{stats.max_pixels:.1f}"
-                row[4].text = f"{stats.mean_pixels:.1f}"
-                row[5].text = f"{stats.stddev_pixels:.1f}"
-        document.add_paragraph()
-
-    def _add_cluster_overview_table(self, document: Document, clusters: list[FaceCluster]) -> None:
-        table = document.add_table(rows=1, cols=3)
-        table.style = "Table Grid"
-        headers = ["Identificador", "Ocorrências", "Possíveis indivíduos correlatos"]
-        for index, header in enumerate(headers):
-            table.rows[0].cells[index].text = header
-        if not clusters:
-            row = table.add_row().cells
-            row[0].text = "-"
-            row[1].text = "0"
-            row[2].text = "Nenhum possível indivíduo identificado."
-        for cluster in clusters:
-            row = table.add_row().cells
-            row[0].text = cluster.cluster_id
-            row[1].text = str(len(cluster.occurrence_ids))
-            row[2].text = ", ".join(cluster.candidate_cluster_ids) or "-"
-        document.add_paragraph()
-
-    def _add_cluster_section(self, document: Document, cluster: FaceCluster, occurrences: list[FaceOccurrence]) -> None:
-        self._add_heading(document, f"Possível indivíduo {cluster.cluster_id}", level=3)
-        self._add_paragraph(document, f"Total de ocorrências: {len(occurrences)}")
-        self._add_paragraph(
-            document,
-            f"Possíveis indivíduos correlatos: {', '.join(cluster.candidate_cluster_ids) or '-'}",
-        )
-        self._add_heading(document, "Galeria comparativa", level=4)
-        if occurrences:
-            for occurrence in occurrences[: self._config.reporting.max_gallery_faces_per_group]:
-                self._add_gallery_row(document, occurrence)
-        else:
-            self._add_paragraph(document, "Nenhuma ilustração disponível para este possível indivíduo.")
-        self._add_heading(document, "Ocorrências do possível indivíduo", level=4)
-        self._add_occurrences_table(document, occurrences)
-
-    def _add_gallery_row(self, document: Document, occurrence: FaceOccurrence) -> None:
-        table = document.add_table(rows=1, cols=3)
-        table.style = "Table Grid"
-        widths = [Inches(1.7), Inches(3.6), Inches(2.4)]
-        labels = ["Recorte facial", "Imagem ou quadro de origem", "Dados da ocorrência"]
-        header = table.add_row().cells
-        for index, label in enumerate(labels):
-            header[index].text = label
-        cells = table.add_row().cells
-        for cell, width in zip(cells, widths):
-            cell.width = width
-        self._fill_image_cell(cells[0], occurrence.crop_path, width=Inches(1.5))
-        self._fill_image_cell(cells[1], occurrence.context_image_path, width=Inches(3.2))
-        self._fill_metadata_cell(cells[2], occurrence)
-        document.add_paragraph()
-
-    def _fill_image_cell(self, cell, image_path: Path | None, width: Inches) -> None:
-        paragraph = cell.paragraphs[0]
-        paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        if image_path is None or not image_path.exists():
-            paragraph.add_run("Artefato não disponível")
-            return
-        run = paragraph.add_run()
-        run.add_picture(str(image_path), width=width)
-
-    def _fill_metadata_cell(self, cell, occurrence: FaceOccurrence) -> None:
-        lines = [
-            occurrence.occurrence_id,
-            f"Arquivo: {occurrence.source_path.name}",
-            f"Marca temporal: {format_seconds(occurrence.frame_timestamp_seconds)}",
-            f"Pontuação: {occurrence.detection_score:.3f}",
-            (
-                f"Caixa delimitadora: {occurrence.bbox.x1:.1f}, {occurrence.bbox.y1:.1f}, "
-                f"{occurrence.bbox.x2:.1f}, {occurrence.bbox.y2:.1f}"
-            ),
-        ]
-        cell.text = ""
-        for index, line in enumerate(lines):
-            paragraph = cell.paragraphs[0] if index == 0 else cell.add_paragraph()
-            paragraph.add_run(line)
-
-    def _add_occurrences_table(self, document: Document, occurrences: list[FaceOccurrence]) -> None:
-        table = document.add_table(rows=1, cols=4)
-        table.style = "Table Grid"
-        headers = ["Ocorrência", "Arquivo", "Marca temporal", "Pontuação"]
-        for index, header in enumerate(headers):
-            table.rows[0].cells[index].text = header
-        if not occurrences:
-            row = table.add_row().cells
-            row[0].text = "-"
-            row[1].text = "Nenhuma ocorrência detalhada."
-            row[2].text = "-"
-            row[3].text = "-"
-            return
-        for item in occurrences:
-            row = table.add_row().cells
-            row[0].text = item.occurrence_id
-            row[1].text = item.source_path.name
-            row[2].text = format_seconds(item.frame_timestamp_seconds)
-            row[3].text = f"{item.detection_score:.3f}"
-        document.add_paragraph()
-
     def _add_hashes_table(self, document: Document, files: list[FileRecord]) -> None:
         table = document.add_table(rows=1, cols=2)
         table.style = "Table Grid"
-        table.rows[0].cells[0].text = "Arquivo"
-        table.rows[0].cells[1].text = "SHA-512"
-        if not files:
-            row = table.add_row().cells
-            row[0].text = "-"
-            row[1].text = "Nenhum arquivo catalogado."
-            return
+        table.alignment = WD_TABLE_ALIGNMENT.CENTER
+        self._set_cell_text(table.rows[0].cells[0], "Arquivo", alignment=WD_ALIGN_PARAGRAPH.CENTER, bold=True)
+        self._set_cell_text(table.rows[0].cells[1], "SHA-512", alignment=WD_ALIGN_PARAGRAPH.CENTER, bold=True)
         for item in files:
             row = table.add_row().cells
-            row[0].text = str(item.path)
-            row[1].text = item.sha512
+            self._set_cell_text(row[0], str(item.path))
+            self._set_cell_text(row[1], item.sha512)
         document.add_paragraph()
 
-    def _add_media_info_table(self, document: Document, files: list[FileRecord]) -> None:
-        table = document.add_table(rows=1, cols=3)
+    def _add_media_metadata_table(self, document: Document, files: list[FileRecord]) -> None:
+        table = document.add_table(rows=1, cols=2)
         table.style = "Table Grid"
-        headers = ["Arquivo", "Fluxo", "Características"]
-        for index, header in enumerate(headers):
-            table.rows[0].cells[index].text = header
+        table.alignment = WD_TABLE_ALIGNMENT.CENTER
+        table.autofit = False
+        self._set_cell_text(table.rows[0].cells[0], "Arquivo", alignment=WD_ALIGN_PARAGRAPH.CENTER, bold=True)
+        self._set_cell_text(table.rows[0].cells[1], "Características", alignment=WD_ALIGN_PARAGRAPH.CENTER, bold=True)
+        for cell in table.columns[0].cells:
+            cell.width = Inches(4.2)
+        for cell in table.columns[1].cells:
+            cell.width = Inches(2.4)
+
         media_files = [item for item in files if item.media_type.value in {"image", "video"}]
         if not media_files:
             row = table.add_row().cells
-            row[0].text = "-"
-            row[1].text = "-"
-            row[2].text = "Nenhuma mídia elegível para extração via MediaInfo."
+            self._set_cell_text(row[0], "-")
+            self._set_cell_text(row[1], "Nenhuma mídia elegível para extração interna de metadados.")
             document.add_paragraph()
             return
+
         for item in media_files:
             if item.media_info_tracks:
-                for index, track in enumerate(item.media_info_tracks):
-                    row = table.add_row().cells
-                    row[0].text = str(item.path) if index == 0 else ""
-                    row[1].text = track.track_type
-                    row[2].text = "; ".join(f"{attribute.label}: {attribute.value}" for attribute in track.attributes)
+                row = table.add_row().cells
+                self._set_cell_text(row[0], str(item.path))
+                self._set_cell_text(row[1], self._media_info_file_description(item.media_info_tracks))
             else:
                 row = table.add_row().cells
-                row[0].text = str(item.path)
-                row[1].text = "-"
-                row[2].text = item.media_info_error or "MediaInfo não disponível para este arquivo."
+                self._set_cell_text(row[0], str(item.path))
+                self._set_cell_text(row[1], item.media_info_error or "Metadados técnicos indisponíveis.")
         document.add_paragraph()
+
+    def _media_info_file_description(self, tracks: tuple[object, ...]) -> str:
+        descriptions: list[str] = []
+        show_type_label = len(tracks) > 1
+        for track in tracks:
+            track_title = media_track_type_label(track.track_type)
+            description = self._media_info_track_description(
+                track.attributes,
+                track_title=track_title,
+                show_type_label=show_type_label and track_title != "Arquivo",
+            )
+            descriptions.append(description)
+        return "\n\n".join(descriptions)
 
     def _add_log_excerpt(self, document: Document, log_path: Path, max_lines: int = 60) -> None:
         if not log_path.exists():
             self._add_paragraph(document, "Registro principal não encontrado.")
             return
         lines = log_path.read_text(encoding="utf-8", errors="ignore").splitlines()[-max_lines:]
-        if not lines:
-            self._add_paragraph(document, "Nenhum registro disponível.")
+        self._add_paragraph(document, "\n".join(lines))
+
+    def _set_cell_text(
+        self,
+        cell,
+        text: str,
+        *,
+        alignment: WD_ALIGN_PARAGRAPH = WD_ALIGN_PARAGRAPH.LEFT,
+        bold: bool = False,
+    ) -> None:
+        cell.text = ""
+        cell.vertical_alignment = WD_ALIGN_VERTICAL.TOP
+        paragraph = cell.paragraphs[0]
+        paragraph.alignment = alignment
+        run = paragraph.add_run(text)
+        run.bold = bold
+
+    def _add_cell_image(self, cell, image_path: Path | None, *, width: Inches) -> None:
+        cell.text = ""
+        cell.vertical_alignment = WD_ALIGN_VERTICAL.TOP
+        paragraph = cell.paragraphs[0]
+        paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        if image_path is None or not image_path.exists():
+            paragraph.add_run("Artefato não disponível")
             return
-        paragraph = document.add_paragraph()
-        for index, line in enumerate(lines):
-            paragraph.add_run(line)
-            if index != len(lines) - 1:
-                paragraph.add_run("\n")
+        paragraph.add_run().add_picture(str(image_path), width=width)
 
-    def _detection_size_label(self) -> str:
-        if self._config.face_model.det_size is None:
-            return "resolução original do arquivo ou quadro"
-        return f"{self._config.face_model.det_size[0]} x {self._config.face_model.det_size[1]}"
+    def _format_face_size_value(self, value: float | None) -> str:
+        return "-" if value is None else f"{value:.2f}"
 
-    def _mediainfo_status(self, files: list[FileRecord]) -> str:
-        media_files = [item for item in files if item.media_type.value in {"image", "video"}]
-        if not media_files:
-            return "nenhuma mídia elegível para coleta"
-        if any(item.media_info_tracks for item in media_files):
-            return "coleta executada para mídias elegíveis, com resultados detalhados na subseção anterior"
-        error_messages = [item.media_info_error for item in media_files if item.media_info_error]
-        if error_messages:
-            return f"coleta não realizada ou indisponível no ambiente; motivo predominante={error_messages[0]}"
-        return "coleta não realizada"
+    def _media_info_track_description(
+        self,
+        attributes: tuple[MediaInfoAttribute, ...],
+        *,
+        track_title: str | None = None,
+        show_type_label: bool = False,
+    ) -> str:
+        if not attributes:
+            return "Nenhuma característica disponível."
+        lines: list[str] = []
+        if show_type_label and track_title:
+            lines.append(track_title)
+        lines.extend(f"{attribute.label}: {attribute.value}" for attribute in attributes)
+        return "\n".join(lines)

@@ -24,7 +24,7 @@ from inventario_faces import __version__
 from inventario_faces.app import persist_runtime_config
 from inventario_faces.domain.config import AppConfig
 from inventario_faces.gui.config_dialog import ConfigDialog
-from inventario_faces.gui.worker import InventoryWorker
+from inventario_faces.gui.worker import FaceSearchWorker, InventoryWorker
 from inventario_faces.services.inventory_service import InventoryService
 
 
@@ -39,7 +39,7 @@ class MainWindow(QMainWindow):
         self._current_config = initial_config
         self._current_report_path: Path | None = None
         self._thread: QThread | None = None
-        self._worker: InventoryWorker | None = None
+        self._worker: InventoryWorker | FaceSearchWorker | None = None
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -63,14 +63,17 @@ class MainWindow(QMainWindow):
         self._config_button.clicked.connect(self._open_configuration_dialog)
         self._about_button = QPushButton("Sobre")
         self._about_button.clicked.connect(self._show_about_dialog)
-        self._run_button = QPushButton("Executar")
+        self._run_button = QPushButton("Criar inventário")
         self._run_button.clicked.connect(self._start_processing)
+        self._face_search_button = QPushButton("Busca por face")
+        self._face_search_button.clicked.connect(self._start_face_search)
         self._open_report_button = QPushButton("Abrir Relatório")
         self._open_report_button.setEnabled(False)
         self._open_report_button.clicked.connect(self._open_report)
         controls_layout.addWidget(self._config_button)
         controls_layout.addWidget(self._about_button)
         controls_layout.addWidget(self._run_button)
+        controls_layout.addWidget(self._face_search_button)
         controls_layout.addWidget(self._open_report_button)
 
         self._status_label = QLabel(
@@ -140,6 +143,52 @@ class MainWindow(QMainWindow):
         self._thread.finished.connect(self._cleanup_thread)
         self._thread.start()
 
+    def _start_face_search(self) -> None:
+        folder = self._folder_input.text().strip()
+        if not folder:
+            QMessageBox.warning(self, "Diretório obrigatório", "Selecione uma pasta de entrada.")
+            return
+
+        root_directory = Path(folder)
+        if not root_directory.exists():
+            QMessageBox.warning(self, "Diretório inválido", "A pasta selecionada não existe.")
+            return
+
+        selected_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Selecionar imagem para busca por face",
+            str(root_directory),
+            self._image_file_filter(),
+        )
+        if not selected_path:
+            return
+
+        query_image_path = Path(selected_path)
+        if not query_image_path.exists():
+            QMessageBox.warning(self, "Arquivo inválido", "A imagem de consulta selecionada não existe.")
+            return
+
+        self._set_running_state(True)
+        self._progress_bar.setValue(0)
+        self._log_view.clear()
+        self._append_log(f"Iniciando busca por face em {root_directory}...")
+        self._append_log(f"Imagem de consulta: {query_image_path}")
+
+        service = self._service_factory(self._current_config)
+        self._thread = QThread(self)
+        self._worker = FaceSearchWorker(service, root_directory, query_image_path)
+        self._worker.moveToThread(self._thread)
+
+        self._thread.started.connect(self._worker.run)
+        self._worker.progress_changed.connect(self._on_progress_changed)
+        self._worker.log_message.connect(self._append_log)
+        self._worker.completed.connect(self._on_completed)
+        self._worker.failed.connect(self._on_failed)
+        self._worker.completed.connect(self._thread.quit)
+        self._worker.failed.connect(self._thread.quit)
+        self._thread.finished.connect(self._cleanup_thread)
+        self._thread.start()
+
     def _on_progress_changed(self, value: int, message: str) -> None:
         self._progress_bar.setValue(value)
         self._status_label.setText(message)
@@ -190,7 +239,12 @@ class MainWindow(QMainWindow):
 
     def _set_running_state(self, running: bool) -> None:
         self._run_button.setEnabled(not running)
+        self._face_search_button.setEnabled(not running)
         self._config_button.setEnabled(not running)
         self._folder_input.setEnabled(not running)
         self._browse_button.setEnabled(not running)
         self._open_report_button.setEnabled((not running) and self._current_report_path is not None)
+
+    def _image_file_filter(self) -> str:
+        patterns = " ".join(f"*{extension}" for extension in self._current_config.media.image_extensions)
+        return f"Imagens suportadas ({patterns});;Todos os arquivos (*)"

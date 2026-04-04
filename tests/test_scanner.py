@@ -15,13 +15,14 @@ class ScannerServiceTests(unittest.TestCase):
         self.service = ScannerService(
             MediaSettings(
                 image_extensions=(".jpg", ".png"),
-                video_extensions=(".mp4", ".avi"),
+                video_extensions=(".mp4", ".avi", ".dav"),
             )
         )
 
     def test_classify_recognizes_supported_extensions(self) -> None:
         self.assertEqual(self.service.classify(Path("image.jpg")), MediaType.IMAGE)
         self.assertEqual(self.service.classify(Path("movie.mp4")), MediaType.VIDEO)
+        self.assertEqual(self.service.classify(Path("gravador.dav")), MediaType.VIDEO)
         self.assertEqual(self.service.classify(Path("notes.txt")), MediaType.OTHER)
 
     def test_scan_skips_excluded_directories(self) -> None:

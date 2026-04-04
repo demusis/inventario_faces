@@ -13,8 +13,11 @@ from inventario_faces.infrastructure.config_loader import (
 from inventario_faces.infrastructure.face_analyzer_insight import InsightFaceAnalyzer
 from inventario_faces.infrastructure.latex_compiler import LatexCompiler
 from inventario_faces.infrastructure.media_info_service import MediaInfoService
+from inventario_faces.reporting.combined_face_search_report_generator import CombinedFaceSearchReportGenerator
 from inventario_faces.reporting.combined_report_generator import CombinedReportGenerator
 from inventario_faces.reporting.docx_renderer import DocxReportGenerator
+from inventario_faces.reporting.face_search_docx_renderer import FaceSearchDocxReportGenerator
+from inventario_faces.reporting.face_search_latex_renderer import FaceSearchLatexReportGenerator
 from inventario_faces.reporting.latex_renderer import LatexReportGenerator
 from inventario_faces.services.clustering_service import ClusteringService
 from inventario_faces.services.hashing_service import HashingService
@@ -70,5 +73,9 @@ def build_inventory_service(config: AppConfig | None = None) -> InventoryService
             docx_generator=DocxReportGenerator(runtime_config),
         ),
         face_analyzer_factory=lambda: InsightFaceAnalyzer(runtime_config.face_model),
-        media_info_extractor=MediaInfoService(directory=runtime_config.app.mediainfo_directory),
+        media_info_extractor=MediaInfoService(),
+        face_search_report_generator=CombinedFaceSearchReportGenerator(
+            latex_generator=FaceSearchLatexReportGenerator(runtime_config, LatexCompiler()),
+            docx_generator=FaceSearchDocxReportGenerator(runtime_config),
+        ),
     )

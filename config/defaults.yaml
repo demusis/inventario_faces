@@ -4,7 +4,6 @@ app:
   report_title: "Relat\u00f3rio Forense de Invent\u00e1rio Facial"
   organization: "Laborat\u00f3rio de An\u00e1lise Digital"
   log_level: "INFO"
-  mediainfo_directory: null
 
 media:
   image_extensions:
@@ -19,14 +18,22 @@ media:
     - ".mp4"
     - ".avi"
     - ".mkv"
+    - ".dav"
     - ".mov"
     - ".wmv"
     - ".mpeg"
     - ".mpg"
 
 video:
+  # Intervalo, em segundos, entre quadros amostrados de vídeos.
+  # Na configuração padrão, a análise não é quadro a quadro: processa-se um quadro a cada intervalo.
   sampling_interval_seconds: 2.0
+  # Limite de quadros amostrados por arquivo. Use null para percorrer todo o vídeo.
   max_frames_per_video: 300
+  # Distância temporal mínima entre keyframes consecutivos do mesmo track.
+  keyframe_interval_seconds: 4.0
+  # Limiar de mudança visual/geométrica que justifica novo keyframe.
+  significant_change_threshold: 0.18
 
 face_model:
   backend: "insightface"
@@ -40,13 +47,46 @@ face_model:
   providers: []
 
 clustering:
+  # Similaridade mínima para fundir tracks no mesmo grupo.
   assignment_similarity: 0.52
+  # Similaridade a partir da qual grupos distintos viram sugestão de revisão.
   candidate_similarity: 0.44
+  # Quantidade mínima de tracks para um grupo aparecer na saída final.
   min_cluster_size: 1
+  # Quantidade mínima de ocorrências para um track entrar no clustering.
+  min_track_size: 1
+
+tracking:
+  iou_threshold: 0.15
+  spatial_distance_threshold: 0.18
+  embedding_similarity_threshold: 0.48
+  minimum_total_match_score: 0.30
+  geometry_weight: 0.45
+  embedding_weight: 0.55
+  max_missed_detections: 2
+  confidence_margin: 0.05
+  representative_embeddings_per_track: 5
+  top_crops_per_track: 4
+  quality_improvement_margin: 0.05
+
+enhancement:
+  enable_preprocessing: true
+  minimum_brightness_to_enhance: 0.36
+  clahe_clip_limit: 2.0
+  clahe_tile_grid_size: 8
+  gamma: 1.0
+  denoise_strength: 0
+
+search:
+  enabled: true
+  prefer_faiss: true
+  coarse_top_k: 8
+  refine_top_k: 12
 
 reporting:
-  max_gallery_faces_per_group: 6
   compile_pdf: true
+  # Quantidade máxima de tracks detalhados na seção “Resultados por Grupo”.
+  max_tracks_per_group: 8
 
 forensics:
   chain_of_custody_note: "Os arquivos originais n\u00e3o foram alterados. Todos os hashes SHA-512 foram calculados em modo somente leitura, e as deriva\u00e7\u00f5es geradas foram armazenadas separadamente para auditoria."

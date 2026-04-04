@@ -1,220 +1,184 @@
 from __future__ import annotations
 
-import json
-import shutil
-import subprocess
+import mimetypes
 from pathlib import Path
+
+import cv2
+from PIL import Image, UnidentifiedImageError
 
 from inventario_faces.domain.entities import MediaInfoAttribute, MediaInfoTrack
 
 
 class MediaInfoService:
-    _EXECUTABLE_NAMES = (
-        "mediainfo.exe",
-        "MediaInfo.exe",
-        "mediainfo",
-        "MediaInfo",
-    )
-
-    _TRACK_LABELS = {
-        "General": "Geral",
-        "Image": "Imagem",
-        "Video": "Vídeo",
-        "Audio": "Áudio",
-        "Text": "Texto",
-    }
-
-    _FIELD_LABELS = {
-        "Format": "Formato",
-        "Format_Profile": "Perfil do formato",
-        "CodecID": "Identificador de codec",
-        "InternetMediaType": "Tipo MIME",
-        "Width": "Largura",
-        "Height": "Altura",
-        "DisplayAspectRatio/String": "Proporção de exibição",
-        "Duration/String3": "Duração",
-        "OverallBitRate/String": "Taxa de bits global",
-        "BitRate/String": "Taxa de bits",
-        "FrameRate/String": "Taxa de quadros",
-        "FrameCount": "Número de quadros",
-        "FileSize/String": "Tamanho do arquivo",
-        "StreamSize/String": "Tamanho do fluxo",
-        "ColorSpace": "Espaço de cor",
-        "ChromaSubsampling": "Subamostragem de croma",
-        "BitDepth": "Profundidade de bits",
-        "Compression_Mode": "Modo de compressão",
-        "ScanType": "Varredura",
-        "ChannelLayout": "Layout de canais",
-        "Channel_s_": "Canais",
-        "Channels": "Canais",
-        "SamplingRate/String": "Taxa de amostragem",
-        "Language": "Idioma",
-    }
-
-    _TRACK_FIELDS = {
-        "General": (
-            "Format",
-            "Format_Profile",
-            "InternetMediaType",
-            "FileSize/String",
-            "Duration/String3",
-            "OverallBitRate/String",
-            "FrameCount",
-        ),
-        "Image": (
-            "Format",
-            "InternetMediaType",
-            "Width",
-            "Height",
-            "ColorSpace",
-            "ChromaSubsampling",
-            "BitDepth",
-            "Compression_Mode",
-            "StreamSize/String",
-        ),
-        "Video": (
-            "Format",
-            "Format_Profile",
-            "CodecID",
-            "Width",
-            "Height",
-            "DisplayAspectRatio/String",
-            "Duration/String3",
-            "BitRate/String",
-            "FrameRate/String",
-            "FrameCount",
-            "ScanType",
-            "ColorSpace",
-            "ChromaSubsampling",
-            "BitDepth",
-            "StreamSize/String",
-        ),
-        "Audio": (
-            "Format",
-            "CodecID",
-            "Duration/String3",
-            "BitRate/String",
-            "Channels",
-            "ChannelLayout",
-            "SamplingRate/String",
-            "BitDepth",
-            "Language",
-            "StreamSize/String",
-        ),
-        "Text": (
-            "Format",
-            "CodecID",
-            "Language",
-            "StreamSize/String",
-        ),
-    }
-
     def __init__(
         self,
         executable_path: str | None = None,
         directory: str | Path | None = None,
     ) -> None:
-        self._configured_directory = (
-            Path(directory).expanduser().resolve()
-            if directory not in (None, "")
-            else None
-        )
-        self._executable_path = self._resolve_executable_path(executable_path, self._configured_directory)
+        self._legacy_executable_path = executable_path
+        self._legacy_directory = Path(directory).expanduser().resolve() if directory not in (None, "") else None
 
     @property
-    def executable_path(self) -> str | None:
-        return self._executable_path
-
-    def extract(self, path: Path) -> tuple[tuple[MediaInfoTrack, ...], str | None]:
-        if not self._executable_path:
-            if self._configured_directory is not None:
-                return (), (
-                    "MediaInfo nao encontrado no diretorio configurado: "
-                    f"{self._configured_directory}"
-                )
-            return (), "MediaInfo nao disponivel no ambiente."
-
-        try:
-            completed = subprocess.run(
-                [self._executable_path, "--Output=JSON", str(path)],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=120,
-                check=False,
-            )
-        except Exception as exc:
-            return (), f"Falha ao executar MediaInfo: {exc}"
-
-        if completed.returncode != 0:
-            message = completed.stderr.strip() or completed.stdout.strip() or "MediaInfo retornou erro."
-            return (), message
-
-        try:
-            payload = json.loads(completed.stdout)
-        except json.JSONDecodeError as exc:
-            return (), f"Falha ao interpretar a saida JSON do MediaInfo: {exc}"
-
-        tracks_payload = payload.get("media", {}).get("track", [])
-        tracks: list[MediaInfoTrack] = []
-        for track in tracks_payload:
-            if not isinstance(track, dict):
-                continue
-            track_type = str(track.get("@type", "")).strip()
-            if not track_type:
-                continue
-            attributes = self._extract_attributes(track_type, track)
-            if not attributes:
-                continue
-            tracks.append(
-                MediaInfoTrack(
-                    track_type=self._TRACK_LABELS.get(track_type, track_type),
-                    attributes=tuple(attributes),
-                )
-            )
-        return tuple(tracks), None
-
-    def _resolve_executable_path(
-        self,
-        executable_path: str | None,
-        configured_directory: Path | None,
-    ) -> str | None:
-        if executable_path:
-            return str(Path(executable_path).expanduser().resolve())
-
-        configured_candidate = self._resolve_from_directory(configured_directory)
-        if configured_candidate is not None:
-            return configured_candidate
-        return shutil.which("mediainfo")
-
-    def _resolve_from_directory(self, configured_directory: Path | None) -> str | None:
-        if configured_directory is None:
-            return None
-        if configured_directory.is_file():
-            return str(configured_directory)
-        if not configured_directory.exists():
-            return None
-        for executable_name in self._EXECUTABLE_NAMES:
-            candidate = configured_directory / executable_name
-            if candidate.exists():
-                return str(candidate.resolve())
+    def executable_path(self) -> None:
         return None
 
-    def _extract_attributes(self, track_type: str, payload: dict[str, object]) -> list[MediaInfoAttribute]:
-        fields = self._TRACK_FIELDS.get(track_type, ())
-        attributes: list[MediaInfoAttribute] = []
-        for field_name in fields:
-            raw_value = payload.get(field_name)
-            if raw_value in (None, ""):
-                continue
-            text = str(raw_value).strip()
-            if not text:
-                continue
-            attributes.append(
-                MediaInfoAttribute(
-                    label=self._FIELD_LABELS.get(field_name, field_name),
-                    value=text,
+    def extract(self, path: Path) -> tuple[tuple[MediaInfoTrack, ...], str | None]:
+        candidate = Path(path)
+        if not candidate.exists():
+            return (), "Arquivo não encontrado para extração de metadados."
+
+        image_tracks = self._extract_image_metadata(candidate)
+        if image_tracks is not None:
+            return image_tracks, None
+
+        video_tracks, video_error = self._extract_video_metadata(candidate)
+        if video_tracks is not None:
+            return video_tracks, None
+        return (), video_error
+
+    def _extract_image_metadata(self, path: Path) -> tuple[MediaInfoTrack, ...] | None:
+        try:
+            with Image.open(path) as image:
+                file_size = path.stat().st_size
+                format_name = (image.format or path.suffix.lstrip(".") or "desconhecido").upper()
+                mime = Image.MIME.get(image.format, mimetypes.guess_type(path.name)[0] or "desconhecido")
+                compression = image.info.get("compression")
+                image_track_attributes = [
+                    MediaInfoAttribute("Formato", format_name),
+                    MediaInfoAttribute("Tipo MIME", mime),
+                    MediaInfoAttribute("Largura", f"{image.width} px"),
+                    MediaInfoAttribute("Altura", f"{image.height} px"),
+                    MediaInfoAttribute("Modo de cor", image.mode),
+                    MediaInfoAttribute("Profundidade de bits", self._image_bit_depth(image.mode)),
+                ]
+                if compression:
+                    image_track_attributes.append(MediaInfoAttribute("Compressão", str(compression)))
+                return (
+                    MediaInfoTrack(
+                        track_type="Geral",
+                        attributes=(
+                            MediaInfoAttribute("Formato", format_name),
+                            MediaInfoAttribute("Tipo MIME", mime),
+                            MediaInfoAttribute("Tamanho do arquivo", self._format_file_size(file_size)),
+                        ),
+                    ),
+                    MediaInfoTrack(
+                        track_type="Imagem",
+                        attributes=tuple(image_track_attributes),
+                    ),
                 )
-            )
-        return attributes
+        except (UnidentifiedImageError, OSError, ValueError):
+            return None
+
+    def _extract_video_metadata(self, path: Path) -> tuple[tuple[MediaInfoTrack, ...] | None, str | None]:
+        capture = cv2.VideoCapture(str(path))
+        if not capture.isOpened():
+            capture.release()
+            return None, "Não foi possível extrair metadados técnicos com o extrator interno."
+
+        try:
+            width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+            height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+            fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
+            frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            fourcc = self._decode_fourcc(int(capture.get(cv2.CAP_PROP_FOURCC) or 0))
+            duration_seconds = frame_count / fps if fps > 0.0 and frame_count > 0 else 0.0
+            file_size = path.stat().st_size
+            bitrate = self._format_bitrate(file_size, duration_seconds)
+            container_format = (path.suffix.lstrip(".") or "desconhecido").upper()
+            mime = mimetypes.guess_type(path.name)[0] or "desconhecido"
+
+            general_attributes = [
+                MediaInfoAttribute("Formato", container_format),
+                MediaInfoAttribute("Tipo MIME", mime),
+                MediaInfoAttribute("Tamanho do arquivo", self._format_file_size(file_size)),
+            ]
+            if duration_seconds > 0:
+                general_attributes.append(MediaInfoAttribute("Duração", self._format_duration(duration_seconds)))
+            if bitrate is not None:
+                general_attributes.append(MediaInfoAttribute("Taxa de bits global", bitrate))
+            if frame_count > 0:
+                general_attributes.append(MediaInfoAttribute("Número de quadros", str(frame_count)))
+
+            video_attributes = [MediaInfoAttribute("Formato", container_format)]
+            if fourcc:
+                video_attributes.append(MediaInfoAttribute("Codec", fourcc))
+            if width > 0:
+                video_attributes.append(MediaInfoAttribute("Largura", f"{width} px"))
+            if height > 0:
+                video_attributes.append(MediaInfoAttribute("Altura", f"{height} px"))
+            if width > 0 and height > 0:
+                video_attributes.append(MediaInfoAttribute("Proporção de exibição", self._format_aspect_ratio(width, height)))
+            if duration_seconds > 0:
+                video_attributes.append(MediaInfoAttribute("Duração", self._format_duration(duration_seconds)))
+            if bitrate is not None:
+                video_attributes.append(MediaInfoAttribute("Taxa de bits", bitrate))
+            if fps > 0:
+                video_attributes.append(MediaInfoAttribute("Taxa de quadros", f"{fps:.3f} FPS"))
+            if frame_count > 0:
+                video_attributes.append(MediaInfoAttribute("Número de quadros", str(frame_count)))
+
+            tracks = [
+                MediaInfoTrack(track_type="Geral", attributes=tuple(general_attributes)),
+            ]
+            if len(video_attributes) > 1:
+                tracks.append(MediaInfoTrack(track_type="Vídeo", attributes=tuple(video_attributes)))
+            return tuple(tracks), None
+        finally:
+            capture.release()
+
+    def _image_bit_depth(self, mode: str) -> str:
+        mapping = {
+            "1": "1 bit",
+            "L": "8 bits",
+            "P": "8 bits",
+            "RGB": "24 bits",
+            "RGBA": "32 bits",
+            "CMYK": "32 bits",
+            "I;16": "16 bits",
+            "I": "32 bits",
+            "F": "32 bits",
+        }
+        return mapping.get(mode, mode)
+
+    def _format_file_size(self, size_bytes: int) -> str:
+        units = ["bytes", "KB", "MB", "GB", "TB"]
+        value = float(size_bytes)
+        unit = units[0]
+        for candidate in units:
+            unit = candidate
+            if value < 1024.0 or candidate == units[-1]:
+                break
+            value /= 1024.0
+        if unit == "bytes":
+            return f"{int(value)} bytes"
+        return f"{value:.2f} {unit}"
+
+    def _format_duration(self, total_seconds: float) -> str:
+        hours = int(total_seconds // 3600)
+        minutes = int((total_seconds % 3600) // 60)
+        seconds = total_seconds % 60
+        return f"{hours:02d}:{minutes:02d}:{seconds:06.3f}"
+
+    def _format_bitrate(self, size_bytes: int, duration_seconds: float) -> str | None:
+        if duration_seconds <= 0.0:
+            return None
+        bits_per_second = (size_bytes * 8.0) / duration_seconds
+        if bits_per_second >= 1_000_000:
+            return f"{bits_per_second / 1_000_000:.2f} Mb/s"
+        if bits_per_second >= 1_000:
+            return f"{bits_per_second / 1_000:.2f} kb/s"
+        return f"{bits_per_second:.0f} b/s"
+
+    def _decode_fourcc(self, fourcc: int) -> str | None:
+        if fourcc <= 0:
+            return None
+        decoded = "".join(chr((fourcc >> (8 * offset)) & 0xFF) for offset in range(4)).strip()
+        normalized = "".join(character for character in decoded if character.isprintable()).strip()
+        return normalized or None
+
+    def _format_aspect_ratio(self, width: int, height: int) -> str:
+        if width <= 0 or height <= 0:
+            return "-"
+        ratio = width / height
+        return f"{ratio:.3f}:1"
