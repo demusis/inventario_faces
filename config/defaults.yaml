@@ -1,0 +1,52 @@
+app:
+  name: "Inventario Faces"
+  output_directory_name: "inventario_faces_output"
+  report_title: "Relat\u00f3rio Forense de Invent\u00e1rio Facial"
+  organization: "Laborat\u00f3rio de An\u00e1lise Digital"
+  log_level: "INFO"
+  mediainfo_directory: null
+
+media:
+  image_extensions:
+    - ".jpg"
+    - ".jpeg"
+    - ".png"
+    - ".bmp"
+    - ".tif"
+    - ".tiff"
+    - ".webp"
+  video_extensions:
+    - ".mp4"
+    - ".avi"
+    - ".mkv"
+    - ".mov"
+    - ".wmv"
+    - ".mpeg"
+    - ".mpg"
+
+video:
+  sampling_interval_seconds: 2.0
+  max_frames_per_video: 300
+
+face_model:
+  backend: "insightface"
+  model_name: "buffalo_l"
+  det_size:
+    - 640
+    - 640
+  minimum_face_quality: 0.60
+  minimum_face_size_pixels: 40
+  ctx_id: 0
+  providers: []
+
+clustering:
+  assignment_similarity: 0.52
+  candidate_similarity: 0.44
+  min_cluster_size: 1
+
+reporting:
+  max_gallery_faces_per_group: 6
+  compile_pdf: true
+
+forensics:
+  chain_of_custody_note: "Os arquivos originais n\u00e3o foram alterados. Todos os hashes SHA-512 foram calculados em modo somente leitura, e as deriva\u00e7\u00f5es geradas foram armazenadas separadamente para auditoria."

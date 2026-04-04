@@ -1,0 +1,130 @@
+from __future__ import annotations
+
+import os
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+from inventario_faces.domain.config import (
+    AppConfig,
+    AppSettings,
+    ClusteringSettings,
+    FaceModelSettings,
+    ForensicsSettings,
+    MediaSettings,
+    ReportingSettings,
+    VideoSettings,
+)
+from inventario_faces.utils.path_utils import ensure_directory
+from inventario_faces.utils.serialization import to_serializable
+
+
+def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(base)
+    for key, value in override.items():
+        current = merged.get(key)
+        if isinstance(current, dict) and isinstance(value, dict):
+            merged[key] = _deep_merge(current, value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _candidate_default_paths() -> list[Path]:
+    current_file = Path(__file__).resolve()
+    return [
+        current_file.parents[3] / "config" / "defaults.yaml",
+        current_file.parents[1] / "config" / "defaults.yaml",
+    ]
+
+
+def locate_default_config() -> Path:
+    for candidate in _candidate_default_paths():
+        if candidate.exists():
+            return candidate
+    raise FileNotFoundError("Arquivo de configuracao padrao nao encontrado.")
+
+
+def _load_yaml(path: Path) -> dict[str, Any]:
+    with path.open("r", encoding="utf-8") as stream:
+        loaded = yaml.safe_load(stream) or {}
+    if not isinstance(loaded, dict):
+        raise ValueError(f"Configuracao invalida em {path}")
+    return loaded
+
+
+def default_user_config_path() -> Path:
+    appdata_directory = Path(os.getenv("APPDATA", Path.home() / "AppData" / "Roaming"))
+    return appdata_directory / "InventarioFaces" / "config.yaml"
+
+
+def load_app_config(config_path: Path | None = None) -> AppConfig:
+    defaults = _load_yaml(locate_default_config())
+    merged = defaults
+    if config_path is not None:
+        path = Path(config_path)
+        if path.exists():
+            merged = _deep_merge(defaults, _load_yaml(path))
+
+    mediainfo_directory = merged["app"].get("mediainfo_directory")
+    normalized_mediainfo_directory = (
+        str(mediainfo_directory).strip() if mediainfo_directory not in (None, "") else None
+    )
+
+    return AppConfig(
+        app=AppSettings(
+            name=str(merged["app"]["name"]),
+            output_directory_name=str(merged["app"]["output_directory_name"]),
+            report_title=str(merged["app"]["report_title"]),
+            organization=str(merged["app"]["organization"]),
+            log_level=str(merged["app"].get("log_level", "INFO")),
+            mediainfo_directory=normalized_mediainfo_directory,
+        ),
+        media=MediaSettings(
+            image_extensions=tuple(str(item).lower() for item in merged["media"]["image_extensions"]),
+            video_extensions=tuple(str(item).lower() for item in merged["media"]["video_extensions"]),
+        ),
+        video=VideoSettings(
+            sampling_interval_seconds=float(merged["video"]["sampling_interval_seconds"]),
+            max_frames_per_video=(
+                int(merged["video"]["max_frames_per_video"])
+                if merged["video"].get("max_frames_per_video") is not None
+                else None
+            ),
+        ),
+        face_model=FaceModelSettings(
+            backend=str(merged["face_model"]["backend"]),
+            model_name=str(merged["face_model"]["model_name"]),
+            det_size=(
+                tuple(int(item) for item in merged["face_model"]["det_size"])
+                if merged["face_model"].get("det_size") is not None
+                else None
+            ),
+            minimum_face_quality=float(merged["face_model"].get("minimum_face_quality", 0.6)),
+            minimum_face_size_pixels=int(merged["face_model"].get("minimum_face_size_pixels", 40)),
+            ctx_id=int(merged["face_model"].get("ctx_id", 0)),
+            providers=tuple(str(item) for item in merged["face_model"].get("providers", [])),
+        ),
+        clustering=ClusteringSettings(
+            assignment_similarity=float(merged["clustering"]["assignment_similarity"]),
+            candidate_similarity=float(merged["clustering"]["candidate_similarity"]),
+            min_cluster_size=int(merged["clustering"].get("min_cluster_size", 1)),
+        ),
+        reporting=ReportingSettings(
+            max_gallery_faces_per_group=int(merged["reporting"]["max_gallery_faces_per_group"]),
+            compile_pdf=bool(merged["reporting"].get("compile_pdf", True)),
+        ),
+        forensics=ForensicsSettings(
+            chain_of_custody_note=str(merged["forensics"]["chain_of_custody_note"]),
+        ),
+    )
+
+
+def save_app_config(config: AppConfig, path: Path) -> Path:
+    payload = to_serializable(config)
+    output_path = Path(path).expanduser()
+    ensure_directory(output_path.parent)
+    with output_path.open("w", encoding="utf-8") as stream:
+        yaml.safe_dump(payload, stream, allow_unicode=True, sort_keys=False)
+    return output_path

@@ -1,0 +1,58 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage[brazil]{babel}
+\usepackage{geometry}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{tabularx}
+\usepackage{array}
+\usepackage{float}
+\usepackage{caption}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{fancyhdr}
+\geometry{margin=2.2cm}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{0.6em}
+\newcolumntype{L}[1]{>{\raggedright\arraybackslash}p{#1}}
+\newcolumntype{C}[1]{>{\centering\arraybackslash}m{#1}}
+\newcolumntype{G}[1]{>{\centering\arraybackslash}p{#1}}
+\newcolumntype{T}[1]{>{\raggedright\arraybackslash\ttfamily\scriptsize}p{#1}}
+\newcolumntype{S}[1]{>{\raggedright\arraybackslash\scriptsize}p{#1}}
+\setlength{\emergencystretch}{3em}
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!50!black,
+  urlcolor=blue!50!black
+}
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{@@TITLE@@}
+\fancyhead[R]{Invent\'ario Faces}
+\fancyfoot[C]{\thepage}
+
+\begin{document}
+
+\begin{titlepage}
+\centering
+\vspace*{2cm}
+{\Huge\bfseries @@TITLE@@ \par}
+\vspace{1.5cm}
+{\Large @@ORGANIZATION@@ \par}
+\vspace{1cm}
+{\large Gerado em @@DATE@@ \par}
+\vfill
+{\large Relat\'orio t\'ecnico para apoio investigativo assistido por IA\par}
+\vspace{1cm}
+{\normalsize Este documento n\~ao deve ser interpretado como identifica\c{c}\~ao conclusiva de indiv\'iduos.\par}
+\end{titlepage}
+
+\tableofcontents
+\newpage
+
+@@BODY@@
+
+\end{document}
