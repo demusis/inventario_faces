@@ -246,6 +246,7 @@ class FaceTrackingServiceTests(unittest.TestCase):
             self.assertTrue(any("amostra=1" in line for line in logs))
             self.assertTrue(any("quadro_real=000060" in line for line in logs))
             self.assertTrue(any("instante=00:00:02" in line for line in logs))
+            self.assertTrue(any("[Tracking] resumo" in line for line in logs))
 
     def _config(self, keyframe_interval_seconds: float = 3.0) -> AppConfig:
         return AppConfig(

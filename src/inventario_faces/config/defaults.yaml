@@ -4,6 +4,7 @@ app:
   report_title: "Relat\u00f3rio Forense de Invent\u00e1rio Facial"
   organization: "Laborat\u00f3rio de An\u00e1lise Digital"
   log_level: "INFO"
+  use_local_temp_copy: false
 
 media:
   image_extensions:
@@ -25,68 +26,86 @@ media:
     - ".mpg"
 
 video:
-  # Intervalo, em segundos, entre quadros amostrados de vídeos.
-  # Na configuração padrão, a análise não é quadro a quadro: processa-se um quadro a cada intervalo.
-  sampling_interval_seconds: 2.0
-  # Limite de quadros amostrados por arquivo. Use null para percorrer todo o vídeo.
-  max_frames_per_video: 300
-  # Distância temporal mínima entre keyframes consecutivos do mesmo track.
-  keyframe_interval_seconds: 4.0
-  # Limiar de mudança visual/geométrica que justifica novo keyframe.
-  significant_change_threshold: 0.18
+  # Padrao pericial: cobertura temporal mais densa, sem truncamento silencioso de videos longos.
+  sampling_interval_seconds: 1.0
+  # Use null para percorrer o video inteiro conforme o intervalo de amostragem.
+  max_frames_per_video: null
+  # Distancia temporal minima entre keyframes consecutivos do mesmo track.
+  keyframe_interval_seconds: 3.0
+  # Limiar um pouco mais sensivel para registrar mudancas relevantes com maior auditabilidade.
+  significant_change_threshold: 0.15
 
 face_model:
   backend: "insightface"
   model_name: "buffalo_l"
+  # Padrao pericial: inferencia em CPU para favorecer estabilidade e reprodutibilidade entre estacoes.
   det_size:
-    - 640
-    - 640
-  minimum_face_quality: 0.60
-  minimum_face_size_pixels: 40
-  ctx_id: 0
-  providers: []
+    - 800
+    - 800
+  minimum_face_quality: 0.68
+  minimum_face_size_pixels: 48
+  ctx_id: -1
+  providers:
+    - "CPUExecutionProvider"
 
 clustering:
-  # Similaridade mínima para fundir tracks no mesmo grupo.
-  assignment_similarity: 0.52
-  # Similaridade a partir da qual grupos distintos viram sugestão de revisão.
-  candidate_similarity: 0.44
-  # Quantidade mínima de tracks para um grupo aparecer na saída final.
+  # Padrao pericial: thresholds mais conservadores para reduzir fusoes indevidas.
+  assignment_similarity: 0.62
+  # Similaridade a partir da qual grupos distintos viram sugestao de revisao.
+  candidate_similarity: 0.56
+  # Quantidade minima de tracks para um grupo aparecer na saida final.
   min_cluster_size: 1
-  # Quantidade mínima de ocorrências para um track entrar no clustering.
+  # Quantidade minima de ocorrencias para um track entrar no clustering.
   min_track_size: 1
 
 tracking:
-  iou_threshold: 0.15
-  spatial_distance_threshold: 0.18
-  embedding_similarity_threshold: 0.48
-  minimum_total_match_score: 0.30
-  geometry_weight: 0.45
-  embedding_weight: 0.55
+  # Padrao pericial: maior exigencia de identidade e maior cautela na associacao temporal.
+  iou_threshold: 0.10
+  spatial_distance_threshold: 0.15
+  embedding_similarity_threshold: 0.58
+  minimum_total_match_score: 0.45
+  geometry_weight: 0.35
+  embedding_weight: 0.65
   max_missed_detections: 2
-  confidence_margin: 0.05
-  representative_embeddings_per_track: 5
-  top_crops_per_track: 4
-  quality_improvement_margin: 0.05
+  confidence_margin: 0.08
+  representative_embeddings_per_track: 8
+  top_crops_per_track: 6
+  quality_improvement_margin: 0.04
 
 enhancement:
   enable_preprocessing: true
-  minimum_brightness_to_enhance: 0.36
+  # Padrao pericial: realce moderado e auditavel, aplicado apenas sobre derivados.
+  minimum_brightness_to_enhance: 0.40
   clahe_clip_limit: 2.0
   clahe_tile_grid_size: 8
-  gamma: 1.0
-  denoise_strength: 0
+  gamma: 1.10
+  denoise_strength: 2
 
 search:
   enabled: true
   prefer_faiss: true
-  coarse_top_k: 8
-  refine_top_k: 12
+  coarse_top_k: 12
+  refine_top_k: 20
+
+distributed:
+  enabled: false
+  execution_label: "compartilhado"
+  node_name: null
+  # Frequencia dos heartbeats gravados pelo no no lote compartilhado.
+  heartbeat_interval_seconds: 10
+  # Janela para considerar lock/heartbeat abandonado e permitir retomada.
+  stale_lock_timeout_minutes: 180
+  # Quando true, a instancia que perceber o lote completo tenta consolidar o resultado final.
+  auto_finalize: true
+  # Valida existencia, consistencia estrutural e hash interno dos parciais antes da consolidacao.
+  validate_partial_integrity: true
+  # Reprocessa automaticamente apenas os parciais ausentes/corrompidos detectados na validacao.
+  auto_reprocess_invalid_partials: true
 
 reporting:
   compile_pdf: true
-  # Quantidade máxima de tracks detalhados na seção “Resultados por Grupo”.
-  max_tracks_per_group: 8
+  # Padrao pericial: maior densidade de detalhamento por grupo.
+  max_tracks_per_group: 12
 
 forensics:
-  chain_of_custody_note: "Os arquivos originais n\u00e3o foram alterados. Todos os hashes SHA-512 foram calculados em modo somente leitura, e as deriva\u00e7\u00f5es geradas foram armazenadas separadamente para auditoria."
+  chain_of_custody_note: "Os arquivos originais nao foram alterados. Todos os hashes SHA-512 foram calculados em modo somente leitura, as derivacoes foram armazenadas separadamente para auditoria e os resultados de deteccao, agrupamento e busca devem ser interpretados como probabilisticos, sujeitos a revisao tecnica pericial."

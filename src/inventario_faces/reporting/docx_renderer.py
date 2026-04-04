@@ -9,10 +9,12 @@ from inventario_faces.domain.config import AppConfig
 from inventario_faces.domain.entities import FaceTrack, FileRecord, InventoryResult, KeyFrame, MediaInfoAttribute, ReportArtifacts
 from inventario_faces.reporting.report_context import (
     keyframes_by_track,
+    mean_pairwise_track_similarity,
     tracks_by_cluster,
 )
 from inventario_faces.reporting.report_support import (
     candidate_cluster_map,
+    format_group_similarity,
     inventory_methodology_items,
     keyframe_reference_text,
     media_track_type_label,
@@ -121,18 +123,20 @@ class DocxReportGenerator:
         for cluster in result.clusters:
             tracks = grouped_tracks.get(cluster.cluster_id, [])
             keyframe_count = sum(len(keyframes_map.get(track.track_id, [])) for track in tracks)
+            mean_similarity = mean_pairwise_track_similarity(tracks)
             self._add_heading(document, f"Grupo {cluster.cluster_id}", 2)
             self._add_paragraph(
                 document,
                 (
                     f"Tracks={len(tracks)}; keyframes={keyframe_count}; ocorrências={len(cluster.occurrence_ids)}; "
+                    f"similaridade média entre tracks={format_group_similarity(mean_similarity, len(tracks))}; "
                     "a tabela abaixo consolida as ocorrências representativas do grupo."
                 ),
             )
             related_groups = candidate_map.get(cluster.cluster_id, [])
             self._add_paragraph(
                 document,
-                "Relações intergrupos sugeridas para revisão: "
+                "Relações intergrupos: "
                 + (", ".join(related_groups) if related_groups else "nenhuma acima do limiar configurado."),
             )
             self._add_group_track_table(document, tracks, keyframes_map)

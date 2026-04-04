@@ -30,6 +30,7 @@ from inventario_faces.domain.config import (
     AppConfig,
     AppSettings,
     ClusteringSettings,
+    DistributedSettings,
     EnhancementSettings,
     FaceModelSettings,
     ForensicsSettings,
@@ -54,9 +55,15 @@ ABNT_ACCESS_DATE = "Acesso em: 4 abr. 2026."
 
 
 class ConfigDialog(QDialog):
-    def __init__(self, config: AppConfig, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        config: AppConfig,
+        parent: QWidget | None = None,
+        default_config: AppConfig | None = None,
+    ) -> None:
         super().__init__(parent)
         self._selected_config = config
+        self._default_config = default_config or config
         self.setWindowTitle("Configurações do procedimento")
         self.resize(980, 860)
         self._build_ui()
@@ -73,7 +80,8 @@ class ConfigDialog(QDialog):
             (
                 "Revise os parâmetros do pipeline antes de cada execução. "
                 "As abas organizam amostragem, tracking, clustering, busca, aprimoramento e relatório. "
-                "Os metadados técnicos da mídia agora são extraídos internamente, sem depender do aplicativo externo MediaInfo."
+                "Os metadados técnicos da mídia agora são extraídos internamente, sem depender do aplicativo externo MediaInfo. "
+                "Os valores padrão foram calibrados para um uso pericial mais conservador, priorizando rastreabilidade, cobertura e redução de associações indevidas."
             )
         )
         description.setWordWrap(True)
@@ -82,6 +90,7 @@ class ConfigDialog(QDialog):
         tabs = QTabWidget(self)
         tabs.addTab(self._build_general_tab(), "Geral")
         tabs.addTab(self._build_media_tab(), "Mídias")
+        tabs.addTab(self._build_distributed_tab(), "Distribuição")
         tabs.addTab(self._build_face_tab(), "Análise facial")
         tabs.addTab(self._build_tracking_tab(), "Tracking")
         tabs.addTab(self._build_clustering_search_tab(), "Agrupamento e busca")
@@ -127,9 +136,13 @@ class ConfigDialog(QDialog):
         if cancel_button is not None:
             cancel_button.setText("Cancelar")
 
-        restore_button = QPushButton("Restaurar valores carregados", self)
-        restore_button.clicked.connect(self._restore_selected_config)
-        button_box.addButton(restore_button, QDialogButtonBox.ResetRole)
+        restore_loaded_button = QPushButton("Restaurar valores carregados", self)
+        restore_loaded_button.clicked.connect(self._restore_selected_config)
+        button_box.addButton(restore_loaded_button, QDialogButtonBox.ResetRole)
+
+        restore_default_button = QPushButton("Restaurar valores padrão", self)
+        restore_default_button.clicked.connect(self._restore_default_config)
+        button_box.addButton(restore_default_button, QDialogButtonBox.ResetRole)
         button_box.accepted.connect(self._accept_configuration)
         button_box.rejected.connect(self.reject)
         layout.addWidget(button_box)
@@ -143,6 +156,7 @@ class ConfigDialog(QDialog):
         self._organization_input = QLineEdit(tab)
         self._log_level_combo = QComboBox(tab)
         self._log_level_combo.addItems(["DEBUG", "INFO", "WARNING", "ERROR"])
+        self._use_local_temp_copy_checkbox = QCheckBox("Criar copia temporaria local dos arquivos de midia antes do processamento", tab)
 
         form.addRow("Diretório de saída:", self._with_help(self._output_directory_input, "Diretório de saída", self._help_html(
             definition="Nome da pasta derivada criada dentro do diretório examinado para armazenar artefatos, inventários, logs e relatórios.",
@@ -164,6 +178,12 @@ class ConfigDialog(QDialog):
             definition="Controla a verbosidade dos registros textuais e estruturados da execução.",
             operational_effect="Níveis mais altos ampliam auditabilidade e diagnóstico, mas aumentam o volume persistido.",
             recommendation="Use INFO na rotina. Use DEBUG para calibração, homologação e investigação de falhas.",
+        )))
+        form.addRow(self._with_help(self._use_local_temp_copy_checkbox, "Copia temporaria local", self._help_html(
+            definition="Antes de decodificar imagem ou video, o aplicativo pode criar uma copia temporaria local do arquivo e processar essa copia, preservando o original.",
+            operational_effect="Reduz leituras repetidas em unidades de rede e tende a estabilizar o processamento de midias grandes ou compartilhadas.",
+            recommendation="Ative quando a pasta de evidencias ou o diretorio de trabalho estiverem em rede ou apresentarem latencia perceptivel.",
+            caveat="O hash SHA-512 continua sendo calculado a partir do arquivo original. A copia temporaria e removida ao final do processamento do item.",
         )))
         return tab
 
@@ -205,13 +225,13 @@ class ConfigDialog(QDialog):
         form.addRow("Intervalo de amostragem:", self._with_help(self._sampling_interval_spin, "Intervalo de amostragem", self._help_html(
             definition="Espaçamento temporal entre quadros extraídos de cada vídeo para análise facial. Por padrão, o sistema não processa todos os quadros originais do arquivo.",
             operational_effect="Intervalos menores aumentam cobertura temporal e custo computacional; intervalos maiores reduzem custo, mas podem perder aparições breves.",
-            recommendation="Comece em 1,0 s a 2,0 s e reduza apenas quando o caso exigir maior granularidade temporal. Para se aproximar de uma análise quadro a quadro, o intervalo precisa cair até equivaler a passo de 1 frame no FPS do vídeo.",
+            recommendation="O padrão pericial do aplicativo usa 1,0 s. Reduza além disso apenas quando o caso exigir granularidade ainda maior. Para se aproximar de uma análise quadro a quadro, o intervalo precisa cair até equivaler a passo de 1 frame no FPS do vídeo.",
             references=[("OpenCV VideoCapture", OPENCV_VIDEOCAPTURE_URL)],
         )))
         form.addRow("Máximo de quadros por vídeo:", self._with_help(max_frames_widget, "Máximo de quadros por vídeo", self._help_html(
             definition="Limite superior de quadros amostrados por arquivo. Quando desativado, o vídeo é percorrido conforme o intervalo de amostragem.",
             operational_effect="Controla custo de processamento, tamanho dos artefatos e duração da execução em vídeos longos.",
-            recommendation="Use limite em triagens exploratórias; desative apenas quando houver justificativa para cobertura integral.",
+            recommendation="Para laudo pericial, prefira sem limite explícito de quadros. Aplique limite apenas em triagens preliminares ou testes de calibração.",
         )))
         form.addRow("Intervalo mínimo entre keyframes:", self._with_help(self._keyframe_interval_spin, "Intervalo mínimo entre keyframes", self._help_html(
             definition="Tempo mínimo entre keyframes consecutivos do mesmo track, salvo quando houver início de track ou mudança significativa.",
@@ -222,6 +242,69 @@ class ConfigDialog(QDialog):
             definition="Pontuação mínima de mudança visual ou geométrica para justificar novo keyframe antes de vencer o intervalo temporal.",
             operational_effect="Valores menores geram mais keyframes; valores maiores reduzem redundância, mas podem perder variações relevantes.",
             recommendation="Ajuste com amostras do caso, especialmente quando houver muita movimentação ou cortes bruscos.",
+        )))
+        return tab
+
+    def _build_distributed_tab(self) -> QWidget:
+        tab = QWidget(self)
+        form = QFormLayout(tab)
+
+        self._distributed_enabled_checkbox = QCheckBox("Ativar processamento compartilhado entre múltiplas instâncias", tab)
+        self._distributed_execution_label_input = QLineEdit(tab)
+        self._distributed_execution_label_input.setPlaceholderText("Ex.: lote_caso_123")
+        self._distributed_node_name_input = QLineEdit(tab)
+        self._distributed_node_name_input.setPlaceholderText("Em branco = hostname do computador")
+        self._distributed_heartbeat_spin = QSpinBox(tab)
+        self._distributed_heartbeat_spin.setRange(1, 3600)
+        self._distributed_heartbeat_spin.setSuffix(" s")
+        self._distributed_stale_lock_spin = QSpinBox(tab)
+        self._distributed_stale_lock_spin.setRange(1, 10_080)
+        self._distributed_stale_lock_spin.setSuffix(" min")
+        self._distributed_validate_partials_checkbox = QCheckBox("Validar integridade dos parciais antes da consolidacao final", tab)
+        self._distributed_auto_reprocess_checkbox = QCheckBox("Recuperar automaticamente parciais ausentes ou corrompidos", tab)
+        self._distributed_auto_finalize_checkbox = QCheckBox("Consolidar relatório final automaticamente quando o lote terminar", tab)
+
+        form.addRow(self._with_help(self._distributed_enabled_checkbox, "Processamento compartilhado", self._help_html(
+            definition="Permite que vários PCs ou várias instâncias do aplicativo compartilhem o mesmo lote, usando locks por arquivo e manifesto global de conclusão.",
+            operational_effect="Cada instância tenta assumir apenas arquivos livres, evitando retrabalho e permitindo retomada distribuída.",
+            recommendation="Use somente quando todas as instâncias apontarem para o mesmo diretório de evidências e para o mesmo identificador de execução compartilhada.",
+            caveat="Para operação entre computadores, prefira caminho UNC ou outro mapeamento idêntico em todas as máquinas, para que o diretório compartilhado seja o mesmo.",
+        )))
+        form.addRow("Identificador da execução:", self._with_help(self._distributed_execution_label_input, "Identificador da execução compartilhada", self._help_html(
+            definition="Nome estável do lote compartilhado. Ele define a pasta comum em que manifesto, locks, parciais e relatório final serão sincronizados.",
+            operational_effect="Instâncias com o mesmo identificador entram no mesmo lote; identificadores diferentes isolam execuções distintas.",
+            recommendation="Use um rótulo curto, sem ambiguidade e associado ao caso, por exemplo caso_045_lote_a.",
+        )))
+        form.addRow("Nome do nó:", self._with_help(self._distributed_node_name_input, "Nome do nó", self._help_html(
+            definition="Identificação textual do computador ou estação, registrada nos locks e heartbeats.",
+            operational_effect="Facilita auditoria operacional, identificação de nós ativos e diagnóstico de locks órfãos.",
+            recommendation="Deixe em branco para usar o hostname do sistema, salvo se houver necessidade de um identificador institucional padronizado.",
+        )))
+        form.addRow("Heartbeat do nó:", self._with_help(self._distributed_heartbeat_spin, "Heartbeat do nó", self._help_html(
+            definition="Intervalo com que a instância atualiza seu registro de presença no lote compartilhado.",
+            operational_effect="Valores menores melhoram detecção de travamentos, mas geram mais escrita no compartilhamento; valores maiores reduzem I/O, mas retardam a identificação de falhas.",
+            recommendation="Entre 10 s e 30 s costuma equilibrar bem visibilidade operacional e custo de escrita.",
+        )))
+        form.addRow("Tempo para lock órfão:", self._with_help(self._distributed_stale_lock_spin, "Tempo para lock órfão", self._help_html(
+            definition="Janela após a qual um lock sem heartbeat recente pode ser considerado abandonado e retomado por outra instância.",
+            operational_effect="Tempo curto acelera recuperação após falha, mas pode retomar indevidamente arquivos de vídeos muito longos se a infraestrutura estiver lenta.",
+            recommendation="Comece com 120 min e reduza apenas se o ambiente for estável e os arquivos normalmente terminarem bem antes disso.",
+        )))
+        form.addRow(self._with_help(self._distributed_auto_finalize_checkbox, "Consolidação automática", self._help_html(
+            definition="Quando habilitado, a instância que perceber o término global do lote tentará consolidar clustering, busca e relatório final.",
+            operational_effect="Evita uma etapa manual de fechamento do lote compartilhado.",
+            recommendation="Mantenha ativado na maioria dos casos. Desative apenas se a consolidação final precisar ser controlada por um nó específico.",
+        )))
+        form.addRow(self._with_help(self._distributed_validate_partials_checkbox, "Validacao de integridade dos parciais", self._help_html(
+            definition="Antes da consolidacao final, o sistema confere se cada parcial esperado existe, se o JSON esta valido, se o hash interno do parcial confere e se as contagens batem com o manifesto.",
+            operational_effect="Eleva a robustez contra arquivos truncados, corrupcao silenciosa e inconsistencias entre manifesto e derivacoes.",
+            recommendation="Mantenha ativado em producao.",
+        )))
+        form.addRow(self._with_help(self._distributed_auto_reprocess_checkbox, "Recuperacao automatica de parciais", self._help_html(
+            definition="Quando a validacao detectar parcial ausente ou corrompido, a instancia finalizadora reprocessa somente o item afetado antes do clustering global.",
+            operational_effect="Reduz a chance de um lote inteiro falhar por um problema pontual em uma unica maquina ou derivacao.",
+            recommendation="Mantenha ativado quando a prioridade for robustez a falhas.",
+            caveat="A recuperacao atua apenas sobre derivados do inventario; os originais permanecem preservados.",
         )))
         return tab
 
@@ -281,20 +364,20 @@ class ConfigDialog(QDialog):
         form.addRow("Tamanho de detecção:", self._with_help(det_size_widget, "Tamanho de detecção", self._help_html(
             definition="Resolução operacional usada pelo detector facial antes da inferência, sem alterar o arquivo original.",
             operational_effect="Valores maiores tendem a ajudar em faces pequenas, mas aumentam tempo e memória.",
-            recommendation="Use 640x640 como padrão inicial e só aumente quando houver perda comprovada de rostos pequenos.",
+            recommendation="O padrão pericial usa 800x800 em CPU para privilegiar estabilidade com melhor sensibilidade a faces menores. Aumente apenas se houver necessidade comprovada.",
             caveat="Ao manter a resolução original, o detector usa a própria geometria do quadro analisado.",
             references=[("SCRFD", SCRFD_URL)],
         )))
         form.addRow("Qualidade mínima da face:", self._with_help(self._minimum_face_quality_spin, "Qualidade mínima da face", self._help_html(
             definition="Limiar mínimo da pontuação de detecção para que uma face siga no inventário.",
             operational_effect="Aumentar o limiar reduz ruído e falsos positivos, mas pode descartar rostos reais em condições adversas.",
-            recommendation="Comece em 0,60 e calibre com amostras do próprio caso.",
+            recommendation="O padrão pericial usa 0,68 para reduzir ruído sem tornar o filtro excessivamente excludente. Ajuste com parcimônia e sempre registre a justificativa.",
             references=[("ArcFace", ARCFACE_URL)],
         )))
         form.addRow("Tamanho mínimo da face:", self._with_help(self._minimum_face_size_spin, "Tamanho mínimo da face", self._help_html(
             definition="Menor lado aceitável, em pixels, para a caixa delimitadora da face.",
             operational_effect="Valores baixos ampliam cobertura, mas aumentam recortes pouco informativos e ruído operacional.",
-            recommendation="Use 40 px a 64 px como faixa inicial em triagem geral.",
+            recommendation="O padrão pericial usa 48 px. Reduza apenas quando o caso justificar busca deliberada por faces pequenas e potencialmente menos informativas.",
         )))
         form.addRow("Mecanismos de execução:", self._with_help(self._providers_input, "Mecanismos de execução", self._help_html(
             definition="Lista, em ordem de preferência, dos execution providers do ONNX Runtime.",
@@ -400,12 +483,12 @@ class ConfigDialog(QDialog):
         form.addRow("Limiar de atribuição:", self._with_help(self._assignment_similarity_spin, "Limiar de atribuição", self._help_html(
             definition="Similaridade mínima para fundir tracks no mesmo grupo.",
             operational_effect="Valores altos reduzem risco de fusão indevida, mas tendem a fragmentar a saída.",
-            recommendation="Comece entre 0,50 e 0,60 e ajuste após revisão visual dos grupos."
+            recommendation="O padrão pericial usa 0,62 para ser mais conservador na fusão de tracks. Reduza apenas com justificativa técnica e revisão visual consistente."
         )))
         form.addRow("Limiar de sugestão entre grupos:", self._with_help(self._candidate_similarity_spin, "Limiar de sugestão entre grupos", self._help_html(
             definition="Similaridade usada para apontar grupos distintos como correlação provável a revisar.",
             operational_effect="Funciona como zona de atenção; não provoca fusão automática.",
-            recommendation="Mantenha abaixo do limiar de atribuição para separar agrupamento de revisão investigativa."
+            recommendation="O padrão pericial usa 0,56 e o mantém abaixo do limiar de atribuição, preservando a distinção entre agrupamento e revisão investigativa."
         )))
         form.addRow("Tamanho mínimo do grupo:", self._with_help(self._min_cluster_size_spin, "Tamanho mínimo do grupo", self._help_html(
             definition="Quantidade mínima de tracks para um grupo aparecer no resultado final.",
@@ -431,12 +514,12 @@ class ConfigDialog(QDialog):
         form.addRow("Top-K coarse:", self._with_help(self._search_coarse_top_k_spin, "Top-K coarse", self._help_html(
             definition="Quantidade de grupos candidatos recuperados na etapa coarse da busca.",
             operational_effect="Valores maiores ampliam cobertura da busca, mas aumentam custo do refinamento.",
-            recommendation="Ajuste conforme o volume de grupos e a necessidade de recall."
+            recommendation="O padrão pericial usa 12 para ampliar recall sem abrir excessivamente a busca."
         )))
         form.addRow("Top-K refinado:", self._with_help(self._search_refine_top_k_spin, "Top-K refinado", self._help_html(
             definition="Quantidade de tracks e ocorrências mantidos após o refinamento interno.",
             operational_effect="Controla quantos resultados detalhados serão examinados na etapa final.",
-            recommendation="Use valor um pouco maior que o coarse quando quiser expandir a inspeção dentro dos grupos candidatos."
+            recommendation="O padrão pericial usa 20 para expandir a revisão interna dos grupos candidatos."
         )))
         return tab
 
@@ -518,6 +601,7 @@ class ConfigDialog(QDialog):
         self._report_title_input.setText(config.app.report_title)
         self._organization_input.setText(config.app.organization)
         self._log_level_combo.setCurrentText(config.app.log_level.upper())
+        self._use_local_temp_copy_checkbox.setChecked(config.app.use_local_temp_copy)
 
         self._image_extensions_input.setText(", ".join(config.media.image_extensions))
         self._video_extensions_input.setText(", ".join(config.media.video_extensions))
@@ -528,6 +612,15 @@ class ConfigDialog(QDialog):
         self._unlimited_frames_checkbox.setChecked(unlimited_frames)
         self._max_frames_spin.setDisabled(unlimited_frames)
         self._max_frames_spin.setValue(config.video.max_frames_per_video or 1)
+
+        self._distributed_enabled_checkbox.setChecked(config.distributed.enabled)
+        self._distributed_execution_label_input.setText(config.distributed.execution_label)
+        self._distributed_node_name_input.setText(config.distributed.node_name or "")
+        self._distributed_heartbeat_spin.setValue(config.distributed.heartbeat_interval_seconds)
+        self._distributed_stale_lock_spin.setValue(config.distributed.stale_lock_timeout_minutes)
+        self._distributed_auto_finalize_checkbox.setChecked(config.distributed.auto_finalize)
+        self._distributed_validate_partials_checkbox.setChecked(config.distributed.validate_partial_integrity)
+        self._distributed_auto_reprocess_checkbox.setChecked(config.distributed.auto_reprocess_invalid_partials)
 
         self._backend_input.setText(config.face_model.backend)
         self._model_name_input.setText(config.face_model.model_name)
@@ -578,6 +671,9 @@ class ConfigDialog(QDialog):
     def _restore_selected_config(self) -> None:
         self._load_config(self._selected_config)
 
+    def _restore_default_config(self) -> None:
+        self._load_config(self._default_config)
+
     def _accept_configuration(self) -> None:
         try:
             self._selected_config = self._build_config()
@@ -594,6 +690,16 @@ class ConfigDialog(QDialog):
         model_name = self._require_text(self._model_name_input.text(), "Informe o nome do modelo facial.")
         chain_note = self._require_text(self._chain_note_input.toPlainText(), "Informe a nota de cadeia de custódia.")
 
+        distributed_enabled = self._distributed_enabled_checkbox.isChecked()
+        execution_label = (
+            self._require_text(
+                self._distributed_execution_label_input.text(),
+                "Informe o identificador da execução compartilhada.",
+            )
+            if distributed_enabled
+            else (self._distributed_execution_label_input.text().strip() or "compartilhado")
+        )
+
         geometry_weight = float(self._tracking_geometry_weight_spin.value())
         embedding_weight = float(self._tracking_embedding_weight_spin.value())
         if geometry_weight == 0.0 and embedding_weight == 0.0:
@@ -606,7 +712,7 @@ class ConfigDialog(QDialog):
                 report_title=report_title,
                 organization=organization,
                 log_level=self._log_level_combo.currentText(),
-                mediainfo_directory=None,
+                use_local_temp_copy=self._use_local_temp_copy_checkbox.isChecked(),
             ),
             media=MediaSettings(
                 image_extensions=self._parse_extensions(self._image_extensions_input.text(), "imagem"),
@@ -664,6 +770,16 @@ class ConfigDialog(QDialog):
                 prefer_faiss=self._search_prefer_faiss_checkbox.isChecked(),
                 coarse_top_k=int(self._search_coarse_top_k_spin.value()),
                 refine_top_k=int(self._search_refine_top_k_spin.value()),
+            ),
+            distributed=DistributedSettings(
+                enabled=distributed_enabled,
+                execution_label=execution_label,
+                node_name=(self._distributed_node_name_input.text().strip() or None),
+                heartbeat_interval_seconds=int(self._distributed_heartbeat_spin.value()),
+                stale_lock_timeout_minutes=int(self._distributed_stale_lock_spin.value()),
+                auto_finalize=self._distributed_auto_finalize_checkbox.isChecked(),
+                validate_partial_integrity=self._distributed_validate_partials_checkbox.isChecked(),
+                auto_reprocess_invalid_partials=self._distributed_auto_reprocess_checkbox.isChecked(),
             ),
         )
 

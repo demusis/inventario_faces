@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from itertools import combinations
 
 from inventario_faces.domain.entities import FaceCluster, FaceOccurrence, FaceTrack, InventoryResult, KeyFrame, MediaType
+from inventario_faces.utils.math_utils import cosine_similarity
 
 
 def occurrences_by_track(result: InventoryResult) -> dict[str, list[FaceOccurrence]]:
@@ -44,3 +46,16 @@ def candidate_cluster_pairs(clusters: list[FaceCluster]) -> list[tuple[str, str]
         for candidate in cluster.candidate_cluster_ids
     }
     return sorted(pairs)
+
+
+def mean_pairwise_track_similarity(tracks: list[FaceTrack]) -> float | None:
+    """Calcula a similaridade média entre embeddings médios das tracks do grupo."""
+
+    similarities = [
+        cosine_similarity(left.average_embedding, right.average_embedding)
+        for left, right in combinations(tracks, 2)
+        if left.average_embedding and right.average_embedding
+    ]
+    if not similarities:
+        return None
+    return float(sum(similarities) / len(similarities))

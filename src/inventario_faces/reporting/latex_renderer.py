@@ -8,10 +8,12 @@ from inventario_faces.domain.entities import FileRecord, FaceTrack, InventoryRes
 from inventario_faces.infrastructure.latex_compiler import LatexCompiler
 from inventario_faces.reporting.report_context import (
     keyframes_by_track,
+    mean_pairwise_track_similarity,
     tracks_by_cluster,
 )
 from inventario_faces.reporting.report_support import (
     candidate_cluster_map,
+    format_group_similarity,
     inventory_methodology_items,
     keyframe_reference_text,
     media_track_type_label,
@@ -99,18 +101,19 @@ O presente relat\'orio registra o processamento automatizado do diret\'orio \tex
         for cluster in result.clusters:
             tracks = grouped_tracks.get(cluster.cluster_id, [])
             keyframe_count = sum(len(keyframes_map.get(track.track_id, [])) for track in tracks)
+            mean_similarity = mean_pairwise_track_similarity(tracks)
             related_groups = candidate_map.get(cluster.cluster_id, [])
             related_text = (
-                rf"\textbf{{Rela\c{{c}}\~oes intergrupos sugeridas para revis\~ao.}} "
+                rf"\textbf{{Rela\c{{c}}\~oes intergrupos.}} "
                 + ", ".join(rf"\texttt{{{escape_latex(item)}}}" for item in related_groups)
                 + "."
                 if related_groups
-                else r"\textbf{Rela\c{c}\~oes intergrupos sugeridas para revis\~ao.} Nenhuma acima do limiar configurado."
+                else r"\textbf{Rela\c{c}\~oes intergrupos.} Nenhuma acima do limiar configurado."
             )
             sections.append(
                 rf"""
 \subsection{{Grupo \texttt{{{escape_latex(cluster.cluster_id)}}}}}
-\textbf{{Resumo do grupo.}} tracks={len(tracks)}; keyframes={keyframe_count}; ocorr\^encias={len(cluster.occurrence_ids)}.
+\textbf{{Resumo do grupo.}} tracks={len(tracks)}; keyframes={keyframe_count}; ocorr\^encias={len(cluster.occurrence_ids)}; similaridade m\'edia entre tracks={escape_latex(format_group_similarity(mean_similarity, len(tracks)))}.
 
 {related_text}
 

@@ -7,6 +7,7 @@ from pathlib import Path
 from inventario_faces.domain.config import AppConfig
 from inventario_faces.infrastructure.config_loader import (
     default_user_config_path,
+    load_default_app_config,
     load_app_config,
     save_app_config,
 )
@@ -41,6 +42,10 @@ def load_runtime_config() -> AppConfig:
         return load_app_config(explicit_config_path)
     persistent_path = resolve_persistent_config_path()
     return load_app_config(persistent_path if persistent_path.exists() else None)
+
+
+def load_default_runtime_config() -> AppConfig:
+    return load_default_app_config()
 
 
 def persist_runtime_config(config: AppConfig) -> Path:

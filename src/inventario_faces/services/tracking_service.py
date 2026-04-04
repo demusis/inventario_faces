@@ -25,8 +25,8 @@ from inventario_faces.utils.math_utils import (
     cosine_similarity,
     normalized_center_distance,
 )
-from inventario_faces.utils.time_utils import utc_now
 from inventario_faces.utils.latex import format_seconds
+from inventario_faces.utils.time_utils import utc_now
 
 from .enhancement_service import EnhancementService
 from .quality_service import FaceQualityService
@@ -74,6 +74,7 @@ class _TrackState:
     best_occurrence_id: str | None = None
     preview_path: Path | None = None
     top_crops: list[tuple[float, Path]] = field(default_factory=list)
+    centroid_embedding_cache: list[float] = field(default_factory=list)
     last_keyframe_time: float | None = None
     last_keyframe_bbox: object | None = None
     last_keyframe_crop_histogram: np.ndarray | None = None
@@ -82,7 +83,9 @@ class _TrackState:
 
     @property
     def centroid_embedding(self) -> list[float]:
-        return average_embeddings(self.representative_embeddings)
+        if not self.centroid_embedding_cache and self.representative_embeddings:
+            self.centroid_embedding_cache = average_embeddings(self.representative_embeddings)
+        return list(self.centroid_embedding_cache)
 
     def register_quality(self, score: float, sharpness: float, brightness: float, illumination: float, frontality: float, detection_score: float) -> None:
         self.detection_scores.append(detection_score)
@@ -97,6 +100,11 @@ class _TrackState:
         self.top_crops.sort(key=lambda item: item[0], reverse=True)
         del self.top_crops[max_items:]
 
+    def add_representative_embedding(self, embedding: list[float], max_items: int) -> None:
+        self.representative_embeddings.append(list(embedding))
+        del self.representative_embeddings[max_items:]
+        self.centroid_embedding_cache = average_embeddings(self.representative_embeddings)
+
 
 @dataclass(frozen=True)
 class _CandidateMatch:
@@ -110,6 +118,8 @@ class _CandidateMatch:
 
 
 class FaceTrackingService:
+    """Consolida detecções faciais em tracks auditáveis ao longo do tempo."""
+
     def __init__(
         self,
         config: AppConfig,
@@ -132,6 +142,8 @@ class FaceTrackingService:
         event_callback: EventCallback | None = None,
         text_callback: TextCallback | None = None,
     ) -> TrackingResult:
+        """Processa uma mídia e devolve ocorrências, tracks e keyframes consolidados."""
+
         active_tracks: list[_TrackState] = []
         completed_tracks: list[_TrackState] = []
         occurrences: list[FaceOccurrence] = []
@@ -197,6 +209,15 @@ class FaceTrackingService:
                 track.missed_detections = 0
                 self._update_track_statistics(track, occurrence)
                 occurrences.append(occurrence)
+                if occurrence.track_position == 1:
+                    self._emit_log(
+                        text_callback,
+                        (
+                            f"[Tracking] track iniciado | track={track.track_id} | "
+                            f"{self._tracking_occurrence_label(occurrence)} | "
+                            f"deteccao={occurrence.detection_score:.3f}"
+                        ),
+                    )
                 self._emit_event(
                     event_callback,
                     "track_detection_associated",
@@ -235,15 +256,24 @@ class FaceTrackingService:
                     occurrence.keyframe_id = keyframe.keyframe_id
                     track.keyframe_ids.append(keyframe.keyframe_id)
                     if occurrence.embedding:
-                        track.representative_embeddings.append(occurrence.embedding)
-                        del track.representative_embeddings[
-                            self._config.tracking.representative_embeddings_per_track :
-                        ]
+                        track.add_representative_embedding(
+                            occurrence.embedding,
+                            self._config.tracking.representative_embeddings_per_track,
+                        )
                     track.last_keyframe_time = occurrence.frame_timestamp_seconds
                     track.last_keyframe_bbox = occurrence.bbox
                     track.last_keyframe_crop_histogram = self._crop_histogram(detection.crop_bgr)
                     track.last_keyframe_quality = detection.quality_metrics.score if detection.quality_metrics else 0.0
                     keyframes.append(keyframe)
+                    self._emit_log(
+                        text_callback,
+                        (
+                            f"[Tracking] keyframe selecionado | track={track.track_id} | "
+                            f"keyframe={keyframe.keyframe_id} | "
+                            f"{self._tracking_occurrence_label(occurrence)} | "
+                            f"motivos={','.join(keyframe_reasons)}"
+                        ),
+                    )
                     self._emit_event(
                         event_callback,
                         "keyframe_selected",
@@ -264,6 +294,14 @@ class FaceTrackingService:
                 if track.missed_detections > self._config.tracking.max_missed_detections:
                     completed_tracks.append(track)
                     active_tracks.remove(track)
+                    self._emit_log(
+                        text_callback,
+                        (
+                            f"[Tracking] track encerrado | track={track.track_id} | "
+                            f"{self._tracking_track_end_label(track)} | "
+                            f"deteccoes={len(track.occurrence_ids)} | keyframes={len(track.keyframe_ids)}"
+                        ),
+                    )
                     self._emit_event(
                         event_callback,
                         "track_closed",
@@ -295,6 +333,16 @@ class FaceTrackingService:
             )
 
         completed_tracks.extend(active_tracks)
+        self._emit_log(
+            text_callback,
+            (
+                f"[Tracking] resumo | origem={source_path.name} | "
+                f"amostras={sampled_frames} | quadros_com_face={frames_with_faces} | "
+                f"deteccoes={raw_detection_count} | selecionadas={selected_detection_count} | "
+                f"embeddings={embedded_detection_count} | tracks={len(completed_tracks)} | "
+                f"keyframes={len(keyframes)}"
+            ),
+        )
         return TrackingResult(
             occurrences=occurrences,
             tracks=[self._to_face_track(track) for track in completed_tracks],
@@ -656,6 +704,22 @@ class FaceTrackingService:
         if frame.frame_index is None:
             return "quadro_real=imagem_estatica | instante=-"
         return f"quadro_real={frame.frame_index:06d} | instante={format_seconds(frame.timestamp_seconds)}"
+
+    def _tracking_occurrence_label(self, occurrence: FaceOccurrence) -> str:
+        if occurrence.frame_index is None:
+            return "quadro_real=imagem_estatica | instante=-"
+        return (
+            f"quadro_real={occurrence.frame_index:06d} | "
+            f"instante={format_seconds(occurrence.frame_timestamp_seconds)}"
+        )
+
+    def _tracking_track_end_label(self, track: _TrackState) -> str:
+        if track.end_frame is None:
+            return "ultimo_quadro_real=imagem_estatica | ultimo_instante=-"
+        return (
+            f"ultimo_quadro_real={track.end_frame:06d} | "
+            f"ultimo_instante={format_seconds(track.end_time)}"
+        )
 
     def _detect_faces(self, analyzer: FaceAnalyzer, frame: SampledFrame) -> list[DetectedFace]:
         detect_method = getattr(analyzer, "detect", None)

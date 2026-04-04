@@ -25,9 +25,9 @@ class StructuredEventLogger:
             stream.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
-def build_file_logger(log_directory: Path, log_level: str) -> logging.Logger:
+def build_file_logger(log_directory: Path, log_level: str, file_name: str = "run.log") -> logging.Logger:
     ensure_directory(log_directory)
-    logger_name = f"inventario_faces.{log_directory.as_posix()}"
+    logger_name = f"inventario_faces.{log_directory.as_posix()}.{file_name}"
     logger = logging.getLogger(logger_name)
     logger.setLevel(getattr(logging, log_level.upper(), logging.INFO))
     logger.propagate = False
@@ -39,7 +39,7 @@ def build_file_logger(log_directory: Path, log_level: str) -> logging.Logger:
         fmt="%(asctime)s | %(levelname)s | %(message)s",
         datefmt="%Y-%m-%dT%H:%M:%SZ",
     )
-    file_handler = logging.FileHandler(log_directory / "run.log", encoding="utf-8")
+    file_handler = logging.FileHandler(log_directory / file_name, encoding="utf-8")
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
     return logger

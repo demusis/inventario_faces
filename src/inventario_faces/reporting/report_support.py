@@ -49,6 +49,14 @@ def media_track_type_label(track_type: str) -> str:
     return track_type
 
 
+def format_group_similarity(mean_similarity: float | None, track_count: int) -> str:
+    if track_count < 2:
+        return "n/a (grupo unitário)"
+    if mean_similarity is None:
+        return "n/a (embeddings indisponíveis)"
+    return f"{mean_similarity:.3f}"
+
+
 def software_reference_abnt_text() -> str:
     return (
         "DEMUSIS. Inventario Faces. [S. l.], 2026. "
@@ -72,6 +80,13 @@ def inventory_methodology_items(config: AppConfig, search: SearchArtifacts | Non
     )
     return [
         "Varredura recursiva do diretório de entrada, com cálculo de hash SHA-512 para cada arquivo e extração interna de metadados técnicos de imagem e vídeo.",
+        (
+            "Quando o modo distribuído está habilitado, o lote passa a operar com manifesto global, locks por arquivo e retomada entre instâncias, "
+            "permitindo divisão segura do processamento entre múltiplos computadores ou execuções concorrentes. "
+            "Antes da consolidação final, os parciais podem ser validados quanto à integridade e, quando configurado, os itens ausentes ou corrompidos são reprocessados automaticamente."
+            if config.distributed.enabled
+            else "A coordenação do lote ocorre localmente nesta instância, sem mecanismo de divisão de trabalho entre múltiplos computadores."
+        ),
         (
             "Para vídeos, a análise facial não é exaustivamente quadro a quadro por padrão: "
             f"o sistema extrai quadros em intervalos temporais configuráveis e, nesta configuração, "
@@ -144,7 +159,8 @@ def technical_parameter_items(
     return [
         (
             f"Aplicativo: nome={config.app.name}; versão={__version__}; saída={config.app.output_directory_name}; "
-            f"título={config.app.report_title}; organização={config.app.organization}; log={config.app.log_level}."
+            f"título={config.app.report_title}; organização={config.app.organization}; log={config.app.log_level}; "
+            f"cópia temporária local={'sim' if config.app.use_local_temp_copy else 'não'}."
         ),
         (
             f"Mídias: imagens={image_extensions}; vídeos={video_extensions}."
@@ -180,6 +196,15 @@ def technical_parameter_items(
             f"preferir FAISS={'sim' if config.search.prefer_faiss else 'não'}; "
             f"coarse_top_k={config.search.coarse_top_k}; refine_top_k={config.search.refine_top_k}; "
             f"engine={search_engine}; vetores indexados={search_vectors}."
+        ),
+        (
+            f"Distribuição: habilitada={'sim' if config.distributed.enabled else 'não'}; "
+            f"execução={config.distributed.execution_label}; nó={config.distributed.node_name or 'hostname automático'}; "
+            f"heartbeat={config.distributed.heartbeat_interval_seconds}s; "
+            f"timeout de lock={config.distributed.stale_lock_timeout_minutes}min; "
+            f"auto-finalização={'sim' if config.distributed.auto_finalize else 'não'}; "
+            f"validar parciais={'sim' if config.distributed.validate_partial_integrity else 'não'}; "
+            f"auto-recuperar parciais={'sim' if config.distributed.auto_reprocess_invalid_partials else 'não'}."
         ),
         (
             f"Aprimoramento: pré-processamento={'sim' if config.enhancement.enable_preprocessing else 'não'}; "

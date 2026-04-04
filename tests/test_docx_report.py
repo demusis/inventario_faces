@@ -71,6 +71,7 @@ class DocxReportGeneratorTests(unittest.TestCase):
             self.assertIn("Emitido em", full_text)
             self.assertIn("Acesso em: 4 abr. 2026.", full_text)
             self.assertIn("https://github.com/demusis/inventario_faces", full_text)
+            self.assertIn("similaridade média entre tracks=n/a (grupo unitário)", full_text)
 
     def _config(self) -> AppConfig:
         return AppConfig(
