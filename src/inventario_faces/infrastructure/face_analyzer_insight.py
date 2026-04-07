@@ -2,9 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import importlib.util
+import os
 from pathlib import Path
+import shutil
 from typing import Any
+from urllib.request import urlopen
 import warnings
+import zipfile
 
 import onnxruntime as ort
 
@@ -12,9 +16,95 @@ from inventario_faces.domain.config import FaceModelSettings
 from inventario_faces.domain.entities import BoundingBox, DetectedFace, SampledFrame
 from inventario_faces.utils.math_utils import l2_normalize
 
+INSIGHTFACE_MODEL_REPO_URL = "https://github.com/deepinsight/insightface/releases/download/v0.7"
+MODEL_DOWNLOAD_TIMEOUT_SECONDS = 60
+
 
 class FaceAnalyzerInitializationError(RuntimeError):
     """Erro ao inicializar o backend facial."""
+
+
+def _resolve_insightface_root() -> Path:
+    configured_root = os.getenv("INSIGHTFACE_HOME")
+    if configured_root:
+        return Path(configured_root).expanduser().resolve()
+    return (Path.home() / ".insightface").resolve()
+
+
+def _resolve_model_directory(model_name: str, root: Path | None = None) -> Path:
+    return (root or _resolve_insightface_root()) / "models" / model_name
+
+
+def _has_local_model_bundle(model_directory: Path) -> bool:
+    return model_directory.exists() and any(model_directory.glob("*.onnx"))
+
+
+def _download_model_bundle(model_name: str, root: Path) -> Path:
+    models_root = root / "models"
+    models_root.mkdir(parents=True, exist_ok=True)
+    model_directory = models_root / model_name
+    zip_path = models_root / f"{model_name}.zip"
+    temp_zip_path = zip_path.with_suffix(".zip.partial")
+    model_url = f"{INSIGHTFACE_MODEL_REPO_URL}/{model_name}.zip"
+
+    try:
+        with urlopen(model_url, timeout=MODEL_DOWNLOAD_TIMEOUT_SECONDS) as response:
+            with temp_zip_path.open("wb") as destination:
+                shutil.copyfileobj(response, destination)
+        temp_zip_path.replace(zip_path)
+    except Exception as exc:
+        if temp_zip_path.exists():
+            temp_zip_path.unlink(missing_ok=True)
+        raise FaceAnalyzerInitializationError(
+            (
+                f"Falha ao baixar o modelo facial '{model_name}' em {model_url}. "
+                "Verifique a conectividade de rede ou preencha a pasta local de modelos."
+            )
+        ) from exc
+
+    if model_directory.exists():
+        shutil.rmtree(model_directory, ignore_errors=True)
+    model_directory.mkdir(parents=True, exist_ok=True)
+    try:
+        with zipfile.ZipFile(zip_path) as archive:
+            archive.extractall(model_directory)
+    except zipfile.BadZipFile as exc:
+        raise FaceAnalyzerInitializationError(
+            (
+                f"O arquivo de modelo '{zip_path}' esta corrompido. "
+                "Exclua-o e tente novamente para baixar uma copia valida."
+            )
+        ) from exc
+    return model_directory
+
+
+def _ensure_local_model_bundle(model_name: str) -> Path:
+    root = _resolve_insightface_root()
+    model_directory = _resolve_model_directory(model_name, root)
+    if _has_local_model_bundle(model_directory):
+        return model_directory
+    zip_path = root / "models" / f"{model_name}.zip"
+    if zip_path.exists() and zip_path.stat().st_size > 0:
+        if model_directory.exists():
+            shutil.rmtree(model_directory, ignore_errors=True)
+        model_directory.mkdir(parents=True, exist_ok=True)
+        try:
+            with zipfile.ZipFile(zip_path) as archive:
+                archive.extractall(model_directory)
+        except zipfile.BadZipFile:
+            zip_path.unlink(missing_ok=True)
+            model_directory = _download_model_bundle(model_name, root)
+    else:
+        zip_path.unlink(missing_ok=True)
+        model_directory = _download_model_bundle(model_name, root)
+    if not _has_local_model_bundle(model_directory):
+        raise FaceAnalyzerInitializationError(
+            (
+                f"Nao foi possivel preparar o modelo facial '{model_name}' em "
+                f"{model_directory}."
+            )
+        )
+    return model_directory
 
 
 def _cleanup_skimage_desktop_ini() -> None:
@@ -100,6 +190,8 @@ class InsightFaceAnalyzer:
         self._providers = providers
 
     def _initialize_backend(self, providers: list[str]) -> tuple[Any, Path, Any | None]:
+        root = _resolve_insightface_root()
+        model_dir = _ensure_local_model_bundle(self.settings.model_name)
         for attempt in range(2):
             _cleanup_skimage_desktop_ini()
             try:
@@ -121,10 +213,11 @@ class InsightFaceAnalyzer:
                 _patch_insightface_face_align()
                 detector = FaceAnalysis(
                     name=self.settings.model_name,
+                    root=str(root),
                     providers=providers,
                     allowed_modules=["detection"],
                 )
-                model_dir = Path(detector.model_dir)
+                model_dir = Path(detector.model_dir or model_dir)
                 recognizer = self._load_recognizer(model_zoo, providers, model_dir)
                 return detector, model_dir, recognizer
             except Exception as exc:

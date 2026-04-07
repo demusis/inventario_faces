@@ -55,6 +55,8 @@ from inventario_faces.infrastructure.logging_setup import (
     StructuredEventLogger,
     build_file_logger,
     close_file_logger,
+    format_exception_traceback,
+    summarize_exception,
 )
 from inventario_faces.services.clustering_service import ClusteringService
 from inventario_faces.services.enhancement_service import EnhancementService
@@ -174,6 +176,11 @@ class InventoryService:
             self._emit_log(text_logger, log_callback, f"Diretorio analisado: {root_directory}")
             self._emit_log(text_logger, log_callback, f"Diretorio de trabalho: {work_root}")
             self._emit_log(text_logger, log_callback, f"Diretorio de execucao: {run_directory}")
+            self._emit_log(
+                text_logger,
+                log_callback,
+                f"[Logs] Texto={logs_directory / 'run.log'} | eventos={logs_directory / 'events.jsonl'}",
+            )
             if local_resume.resumed:
                 self._emit_log(
                     text_logger,
@@ -181,8 +188,25 @@ class InventoryService:
                     "[Retomada local] Execucao local incompleta localizada; reaproveitando itens ja concluidos.",
                 )
             self._emit_log(text_logger, log_callback, "Pipeline orientado a tracks ativado.")
+            self._emit_log(
+                text_logger,
+                log_callback,
+                (
+                    f"[Backend facial] Inicializando modelo {self._config.face_model.model_name}. "
+                    "No primeiro uso, o bundle local pode ser preparado automaticamente."
+                ),
+            )
             analyzer = self._face_analyzer_factory()
             providers = list(getattr(analyzer, "providers", []))
+            self._emit_log(
+                text_logger,
+                log_callback,
+                (
+                    f"[Backend facial] Modelo pronto | "
+                    f"diretorio={getattr(analyzer, '_model_dir', '-')} | "
+                    f"providers={', '.join(providers) if providers else 'desconhecido'}"
+                ),
+            )
             for line in self._configuration_log_lines(providers):
                 self._emit_log(text_logger, log_callback, line)
             for line in self._planned_file_log_lines(planned_files):
@@ -387,6 +411,23 @@ class InventoryService:
             else:
                 self._mark_local_resume_pending(local_resume, finished_at_utc)
             return result
+        except Exception as exc:
+            error_summary, traceback_text = self._emit_exception(
+                text_logger,
+                log_callback,
+                "[Execucao] Falha fatal do inventario",
+                exc,
+                include_traceback_in_callback=True,
+            )
+            event_logger.write(
+                "run_failed",
+                error=error_summary,
+                error_type=type(exc).__name__,
+                traceback=traceback_text,
+                resumed=local_resume.resumed,
+            )
+            self._mark_local_resume_pending(local_resume, utc_now())
+            raise
         finally:
             close_file_logger(text_logger)
 
@@ -1009,6 +1050,11 @@ class InventoryService:
         event_logger = StructuredEventLogger(inventory_result.logs_directory / "events.jsonl")
         export_service = ExportService(inventory_result.run_directory)
         try:
+            self._emit_log(
+                logger,
+                log_callback,
+                f"[Logs] Texto={inventory_result.logs_directory / 'run.log'} | eventos={inventory_result.logs_directory / 'events.jsonl'}",
+            )
             self._emit_log(logger, log_callback, f"[Busca por face] Imagem de consulta: {query_path}")
             analyzer = self._face_analyzer_factory()
             processing_query_path, query_sha512, query_cleanup_path = self._prepare_processing_input(
@@ -1125,6 +1171,22 @@ class InventoryService:
             if progress_callback is not None:
                 progress_callback(100, 100, "Busca por face concluída")
             return final_result
+        except Exception as exc:
+            error_summary, traceback_text = self._emit_exception(
+                logger,
+                log_callback,
+                "[Busca por face] Falha fatal",
+                exc,
+                include_traceback_in_callback=True,
+            )
+            event_logger.write(
+                "face_search_failed",
+                query_path=query_path,
+                error=error_summary,
+                error_type=type(exc).__name__,
+                traceback=traceback_text,
+            )
+            raise
         finally:
             close_file_logger(logger)
 
@@ -1156,8 +1218,14 @@ class InventoryService:
         media_info_tracks = ()
         media_info_error: str | None = None
         tracking_result: TrackingResult | None = None
+        current_stage = "preparacao de entrada"
 
         try:
+            self._emit_log(
+                text_logger,
+                log_callback,
+                f"{file_prefix} [Etapa] Preparando entrada e calculando hash SHA-512.",
+            )
             processing_path, sha512, cleanup_path = self._prepare_processing_input(
                 file_path=file_path,
                 media_type=media_type,
@@ -1165,8 +1233,19 @@ class InventoryService:
                 text_logger=text_logger,
                 log_callback=log_callback,
             )
+            self._emit_log(
+                text_logger,
+                log_callback,
+                f"{file_prefix} [Etapa] Entrada preparada | sha512={sha512[:16]}...",
+            )
 
             if media_type in {MediaType.IMAGE, MediaType.VIDEO}:
+                current_stage = "extracao de metadados"
+                self._emit_log(
+                    text_logger,
+                    log_callback,
+                    f"{file_prefix} [Etapa] Extraindo metadados tecnicos da midia.",
+                )
                 media_info_tracks, media_info_error = self._extract_media_info(processing_path)
                 if media_info_error is not None:
                     self._emit_log(
@@ -1177,11 +1256,23 @@ class InventoryService:
 
             frames = None
             if media_type == MediaType.IMAGE:
+                current_stage = "carregamento de imagem"
+                self._emit_log(
+                    text_logger,
+                    log_callback,
+                    f"{file_prefix} [Etapa] Carregando imagem para analise.",
+                )
                 frames = self._frames_with_original_source(
                     [self._media_service.load_image(processing_path)],
                     file_path,
                 )
             elif media_type == MediaType.VIDEO:
+                current_stage = "amostragem de video"
+                self._emit_log(
+                    text_logger,
+                    log_callback,
+                    f"{file_prefix} [Etapa] Amostrando quadros do video.",
+                )
                 sampled_frames = self._media_service.sample_video(
                     processing_path,
                     metadata_callback=lambda info: self._emit_log(
@@ -1193,6 +1284,12 @@ class InventoryService:
                 frames = self._frames_with_original_source(sampled_frames, file_path)
 
             if frames is not None:
+                current_stage = "deteccao, tracking e embeddings"
+                self._emit_log(
+                    text_logger,
+                    log_callback,
+                    f"{file_prefix} [Etapa] Executando deteccao, tracking e embeddings faciais.",
+                )
                 tracking_result = self._tracking_service.process_media(
                     source_path=file_path,
                     sha512=sha512,
@@ -1237,12 +1334,14 @@ class InventoryService:
                 media_info_error=media_info_error,
             )
         except Exception as exc:
-            processing_error = str(exc)
-            text_logger.exception("Falha ao processar %s", file_path)
-            self._emit_log(
+            processing_error, traceback_text = self._emit_exception(
                 text_logger,
                 log_callback,
-                f"{file_prefix} Erro de processamento: {processing_error}",
+                (
+                    f"{file_prefix} Erro de processamento | etapa={current_stage} | "
+                    f"arquivo={file_path}"
+                ),
+                exc,
             )
             event_logger.write(
                 "file_processing_error",
@@ -1250,6 +1349,9 @@ class InventoryService:
                 media_type=media_type,
                 sha512=sha512,
                 error=processing_error,
+                error_type=type(exc).__name__,
+                error_stage=current_stage,
+                traceback=traceback_text,
                 media_info_tracks=media_info_tracks,
                 media_info_error=media_info_error,
             )
@@ -1304,7 +1406,16 @@ class InventoryService:
         log_callback: LogCallback | None,
     ) -> tuple[Path, str, Path | None]:
         if not self._config.app.use_local_temp_copy or media_type not in {MediaType.IMAGE, MediaType.VIDEO}:
-            return file_path, self._hashing_service.sha512(file_path), None
+            sha512 = self._hashing_service.sha512(file_path)
+            self._emit_log(
+                text_logger,
+                log_callback,
+                (
+                    f"{file_prefix} Entrada original mantida | "
+                    f"origem={file_path} | sha512={sha512[:16]}..."
+                ),
+            )
+            return file_path, sha512, None
 
         temporary_directory = Path(tempfile.mkdtemp(prefix="inventario_faces_media_"))
         temporary_path = temporary_directory / file_path.name
@@ -2140,6 +2251,26 @@ class InventoryService:
         logger.info(message)
         if log_callback is not None:
             log_callback(message)
+
+    def _emit_exception(
+        self,
+        logger: logging.Logger,
+        log_callback: LogCallback | None,
+        context_message: str,
+        exc: BaseException,
+        *,
+        include_traceback_in_callback: bool = False,
+    ) -> tuple[str, str]:
+        summary = summarize_exception(exc)
+        traceback_text = format_exception_traceback(exc)
+        logger.exception("%s | %s", context_message, summary)
+        if log_callback is not None:
+            log_callback(f"{context_message} | {summary}")
+            if include_traceback_in_callback:
+                log_callback("[Traceback] Inicio")
+                log_callback(traceback_text)
+                log_callback("[Traceback] Fim")
+        return summary, traceback_text
 
     def _configuration_log_lines(self, providers: list[str]) -> list[str]:
         provider_label = ", ".join(providers) if providers else "selecao automatica"

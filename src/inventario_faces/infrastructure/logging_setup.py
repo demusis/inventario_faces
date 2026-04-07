@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
+import time
+import traceback
 from typing import Any
 
 from inventario_faces.utils.path_utils import ensure_directory
@@ -25,6 +27,28 @@ class StructuredEventLogger:
             stream.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
+def summarize_exception(exc: BaseException) -> str:
+    parts: list[str] = []
+    visited: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        label = type(current).__name__
+        message = str(current).strip()
+        parts.append(f"{label}: {message}" if message else label)
+        if current.__cause__ is not None:
+            current = current.__cause__
+            continue
+        if current.__suppress_context__:
+            break
+        current = current.__context__
+    return " <= ".join(parts) if parts else type(exc).__name__
+
+
+def format_exception_traceback(exc: BaseException) -> str:
+    return "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)).strip()
+
+
 def build_file_logger(log_directory: Path, log_level: str, file_name: str = "run.log") -> logging.Logger:
     ensure_directory(log_directory)
     logger_name = f"inventario_faces.{log_directory.as_posix()}.{file_name}"
@@ -36,9 +60,10 @@ def build_file_logger(log_directory: Path, log_level: str, file_name: str = "run
         return logger
 
     formatter = logging.Formatter(
-        fmt="%(asctime)s | %(levelname)s | %(message)s",
-        datefmt="%Y-%m-%dT%H:%M:%SZ",
+        fmt="%(asctime)s.%(msecs)03dZ | %(levelname)s | %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S",
     )
+    formatter.converter = time.gmtime
     file_handler = logging.FileHandler(log_directory / file_name, encoding="utf-8")
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)

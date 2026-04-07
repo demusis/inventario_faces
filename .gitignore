@@ -15,4 +15,8 @@ src/*.egg-info/
 src/**/*.egg-info/
 
 build/inventario_faces/
+build/__pycache__/
+build/*.out
+build/*.err
 dist/installer/
+dist/InventarioFaces/_internal/models/

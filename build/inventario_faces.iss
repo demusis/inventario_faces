@@ -16,9 +16,13 @@ AppSupportURL={#MyAppURL}
 AppUpdatesURL={#MyAppURL}
 DefaultDirName={autopf}\InventarioFaces
 DefaultGroupName={#MyAppName}
+ArchitecturesAllowed=x64compatible
+ArchitecturesInstallIn64BitMode=x64compatible
+SetupIconFile=..\src\inventario_faces\assets\app_icon.ico
+UninstallDisplayIcon={app}\{#MyAppExeName}
 OutputDir=..\dist\installer
 OutputBaseFilename=InventarioFacesSetup-{#MyAppVersion}
-Compression=lzma
+Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
 

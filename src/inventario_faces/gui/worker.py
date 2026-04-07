@@ -5,6 +5,7 @@ from typing import Callable
 
 from PySide6.QtCore import QObject, Signal, Slot
 
+from inventario_faces.infrastructure.logging_setup import summarize_exception
 from inventario_faces.services.inventory_service import InventoryService
 
 
@@ -27,7 +28,7 @@ class _BaseWorker(QObject):
             report_path = report.pdf_path or report.docx_path or report.tex_path
             self.completed.emit(str(report_path))
         except Exception as exc:
-            self.failed.emit(str(exc))
+            self.failed.emit(summarize_exception(exc))
 
     def _on_progress(self, current: int, total: int, message: str) -> None:
         percent = 0 if total == 0 else int((current / total) * 100)

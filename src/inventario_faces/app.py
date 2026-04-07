@@ -27,6 +27,17 @@ from inventario_faces.services.scanner_service import ScannerService
 from inventario_faces.services.video_service import VideoService
 
 
+def _runtime_base_directory() -> Path:
+    return Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parents[2]))
+
+
+def _package_resource_directory() -> Path:
+    frozen_base = getattr(sys, "_MEIPASS", None)
+    if frozen_base is not None:
+        return Path(frozen_base) / "inventario_faces"
+    return Path(__file__).resolve().parent
+
+
 def resolve_config_path() -> Path | None:
     raw_value = os.getenv("INVENTARIO_FACES_CONFIG")
     return Path(raw_value).expanduser().resolve() if raw_value else None
@@ -52,14 +63,23 @@ def persist_runtime_config(config: AppConfig) -> Path:
     return save_app_config(config, resolve_persistent_config_path())
 
 
-def configure_runtime_environment() -> None:
-    runtime_base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parents[2]))
-    model_candidates = [
-        Path(sys.executable).resolve().parent / "models",
-        runtime_base / "models",
-    ]
-    for candidate in model_candidates:
+def resolve_app_icon_path() -> Path | None:
+    resource_directory = _package_resource_directory() / "assets"
+    for file_name in ("app_icon.ico", "app_icon.png"):
+        candidate = resource_directory / file_name
         if candidate.exists():
+            return candidate
+    return None
+
+
+def configure_runtime_environment() -> None:
+    runtime_base = _runtime_base_directory()
+    root_candidates = [
+        Path(sys.executable).resolve().parent,
+        runtime_base,
+    ]
+    for candidate in root_candidates:
+        if (candidate / "models").exists():
             os.environ.setdefault("INSIGHTFACE_HOME", str(candidate))
             break
 

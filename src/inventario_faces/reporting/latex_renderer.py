@@ -5,7 +5,7 @@ from pathlib import Path
 
 from inventario_faces.domain.config import AppConfig
 from inventario_faces.domain.entities import FileRecord, FaceTrack, InventoryResult, KeyFrame, MediaInfoAttribute, ReportArtifacts
-from inventario_faces.infrastructure.latex_compiler import LatexCompiler
+from inventario_faces.infrastructure.latex_compiler import LatexCompilationError, LatexCompiler
 from inventario_faces.reporting.report_context import (
     keyframes_by_track,
     mean_pairwise_track_similarity,
@@ -37,7 +37,11 @@ class LatexReportGenerator:
 
         pdf_path: Path | None = None
         if self._config.reporting.compile_pdf:
-            pdf_path = self._compiler.compile(tex_path)
+            try:
+                pdf_path = self._compiler.compile(tex_path)
+            except LatexCompilationError as exc:
+                warning_path = report_directory / "relatorio_forense_pdf_erro.txt"
+                warning_path.write_text(str(exc), encoding="utf-8")
         return ReportArtifacts(tex_path=tex_path, pdf_path=pdf_path)
 
     def _render_tex(self, result: InventoryResult, tex_path: Path) -> str:

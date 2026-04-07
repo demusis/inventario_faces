@@ -7,6 +7,7 @@ from typing import Callable
 from PySide6.QtCore import QThread, QUrl
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
+    QApplication,
     QFileDialog,
     QHBoxLayout,
     QLabel,
@@ -48,6 +49,9 @@ class MainWindow(QMainWindow):
 
     def _build_ui(self) -> None:
         self.setWindowTitle(self._current_config.app.name)
+        app_icon = QApplication.windowIcon()
+        if not app_icon.isNull():
+            self.setWindowIcon(app_icon)
         self.resize(920, 640)
 
         central_widget = QWidget(self)
@@ -280,10 +284,16 @@ class MainWindow(QMainWindow):
         self._set_running_state(False)
 
     def _on_failed(self, error: str) -> None:
-        self._append_log(f"Falha: {error}")
+        self._append_log("[ERRO] Execucao interrompida.")
+        self._append_log(error)
         self._status_label.setText("Falha no processamento.")
         self._set_running_state(False)
-        QMessageBox.critical(self, "Erro", error)
+        short_error = error.splitlines()[0] if error else "Falha desconhecida."
+        QMessageBox.critical(
+            self,
+            "Erro",
+            f"{short_error}\n\nConsulte o log exibido na janela para detalhes.",
+        )
 
     def _open_report(self) -> None:
         if self._current_report_path is None:
@@ -304,8 +314,14 @@ class MainWindow(QMainWindow):
         )
 
     def _append_log(self, message: str) -> None:
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        self._log_view.appendPlainText(f"{timestamp} | {message}")
+        normalized = message.replace("\r\n", "\n").replace("\r", "\n")
+        lines = normalized.split("\n")
+        for line in lines:
+            if line == "":
+                self._log_view.appendPlainText("")
+                continue
+            timestamp = datetime.now().strftime("%H:%M:%S")
+            self._log_view.appendPlainText(f"{timestamp} | {line}")
 
     def _cleanup_thread(self) -> None:
         if self._worker is not None:
