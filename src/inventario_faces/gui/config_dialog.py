@@ -34,6 +34,7 @@ from inventario_faces.domain.config import (
     EnhancementSettings,
     FaceModelSettings,
     ForensicsSettings,
+    LikelihoodRatioSettings,
     MediaSettings,
     ReportingSettings,
     SearchSettings,
@@ -94,6 +95,7 @@ class ConfigDialog(QDialog):
         tabs.addTab(self._build_face_tab(), "Análise facial")
         tabs.addTab(self._build_tracking_tab(), "Tracking")
         tabs.addTab(self._build_clustering_search_tab(), "Agrupamento e busca")
+        tabs.addTab(self._build_likelihood_ratio_tab(), "Razão de verossimilhança")
         tabs.addTab(self._build_enhancement_tab(), "Aprimoramento")
         tabs.addTab(self._build_reporting_tab(), "Relatório")
         layout.addWidget(tabs)
@@ -321,7 +323,7 @@ class ConfigDialog(QDialog):
         self._minimum_face_size_spin.setRange(1, 4096)
         self._minimum_face_size_spin.setSuffix(" px")
         self._providers_input = QLineEdit(tab)
-        self._providers_input.setPlaceholderText("Em branco = seleção automática")
+        self._providers_input.setPlaceholderText("Em branco = preferir GPU automaticamente")
 
         self._det_width_spin = QSpinBox(tab)
         self._det_width_spin.setRange(32, 4096)
@@ -358,7 +360,7 @@ class ConfigDialog(QDialog):
         form.addRow("Contexto de execução:", self._with_help(self._ctx_id_spin, "Contexto de execução", self._help_html(
             definition="Identificador do dispositivo usado pela inferência. Em geral, 0 indica o primeiro acelerador disponível e -1 força CPU.",
             operational_effect="Afeta desempenho, estabilidade do ambiente e reprodutibilidade operacional.",
-            recommendation="Use -1 quando a prioridade for estabilidade e 0 apenas em hardware acelerado validado.",
+            recommendation="Use 0 como padrão para permitir aceleração quando houver provider de GPU disponível. Use -1 apenas quando quiser forçar CPU deliberadamente.",
             references=[("ONNX Runtime execution providers", ONNXRUNTIME_EP_URL)],
         )))
         form.addRow("Tamanho de detecção:", self._with_help(det_size_widget, "Tamanho de detecção", self._help_html(
@@ -382,7 +384,7 @@ class ConfigDialog(QDialog):
         form.addRow("Mecanismos de execução:", self._with_help(self._providers_input, "Mecanismos de execução", self._help_html(
             definition="Lista, em ordem de preferência, dos execution providers do ONNX Runtime.",
             operational_effect="A ordem interfere em desempenho, compatibilidade e fallback entre GPU e CPU.",
-            recommendation="Deixe em branco para seleção automática até que a infraestrutura esteja validada.",
+            recommendation="Deixe em branco para o aplicativo preferir GPU automaticamente quando houver CUDA ou DirectML e cair para CPU quando não houver suporte.",
             references=[("ONNX Runtime execution providers", ONNXRUNTIME_EP_URL)],
         )))
         return tab
@@ -523,6 +525,124 @@ class ConfigDialog(QDialog):
         )))
         return tab
 
+    def _build_likelihood_ratio_tab(self) -> QWidget:
+        tab = QWidget(self)
+        form = QFormLayout(tab)
+
+        self._lr_max_scores_spin = QSpinBox(tab)
+        self._lr_max_scores_spin.setRange(10, 5_000_000)
+        self._lr_max_scores_spin.setSingleStep(1000)
+        self._lr_min_identities_spin = QSpinBox(tab)
+        self._lr_min_identities_spin.setRange(2, 1_000_000)
+        self._lr_min_same_scores_spin = QSpinBox(tab)
+        self._lr_min_same_scores_spin.setRange(1, 1_000_000)
+        self._lr_min_different_scores_spin = QSpinBox(tab)
+        self._lr_min_different_scores_spin.setRange(1, 1_000_000)
+        self._lr_min_unique_scores_spin = QSpinBox(tab)
+        self._lr_min_unique_scores_spin.setRange(2, 10_000)
+        self._lr_bandwidth_scale_spin = self._double_spin_box(0.05, 20.0, 3, 0.05)
+        self._lr_uniform_floor_spin = self._double_spin_box(0.0, 0.5, 5, 0.0005)
+        self._lr_min_density_input = QLineEdit(tab)
+        self._lr_min_density_input.setPlaceholderText("Ex.: 1e-12")
+
+        form.addRow(
+            "Amostra máxima por distribuição:",
+            self._with_help(
+                self._lr_max_scores_spin,
+                "Amostra máxima por distribuição",
+                self._help_html(
+                    definition="Limite de scores mantidos por reservoir sampling em cada distribuição da calibração LR.",
+                    operational_effect="Controla memória, tempo de KDE e tamanho do modelo salvo, sem alterar o total de pares realmente percorridos.",
+                    recommendation="Mantenha 20000 como ponto de equilíbrio. Aumente apenas quando quiser curvas mais estáveis em bases muito heterogêneas e houver folga computacional.",
+                ),
+            ),
+        )
+        form.addRow(
+            "Mínimo de identidades com faces:",
+            self._with_help(
+                self._lr_min_identities_spin,
+                "Mínimo de identidades com faces",
+                self._help_html(
+                    definition="Número mínimo de identidades úteis exigido para autorizar a calibração LR.",
+                    operational_effect="Evita ajustar densidades com base muito pequena ou estatisticamente frágil.",
+                    recommendation="Use ao menos 2. Valores maiores tornam o suporte mais exigente e conservador.",
+                ),
+            ),
+        )
+        form.addRow(
+            "Mínimo de scores de mesma origem:",
+            self._with_help(
+                self._lr_min_same_scores_spin,
+                "Mínimo de scores de mesma origem",
+                self._help_html(
+                    definition="Quantidade mínima de pares H1 necessária para ajustar a densidade de mesma origem.",
+                    operational_effect="Se a base não atingir esse volume, a LR não é aplicada e o resultado fica sem calibração.",
+                    recommendation="Mantenha um valor baixo, porém não trivial. O padrão 5 só garante viabilidade mínima; para uso mais rígido, aumente com cautela.",
+                ),
+            ),
+        )
+        form.addRow(
+            "Mínimo de scores de origem distinta:",
+            self._with_help(
+                self._lr_min_different_scores_spin,
+                "Mínimo de scores de origem distinta",
+                self._help_html(
+                    definition="Quantidade mínima de pares H2 necessária para ajustar a densidade de origem distinta.",
+                    operational_effect="Controla a robustez da distribuição de comparação entre identidades diferentes.",
+                    recommendation="Mantenha alinhado ao mínimo de mesma origem e só eleve quando a base rotulada for abundante.",
+                ),
+            ),
+        )
+        form.addRow(
+            "Mínimo de valores distintos:",
+            self._with_help(
+                self._lr_min_unique_scores_spin,
+                "Mínimo de valores distintos",
+                self._help_html(
+                    definition="Quantidade mínima de scores distintos exigida em cada distribuição para evitar KDE degenerada.",
+                    operational_effect="Bloqueia ajustes quando os scores ficam praticamente constantes e a densidade perde utilidade.",
+                    recommendation="Mantenha 2 como regra mínima. Aumente apenas se quiser rejeitar bases com variabilidade muito estreita.",
+                ),
+            ),
+        )
+        form.addRow(
+            "Escala da banda KDE:",
+            self._with_help(
+                self._lr_bandwidth_scale_spin,
+                "Escala da banda KDE",
+                self._help_html(
+                    definition="Fator multiplicativo aplicado à largura de banda Scott da gaussian_kde.",
+                    operational_effect="Valores maiores suavizam mais as curvas; valores menores tornam a densidade mais sensível a picos e irregularidades.",
+                    recommendation="Comece em 1,0. Suba quando a curva ficar serrilhada demais; desça apenas em estudos controlados e com base grande.",
+                ),
+            ),
+        )
+        form.addRow(
+            "Peso do piso uniforme:",
+            self._with_help(
+                self._lr_uniform_floor_spin,
+                "Peso do piso uniforme",
+                self._help_html(
+                    definition="Mistura uma pequena parcela de densidade uniforme à KDE para evitar zeros numéricos.",
+                    operational_effect="Reduz explosões artificiais do LR quando a densidade estimada fica muito próxima de zero em uma das hipóteses.",
+                    recommendation="Mantenha muito pequeno. O padrão 0,001 corresponde a 0,1% de mistura uniforme.",
+                ),
+            ),
+        )
+        form.addRow(
+            "Densidade mínima absoluta:",
+            self._with_help(
+                self._lr_min_density_input,
+                "Densidade mínima absoluta",
+                self._help_html(
+                    definition="Piso absoluto aplicado à densidade final após a estabilização.",
+                    operational_effect="Evita divisão por valores numericamente nulos e limita LR extremos causados por underflow.",
+                    recommendation="Use notação científica, como 1e-12. Reduza apenas se você souber exatamente o impacto estatístico e numérico.",
+                ),
+            ),
+        )
+        return tab
+
     def _build_enhancement_tab(self) -> QWidget:
         tab = QWidget(self)
         form = QFormLayout(tab)
@@ -657,6 +777,15 @@ class ConfigDialog(QDialog):
         self._search_coarse_top_k_spin.setValue(config.search.coarse_top_k)
         self._search_refine_top_k_spin.setValue(config.search.refine_top_k)
 
+        self._lr_max_scores_spin.setValue(config.likelihood_ratio.max_scores_per_distribution)
+        self._lr_min_identities_spin.setValue(config.likelihood_ratio.minimum_identities_with_faces)
+        self._lr_min_same_scores_spin.setValue(config.likelihood_ratio.minimum_same_source_scores)
+        self._lr_min_different_scores_spin.setValue(config.likelihood_ratio.minimum_different_source_scores)
+        self._lr_min_unique_scores_spin.setValue(config.likelihood_ratio.minimum_unique_scores_per_distribution)
+        self._lr_bandwidth_scale_spin.setValue(config.likelihood_ratio.kde_bandwidth_scale)
+        self._lr_uniform_floor_spin.setValue(config.likelihood_ratio.kde_uniform_floor_weight)
+        self._lr_min_density_input.setText(f"{config.likelihood_ratio.kde_min_density:.12g}")
+
         self._enhancement_enable_checkbox.setChecked(config.enhancement.enable_preprocessing)
         self._enhancement_min_brightness_spin.setValue(config.enhancement.minimum_brightness_to_enhance)
         self._enhancement_clahe_clip_spin.setValue(config.enhancement.clahe_clip_limit)
@@ -689,6 +818,10 @@ class ConfigDialog(QDialog):
         backend = self._require_text(self._backend_input.text(), "Informe o mecanismo facial.")
         model_name = self._require_text(self._model_name_input.text(), "Informe o nome do modelo facial.")
         chain_note = self._require_text(self._chain_note_input.toPlainText(), "Informe a nota de cadeia de custódia.")
+        lr_min_density_text = self._require_text(
+            self._lr_min_density_input.text(),
+            "Informe a densidade mínima absoluta da calibração LR.",
+        )
 
         distributed_enabled = self._distributed_enabled_checkbox.isChecked()
         execution_label = (
@@ -770,6 +903,16 @@ class ConfigDialog(QDialog):
                 prefer_faiss=self._search_prefer_faiss_checkbox.isChecked(),
                 coarse_top_k=int(self._search_coarse_top_k_spin.value()),
                 refine_top_k=int(self._search_refine_top_k_spin.value()),
+            ),
+            likelihood_ratio=LikelihoodRatioSettings(
+                max_scores_per_distribution=int(self._lr_max_scores_spin.value()),
+                minimum_identities_with_faces=int(self._lr_min_identities_spin.value()),
+                minimum_same_source_scores=int(self._lr_min_same_scores_spin.value()),
+                minimum_different_source_scores=int(self._lr_min_different_scores_spin.value()),
+                minimum_unique_scores_per_distribution=int(self._lr_min_unique_scores_spin.value()),
+                kde_bandwidth_scale=float(self._lr_bandwidth_scale_spin.value()),
+                kde_uniform_floor_weight=float(self._lr_uniform_floor_spin.value()),
+                kde_min_density=float(lr_min_density_text),
             ),
             distributed=DistributedSettings(
                 enabled=distributed_enabled,

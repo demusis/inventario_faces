@@ -5,6 +5,7 @@ import importlib.util
 import os
 from pathlib import Path
 import shutil
+import sys
 from typing import Any
 from urllib.request import urlopen
 import warnings
@@ -18,10 +19,79 @@ from inventario_faces.utils.math_utils import l2_normalize
 
 INSIGHTFACE_MODEL_REPO_URL = "https://github.com/deepinsight/insightface/releases/download/v0.7"
 MODEL_DOWNLOAD_TIMEOUT_SECONDS = 60
+PREFERRED_EXECUTION_PROVIDERS = (
+    "CUDAExecutionProvider",
+    "DmlExecutionProvider",
+    "CPUExecutionProvider",
+)
+GPU_EXECUTION_PROVIDERS = (
+    "CUDAExecutionProvider",
+    "DmlExecutionProvider",
+)
+_WINDOWS_DLL_DIRECTORY_HANDLES: list[Any] = []
 
 
 class FaceAnalyzerInitializationError(RuntimeError):
     """Erro ao inicializar o backend facial."""
+
+
+def _register_runtime_dll_directories() -> None:
+    candidate_directories: list[Path] = []
+    root_candidates = [
+        Path(getattr(sys, "_MEIPASS", "")).resolve() if getattr(sys, "_MEIPASS", None) else None,
+        Path(sys.executable).resolve().parent,
+        Path(__file__).resolve().parents[3],
+    ]
+    seen_roots: set[Path] = set()
+    for root in root_candidates:
+        if root is None or not root.exists():
+            continue
+        if root in seen_roots:
+            continue
+        seen_roots.add(root)
+        capi_directory = root / "onnxruntime" / "capi"
+        if capi_directory.exists():
+            candidate_directories.append(capi_directory)
+        nvidia_root = root / "nvidia"
+        if nvidia_root.exists():
+            candidate_directories.extend(path for path in nvidia_root.rglob("bin") if path.is_dir())
+
+    seen_directories: set[Path] = set()
+    path_entries = os.environ.get("PATH", "").split(os.pathsep) if os.environ.get("PATH") else []
+    for directory in candidate_directories:
+        if directory in seen_directories:
+            continue
+        seen_directories.add(directory)
+        directory_text = str(directory)
+        if directory_text not in path_entries:
+            path_entries.insert(0, directory_text)
+        add_dll_directory = getattr(os, "add_dll_directory", None)
+        if add_dll_directory is None:
+            continue
+        try:
+            handle = add_dll_directory(directory_text)
+        except OSError:
+            continue
+        _WINDOWS_DLL_DIRECTORY_HANDLES.append(handle)
+
+    if path_entries:
+        os.environ["PATH"] = os.pathsep.join(path_entries)
+
+
+def _try_preload_onnxruntime_gpu_dlls() -> None:
+    _register_runtime_dll_directories()
+    preload = getattr(ort, "preload_dlls", None)
+    if preload is None:
+        return
+    try:
+        preload(directory="")
+    except TypeError:
+        try:
+            preload()
+        except Exception:
+            return
+    except Exception:
+        return
 
 
 def _resolve_insightface_root() -> Path:
@@ -183,11 +253,14 @@ class InsightFaceAnalyzer:
     settings: FaceModelSettings
 
     def __post_init__(self) -> None:
-        providers = list(self.settings.providers) or self._discover_providers()
+        _try_preload_onnxruntime_gpu_dlls()
+        available_providers = self._available_execution_providers()
+        providers = self._resolve_providers(available_providers)
         self._detector, self._model_dir, self._recognizer = self._initialize_backend(providers)
         self._prepared_det_size: tuple[int, int] | None = None
         self._prepare_detector(self.settings.det_size or (640, 640))
         self._providers = providers
+        self._available_providers = available_providers
 
     def _initialize_backend(self, providers: list[str]) -> tuple[Any, Path, Any | None]:
         root = _resolve_insightface_root()
@@ -215,7 +288,7 @@ class InsightFaceAnalyzer:
                     name=self.settings.model_name,
                     root=str(root),
                     providers=providers,
-                    allowed_modules=["detection"],
+                    allowed_modules=["detection", "landmark_2d_106", "landmark_3d_68"],
                 )
                 model_dir = Path(detector.model_dir or model_dir)
                 recognizer = self._load_recognizer(model_zoo, providers, model_dir)
@@ -230,11 +303,24 @@ class InsightFaceAnalyzer:
             "Falha ao inicializar o InsightFace apos saneamento automatico do skimage."
         )
 
-    def _discover_providers(self) -> list[str]:
-        available = ort.get_available_providers()
+    def _available_execution_providers(self) -> list[str]:
+        return list(dict.fromkeys(str(provider) for provider in ort.get_available_providers()))
+
+    def _resolve_providers(self, available_providers: list[str]) -> list[str]:
+        configured = [
+            provider
+            for provider in self.settings.providers
+            if provider in available_providers
+        ]
+        if configured:
+            return configured
+        return self._discover_providers(available_providers)
+
+    def _discover_providers(self, available_providers: list[str] | None = None) -> list[str]:
+        available = available_providers or self._available_execution_providers()
         prioritized = [
             provider
-            for provider in ("CUDAExecutionProvider", "DmlExecutionProvider", "CPUExecutionProvider")
+            for provider in PREFERRED_EXECUTION_PROVIDERS
             if provider in available
         ]
         return prioritized or ["CPUExecutionProvider"]
@@ -242,6 +328,14 @@ class InsightFaceAnalyzer:
     @property
     def providers(self) -> list[str]:
         return list(self._providers)
+
+    @property
+    def available_providers(self) -> list[str]:
+        return list(self._available_providers)
+
+    @property
+    def using_gpu(self) -> bool:
+        return any(provider in GPU_EXECUTION_PROVIDERS for provider in self._providers)
 
     def detect(self, frame: SampledFrame) -> list[DetectedFace]:
         self._ensure_detection_size(frame)
@@ -258,6 +352,7 @@ class InsightFaceAnalyzer:
                 if raw_landmarks is not None
                 else ()
             )
+            biometric_landmarks = self._extract_biometric_landmarks(face, landmarks)
 
             detections.append(
                 DetectedFace(
@@ -265,6 +360,7 @@ class InsightFaceAnalyzer:
                     detection_score=detection_score,
                     crop_bgr=crop,
                     landmarks=landmarks,
+                    biometric_landmarks=biometric_landmarks,
                     enhancement_metadata=frame.enhancement_metadata,
                 )
             )
@@ -317,12 +413,31 @@ class InsightFaceAnalyzer:
                     crop_bgr=detection.crop_bgr,
                     embedding=self.embed(frame, detection, reason="full_analysis"),
                     landmarks=detection.landmarks,
+                    biometric_landmarks=detection.biometric_landmarks,
                     quality_metrics=detection.quality_metrics,
                     enhancement_metadata=detection.enhancement_metadata,
                     embedding_source="full_analysis",
                 )
             )
         return enriched
+
+    def _extract_biometric_landmarks(
+        self,
+        face: Any,
+        fallback_landmarks: tuple[tuple[float, float], ...],
+    ) -> tuple[tuple[float, float], ...]:
+        for attribute_name in ("landmark_2d_106", "landmark_3d_68"):
+            raw_points = getattr(face, attribute_name, None)
+            if raw_points is None:
+                continue
+            points = []
+            for point in raw_points:
+                if len(point) < 2:
+                    continue
+                points.append((float(point[0]), float(point[1])))
+            if points:
+                return tuple(points)
+        return tuple(fallback_landmarks)
 
     def _prepare_detector(self, det_size: tuple[int, int]) -> None:
         self._detector.prepare(ctx_id=self.settings.ctx_id, det_size=det_size)

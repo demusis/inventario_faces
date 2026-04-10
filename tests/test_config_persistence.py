@@ -14,6 +14,7 @@ from inventario_faces.domain.config import (
     EnhancementSettings,
     FaceModelSettings,
     ForensicsSettings,
+    LikelihoodRatioSettings,
     MediaSettings,
     ReportingSettings,
     SearchSettings,
@@ -93,6 +94,16 @@ class ConfigPersistenceTests(unittest.TestCase):
                 coarse_top_k=10,
                 refine_top_k=16,
             ),
+            likelihood_ratio=LikelihoodRatioSettings(
+                max_scores_per_distribution=12345,
+                minimum_identities_with_faces=3,
+                minimum_same_source_scores=7,
+                minimum_different_source_scores=9,
+                minimum_unique_scores_per_distribution=4,
+                kde_bandwidth_scale=1.25,
+                kde_uniform_floor_weight=0.0025,
+                kde_min_density=1e-10,
+            ),
             distributed=DistributedSettings(
                 enabled=True,
                 execution_label="lote_compartilhado",
@@ -127,6 +138,32 @@ class ConfigPersistenceTests(unittest.TestCase):
         self.assertEqual(config.tracking.max_missed_detections, loaded.tracking.max_missed_detections)
         self.assertEqual(config.enhancement.gamma, loaded.enhancement.gamma)
         self.assertEqual(config.search.refine_top_k, loaded.search.refine_top_k)
+        self.assertEqual(
+            config.likelihood_ratio.max_scores_per_distribution,
+            loaded.likelihood_ratio.max_scores_per_distribution,
+        )
+        self.assertEqual(
+            config.likelihood_ratio.minimum_identities_with_faces,
+            loaded.likelihood_ratio.minimum_identities_with_faces,
+        )
+        self.assertEqual(
+            config.likelihood_ratio.minimum_same_source_scores,
+            loaded.likelihood_ratio.minimum_same_source_scores,
+        )
+        self.assertEqual(
+            config.likelihood_ratio.minimum_different_source_scores,
+            loaded.likelihood_ratio.minimum_different_source_scores,
+        )
+        self.assertEqual(
+            config.likelihood_ratio.minimum_unique_scores_per_distribution,
+            loaded.likelihood_ratio.minimum_unique_scores_per_distribution,
+        )
+        self.assertEqual(config.likelihood_ratio.kde_bandwidth_scale, loaded.likelihood_ratio.kde_bandwidth_scale)
+        self.assertEqual(
+            config.likelihood_ratio.kde_uniform_floor_weight,
+            loaded.likelihood_ratio.kde_uniform_floor_weight,
+        )
+        self.assertEqual(config.likelihood_ratio.kde_min_density, loaded.likelihood_ratio.kde_min_density)
         self.assertEqual(config.distributed.execution_label, loaded.distributed.execution_label)
         self.assertEqual(config.distributed.node_name, loaded.distributed.node_name)
         self.assertEqual(config.distributed.auto_finalize, loaded.distributed.auto_finalize)
@@ -293,14 +330,22 @@ forensics:
         self.assertEqual((800, 800), loaded.face_model.det_size)
         self.assertEqual(0.68, loaded.face_model.minimum_face_quality)
         self.assertEqual(48, loaded.face_model.minimum_face_size_pixels)
-        self.assertEqual(-1, loaded.face_model.ctx_id)
-        self.assertEqual(("CPUExecutionProvider",), loaded.face_model.providers)
+        self.assertEqual(0, loaded.face_model.ctx_id)
+        self.assertEqual((), loaded.face_model.providers)
         self.assertEqual(0.62, loaded.clustering.assignment_similarity)
         self.assertEqual(0.56, loaded.clustering.candidate_similarity)
         self.assertEqual(0.58, loaded.tracking.embedding_similarity_threshold)
         self.assertEqual(0.45, loaded.tracking.minimum_total_match_score)
         self.assertEqual(12, loaded.search.coarse_top_k)
         self.assertEqual(20, loaded.search.refine_top_k)
+        self.assertEqual(20000, loaded.likelihood_ratio.max_scores_per_distribution)
+        self.assertEqual(2, loaded.likelihood_ratio.minimum_identities_with_faces)
+        self.assertEqual(5, loaded.likelihood_ratio.minimum_same_source_scores)
+        self.assertEqual(5, loaded.likelihood_ratio.minimum_different_source_scores)
+        self.assertEqual(2, loaded.likelihood_ratio.minimum_unique_scores_per_distribution)
+        self.assertEqual(1.0, loaded.likelihood_ratio.kde_bandwidth_scale)
+        self.assertEqual(0.001, loaded.likelihood_ratio.kde_uniform_floor_weight)
+        self.assertEqual(1e-12, loaded.likelihood_ratio.kde_min_density)
         self.assertIn("probabilisticos", loaded.forensics.chain_of_custody_note)
 
     def test_packaged_default_config_matches_project_default_config(self) -> None:

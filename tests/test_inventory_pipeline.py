@@ -16,6 +16,7 @@ from inventario_faces.domain.config import (
     ClusteringSettings,
     FaceModelSettings,
     ForensicsSettings,
+    LikelihoodRatioSettings,
     MediaSettings,
     ReportingSettings,
     VideoSettings,
@@ -39,8 +40,41 @@ class _FakeAnalyzer:
                 detection_score=0.97,
                 embedding=[1.0, 0.0, 0.0],
                 crop_bgr=crop,
+                landmarks=((12.0, 16.0), (31.0, 16.0), (22.0, 24.0), (15.0, 32.0), (29.0, 32.0)),
+                biometric_landmarks=(
+                    (12.0, 16.0),
+                    (20.0, 14.0),
+                    (31.0, 16.0),
+                    (17.0, 23.0),
+                    (22.0, 24.0),
+                    (28.0, 23.0),
+                    (15.0, 32.0),
+                    (22.0, 34.0),
+                    (29.0, 32.0),
+                ),
             )
         ]
+
+
+class _CalibrationAwareAnalyzer(_FakeAnalyzer):
+    _EMBEDDINGS = {
+        "alice_1": [1.00, 0.02, 0.00],
+        "alice_2": [0.99, 0.05, 0.00],
+        "alice_3": [0.97, 0.08, 0.00],
+        "alice_4": [0.96, 0.11, 0.00],
+        "bob_1": [0.15, 0.99, 0.00],
+        "bob_2": [0.18, 0.97, 0.00],
+        "bob_3": [0.22, 0.95, 0.00],
+        "bob_4": [0.25, 0.93, 0.00],
+        "query_a": [0.98, 0.06, 0.00],
+        "query_b": [0.97, 0.07, 0.00],
+    }
+
+    def analyze(self, frame: SampledFrame) -> list[DetectedFace]:
+        detected = super().analyze(frame)
+        embedding = self._EMBEDDINGS.get(Path(frame.source_path).stem.lower(), [1.0, 0.0, 0.0])
+        detected[0].embedding = list(embedding)
+        return detected
 
 
 class _FakeReportGenerator:
@@ -328,6 +362,282 @@ class InventoryPipelineTests(unittest.TestCase):
             self.assertTrue(result.report.tex_path.exists())
             self.assertTrue(result.report.docx_path.exists())
             self.assertTrue((result.inventory_result.run_directory / "inventory" / "face_search.json").exists())
+
+    def test_face_set_comparison_exports_matches_and_mesh_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            set_a_image = temp_root / "set_a.jpg"
+            set_b_image = temp_root / "set_b.jpg"
+            self._create_test_image(set_a_image)
+            self._create_test_image(set_b_image)
+
+            config = self._config()
+            service = InventoryService(
+                config=config,
+                scanner_service=ScannerService(config.media),
+                hashing_service=HashingService(),
+                media_service=VideoService(config.video),
+                clustering_service=ClusteringService(config.clustering),
+                report_generator=_FakeReportGenerator(),
+                face_analyzer_factory=_FakeAnalyzer,
+            )
+
+            result = service.compare_face_sets([set_a_image], [set_b_image], work_directory=temp_root / "trabalho")
+
+            self.assertEqual(1, result.summary.set_a_images)
+            self.assertEqual(1, result.summary.set_b_images)
+            self.assertEqual(1, result.summary.set_a_selected_faces)
+            self.assertEqual(1, result.summary.set_b_selected_faces)
+            self.assertEqual(1, result.summary.total_pair_comparisons)
+            self.assertEqual(1, result.summary.assignment_matches)
+            self.assertEqual(0, result.summary.candidate_matches)
+            self.assertEqual(1, len(result.matches))
+            self.assertEqual("assignment", result.matches[0].classification)
+            self.assertEqual(1.0, result.matches[0].similarity)
+            self.assertEqual(1.0, result.summary.q1_similarity)
+            self.assertEqual(1.0, result.summary.q3_similarity)
+            self.assertEqual(1.0, result.summary.mean_confidence_low)
+            self.assertEqual(1.0, result.summary.mean_confidence_high)
+            self.assertTrue(result.manifest_path.exists())
+            self.assertTrue((result.export_directory / "face_set_comparison_matches.csv").exists())
+            self.assertTrue((result.export_directory / "face_set_comparison_summary.txt").exists())
+            self.assertTrue((result.export_directory / "inputs" / "set_a" / "0001_set_a.jpg").exists())
+            self.assertTrue((result.export_directory / "inputs" / "set_b" / "0001_set_b.jpg").exists())
+            self.assertEqual(1, len(result.set_a_faces))
+            self.assertEqual(1, len(result.set_b_faces))
+            self.assertIsNotNone(result.set_a_faces[0].mesh_crop_path)
+            self.assertIsNotNone(result.set_a_faces[0].mesh_context_path)
+            self.assertTrue(result.set_a_faces[0].mesh_crop_path.exists())
+            self.assertTrue(result.set_a_faces[0].mesh_context_path.exists())
+            self.assertGreaterEqual(len(result.set_a_faces[0].biometric_landmarks), 5)
+
+    def test_face_set_comparison_can_calibrate_likelihood_ratio_with_labeled_base(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            set_a_image = temp_root / "query_a.jpg"
+            set_b_image = temp_root / "query_b.jpg"
+            self._create_test_image(set_a_image)
+            self._create_test_image(set_b_image)
+
+            calibration_root = temp_root / "calibracao"
+            for identity_label in ("alice", "bob"):
+                identity_root = calibration_root / identity_label
+                identity_root.mkdir(parents=True, exist_ok=True)
+                for index in range(1, 5):
+                    self._create_test_image(identity_root / f"{identity_label}_{index}.jpg")
+
+            config = self._config()
+            service = InventoryService(
+                config=config,
+                scanner_service=ScannerService(config.media),
+                hashing_service=HashingService(),
+                media_service=VideoService(config.video),
+                clustering_service=ClusteringService(config.clustering),
+                report_generator=_FakeReportGenerator(),
+                face_analyzer_factory=_CalibrationAwareAnalyzer,
+            )
+
+            result = service.compare_face_sets(
+                [set_a_image],
+                [set_b_image],
+                work_directory=temp_root / "trabalho",
+                calibration_root=calibration_root,
+            )
+
+            self.assertIsNotNone(result.calibration)
+            self.assertTrue(result.calibration.summary.support_ready)
+            self.assertTrue(result.summary.likelihood_ratio_calibrated)
+            self.assertEqual(1, result.summary.calibrated_matches)
+            self.assertIsNotNone(result.matches[0].likelihood_ratio)
+            self.assertIsNotNone(result.matches[0].log10_likelihood_ratio)
+            self.assertGreater(result.matches[0].log10_likelihood_ratio, 0.0)
+            self.assertIsNotNone(result.matches[0].evidence_label)
+            self.assertTrue((result.export_directory / "face_set_comparison_calibration_scores.csv").exists())
+            self.assertTrue((result.export_directory / "face_set_comparison_calibration_model.json").exists())
+
+    def test_face_set_comparison_can_reuse_saved_likelihood_ratio_model(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            set_a_image = temp_root / "query_a.jpg"
+            set_b_image = temp_root / "query_b.jpg"
+            self._create_test_image(set_a_image)
+            self._create_test_image(set_b_image)
+
+            calibration_root = temp_root / "calibracao"
+            for identity_label in ("alice", "bob"):
+                identity_root = calibration_root / identity_label
+                identity_root.mkdir(parents=True, exist_ok=True)
+                for index in range(1, 5):
+                    self._create_test_image(identity_root / f"{identity_label}_{index}.jpg")
+
+            config = self._config()
+            service = InventoryService(
+                config=config,
+                scanner_service=ScannerService(config.media),
+                hashing_service=HashingService(),
+                media_service=VideoService(config.video),
+                clustering_service=ClusteringService(config.clustering),
+                report_generator=_FakeReportGenerator(),
+                face_analyzer_factory=_CalibrationAwareAnalyzer,
+            )
+
+            calibrated_result = service.compare_face_sets(
+                [set_a_image],
+                [set_b_image],
+                work_directory=temp_root / "trabalho_base",
+                calibration_root=calibration_root,
+            )
+            model_path = calibrated_result.export_directory / "face_set_comparison_calibration_model.json"
+
+            reused_result = service.compare_face_sets(
+                [set_a_image],
+                [set_b_image],
+                work_directory=temp_root / "trabalho_reuso",
+                calibration_model_path=model_path,
+            )
+
+            self.assertTrue(model_path.exists())
+            self.assertIsNotNone(reused_result.calibration)
+            self.assertTrue(reused_result.calibration.loaded_from_model)
+            self.assertEqual(model_path.resolve(), reused_result.calibration.model_path)
+            self.assertEqual([], reused_result.calibration.inputs)
+            self.assertEqual([], reused_result.calibration.entries)
+            self.assertTrue(reused_result.calibration.summary.support_ready)
+            self.assertTrue(reused_result.summary.likelihood_ratio_calibrated)
+            self.assertAlmostEqual(
+                calibrated_result.matches[0].log10_likelihood_ratio,
+                reused_result.matches[0].log10_likelihood_ratio,
+                places=6,
+            )
+            self.assertFalse((reused_result.export_directory / "face_set_comparison_calibration_inputs.csv").exists())
+            self.assertFalse((reused_result.export_directory / "face_set_comparison_calibration_entries.csv").exists())
+            self.assertTrue((reused_result.export_directory / "face_set_comparison_calibration_model.json").exists())
+
+    def test_face_set_comparison_emits_phase_logs_for_calibration_and_matching(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            set_a_image = temp_root / "query_a.jpg"
+            set_b_image = temp_root / "query_b.jpg"
+            self._create_test_image(set_a_image)
+            self._create_test_image(set_b_image)
+
+            calibration_root = temp_root / "calibracao"
+            for identity_label in ("alice", "bob"):
+                identity_root = calibration_root / identity_label
+                identity_root.mkdir(parents=True, exist_ok=True)
+                for index in range(1, 5):
+                    self._create_test_image(identity_root / f"{identity_label}_{index}.jpg")
+
+            config = self._config()
+            service = InventoryService(
+                config=config,
+                scanner_service=ScannerService(config.media),
+                hashing_service=HashingService(),
+                media_service=VideoService(config.video),
+                clustering_service=ClusteringService(config.clustering),
+                report_generator=_FakeReportGenerator(),
+                face_analyzer_factory=_CalibrationAwareAnalyzer,
+            )
+            logs: list[str] = []
+            progress_messages: list[str] = []
+
+            service.compare_face_sets(
+                [set_a_image],
+                [set_b_image],
+                work_directory=temp_root / "trabalho",
+                calibration_root=calibration_root,
+                log_callback=logs.append,
+                progress_callback=lambda current, total, message: progress_messages.append(message),
+            )
+
+            self.assertTrue(any("[Comparacao] Similaridades |" in line for line in logs))
+            self.assertTrue(any("[Comparacao] Similaridades concluidas | pares=1 | ranking=1" in line for line in logs))
+            self.assertTrue(
+                any(
+                    "[Calibracao LR] Pares previstos | mesma_origem=12 | origem_distinta=16 | limite_amostra=20000"
+                    in line
+                    for line in logs
+                )
+            )
+            self.assertTrue(
+                any("[Calibracao LR] Mesma origem concluida | pares=12/12 | amostrados=12" in line for line in logs)
+            )
+            self.assertTrue(
+                any(
+                    "[Calibracao LR] Origem distinta concluida | pares=16/16 | amostrados=16" in line
+                    for line in logs
+                )
+            )
+            self.assertTrue(
+                any("[Calibracao LR] Aplicacao de LR concluida | pares_calibrados=1" in line for line in logs)
+            )
+            self.assertTrue(any("Calibracao LR: preparando pares estatisticos" in message for message in progress_messages))
+            self.assertTrue(any("Calibracao LR: ajustando densidades KDE" in message for message in progress_messages))
+
+    def test_face_set_comparison_uses_custom_likelihood_ratio_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            set_a_image = temp_root / "query_a.jpg"
+            set_b_image = temp_root / "query_b.jpg"
+            self._create_test_image(set_a_image)
+            self._create_test_image(set_b_image)
+
+            calibration_root = temp_root / "calibracao"
+            for identity_label in ("alice", "bob"):
+                identity_root = calibration_root / identity_label
+                identity_root.mkdir(parents=True, exist_ok=True)
+                for index in range(1, 5):
+                    self._create_test_image(identity_root / f"{identity_label}_{index}.jpg")
+
+            base_config = self._config()
+            config = AppConfig(
+                app=base_config.app,
+                media=base_config.media,
+                video=base_config.video,
+                face_model=base_config.face_model,
+                clustering=base_config.clustering,
+                reporting=base_config.reporting,
+                forensics=base_config.forensics,
+                tracking=base_config.tracking,
+                enhancement=base_config.enhancement,
+                search=base_config.search,
+                distributed=base_config.distributed,
+                likelihood_ratio=LikelihoodRatioSettings(
+                    max_scores_per_distribution=3,
+                    minimum_identities_with_faces=2,
+                    minimum_same_source_scores=3,
+                    minimum_different_source_scores=3,
+                    minimum_unique_scores_per_distribution=2,
+                    kde_bandwidth_scale=1.3,
+                    kde_uniform_floor_weight=0.01,
+                    kde_min_density=1e-9,
+                ),
+            )
+            service = InventoryService(
+                config=config,
+                scanner_service=ScannerService(config.media),
+                hashing_service=HashingService(),
+                media_service=VideoService(config.video),
+                clustering_service=ClusteringService(config.clustering),
+                report_generator=_FakeReportGenerator(),
+                face_analyzer_factory=_CalibrationAwareAnalyzer,
+            )
+
+            result = service.compare_face_sets(
+                [set_a_image],
+                [set_b_image],
+                work_directory=temp_root / "trabalho",
+                calibration_root=calibration_root,
+            )
+
+            self.assertIsNotNone(result.calibration)
+            self.assertEqual(3, result.calibration.summary.genuine_score_count)
+            self.assertEqual(3, result.calibration.summary.impostor_score_count)
+            self.assertIsNotNone(result.calibration.settings_snapshot)
+            self.assertEqual(1.3, result.calibration.settings_snapshot.kde_bandwidth_scale)
+            self.assertEqual(0.01, result.calibration.settings_snapshot.kde_uniform_floor_weight)
+            self.assertEqual(1e-9, result.calibration.settings_snapshot.kde_min_density)
+            self.assertIn("1.0000%", result.calibration.summary.smoothing_note or "")
 
     def test_pipeline_emits_detailed_and_accurate_video_logs(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

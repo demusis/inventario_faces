@@ -2,7 +2,8 @@ numpy>=1.26
 opencv-python>=4.10
 PySide6>=6.8
 PyYAML>=6.0
-onnxruntime>=1.22
+onnxruntime-gpu[cuda,cudnn]>=1.22; platform_system == "Windows"
+onnxruntime>=1.22; platform_system != "Windows"
 python-docx>=1.2
 Pillow>=10.0
 # InsightFace e mais estavel hoje em Python 3.11/3.12.

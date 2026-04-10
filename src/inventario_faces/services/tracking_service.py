@@ -374,6 +374,7 @@ class FaceTrackingService:
             crop_bgr=detection.crop_bgr,
             embedding=list(detection.embedding),
             landmarks=detection.landmarks,
+            biometric_landmarks=detection.biometric_landmarks,
             quality_metrics=quality_metrics,
             enhancement_metadata=detection.enhancement_metadata,
             embedding_source=detection.embedding_source,
@@ -538,6 +539,7 @@ class FaceTrackingService:
             enhancement_metadata=detection.enhancement_metadata,
             track_position=len(track.occurrence_ids) + 1,
             embedding_source=detection.embedding_source,
+            biometric_landmarks=detection.biometric_landmarks,
         )
 
     def _update_track_statistics(self, track: _TrackState, occurrence: FaceOccurrence) -> None:
@@ -621,6 +623,7 @@ class FaceTrackingService:
             context_image_path=context_path,
             embedding=list(occurrence.embedding),
             preview_path=crop_path,
+            biometric_landmarks=detection.biometric_landmarks,
         )
 
     def _significant_change_score(self, track: _TrackState, detection: DetectedFace) -> float:

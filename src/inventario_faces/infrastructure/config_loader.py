@@ -14,6 +14,7 @@ from inventario_faces.domain.config import (
     EnhancementSettings,
     FaceModelSettings,
     ForensicsSettings,
+    LikelihoodRatioSettings,
     MediaSettings,
     ReportingSettings,
     SearchSettings,
@@ -177,6 +178,32 @@ def load_app_config(config_path: Path | None = None) -> AppConfig:
                 ),
                 coarse_top_k=int(merged.get("search", {}).get("coarse_top_k", 8)),
                 refine_top_k=int(merged.get("search", {}).get("refine_top_k", 12)),
+            ),
+            likelihood_ratio=LikelihoodRatioSettings(
+                max_scores_per_distribution=int(
+                    merged.get("likelihood_ratio", {}).get("max_scores_per_distribution", 20000)
+                ),
+                minimum_identities_with_faces=int(
+                    merged.get("likelihood_ratio", {}).get("minimum_identities_with_faces", 2)
+                ),
+                minimum_same_source_scores=int(
+                    merged.get("likelihood_ratio", {}).get("minimum_same_source_scores", 5)
+                ),
+                minimum_different_source_scores=int(
+                    merged.get("likelihood_ratio", {}).get("minimum_different_source_scores", 5)
+                ),
+                minimum_unique_scores_per_distribution=int(
+                    merged.get("likelihood_ratio", {}).get("minimum_unique_scores_per_distribution", 2)
+                ),
+                kde_bandwidth_scale=float(
+                    merged.get("likelihood_ratio", {}).get("kde_bandwidth_scale", 1.0)
+                ),
+                kde_uniform_floor_weight=float(
+                    merged.get("likelihood_ratio", {}).get("kde_uniform_floor_weight", 0.001)
+                ),
+                kde_min_density=float(
+                    merged.get("likelihood_ratio", {}).get("kde_min_density", 1e-12)
+                ),
             ),
             distributed=DistributedSettings(
                 enabled=_coerce_bool(merged.get("distributed", {}).get("enabled", False), "distributed.enabled"),

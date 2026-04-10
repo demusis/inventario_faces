@@ -88,3 +88,47 @@ class DistributedHealthWorker(_BaseWorker):
                 log_callback=self.log_message.emit,
             )
         )
+
+
+class FaceSetComparisonWorker(QObject):
+    progress_changed = Signal(int, str)
+    log_message = Signal(str)
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        service: InventoryService,
+        set_a_paths: list[Path],
+        set_b_paths: list[Path],
+        work_directory: Path | None = None,
+        calibration_root: Path | None = None,
+        calibration_model_path: Path | None = None,
+    ) -> None:
+        super().__init__()
+        self._service = service
+        self._set_a_paths = list(set_a_paths)
+        self._set_b_paths = list(set_b_paths)
+        self._work_directory = work_directory
+        self._calibration_root = calibration_root
+        self._calibration_model_path = calibration_model_path
+
+    def _on_progress(self, current: int, total: int, message: str) -> None:
+        percent = 0 if total == 0 else int((current / total) * 100)
+        self.progress_changed.emit(percent, message)
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            result = self._service.compare_face_sets(
+                self._set_a_paths,
+                self._set_b_paths,
+                work_directory=self._work_directory,
+                calibration_root=self._calibration_root,
+                calibration_model_path=self._calibration_model_path,
+                progress_callback=self._on_progress,
+                log_callback=self.log_message.emit,
+            )
+            self.completed.emit(result)
+        except Exception as exc:
+            self.failed.emit(summarize_exception(exc))

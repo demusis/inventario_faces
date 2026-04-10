@@ -38,15 +38,14 @@ video:
 face_model:
   backend: "insightface"
   model_name: "buffalo_l"
-  # Padrao pericial: inferencia em CPU para favorecer estabilidade e reprodutibilidade entre estacoes.
+  # Padrao pericial: preferir aceleracao por GPU quando disponivel, com fallback automatico para CPU.
   det_size:
     - 800
     - 800
   minimum_face_quality: 0.68
   minimum_face_size_pixels: 48
-  ctx_id: -1
-  providers:
-    - "CPUExecutionProvider"
+  ctx_id: 0
+  providers: []
 
 clustering:
   # Padrao pericial: thresholds mais conservadores para reduzir fusoes indevidas.
@@ -86,6 +85,23 @@ search:
   prefer_faiss: true
   coarse_top_k: 12
   refine_top_k: 20
+
+likelihood_ratio:
+  # Quantidade maxima de scores amostrados em cada distribuicao da calibracao LR.
+  max_scores_per_distribution: 20000
+  # Numero minimo de identidades com faces validas para autorizar o ajuste.
+  minimum_identities_with_faces: 2
+  # Minimos de scores para ajustar as densidades de mesma origem e origem distinta.
+  minimum_same_source_scores: 5
+  minimum_different_source_scores: 5
+  # Quantidade minima de valores distintos em cada distribuicao para evitar KDE degenerada.
+  minimum_unique_scores_per_distribution: 2
+  # Fator multiplicativo da largura de banda Scott da gaussian_kde.
+  kde_bandwidth_scale: 1.0
+  # Peso do piso uniforme misturado a cada densidade para evitar zeros numericos.
+  kde_uniform_floor_weight: 0.001
+  # Densidade minima absoluta aceita apos a estabilizacao.
+  kde_min_density: 1.0e-12
 
 distributed:
   enabled: false

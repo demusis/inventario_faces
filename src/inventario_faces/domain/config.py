@@ -248,6 +248,37 @@ class SearchSettings:
 
 
 @dataclass(frozen=True)
+class LikelihoodRatioSettings:
+    """Parametros da calibracao LR baseada em KDE para comparacao entre conjuntos."""
+
+    max_scores_per_distribution: int = 20000
+    minimum_identities_with_faces: int = 2
+    minimum_same_source_scores: int = 5
+    minimum_different_source_scores: int = 5
+    minimum_unique_scores_per_distribution: int = 2
+    kde_bandwidth_scale: float = 1.0
+    kde_uniform_floor_weight: float = 0.001
+    kde_min_density: float = 1e-12
+
+    def __post_init__(self) -> None:
+        if self.max_scores_per_distribution <= 0:
+            raise ValueError("Maximo de scores por distribuicao deve ser maior que zero.")
+        if self.minimum_identities_with_faces < 2:
+            raise ValueError("Minimo de identidades com faces deve ser ao menos 2.")
+        if self.minimum_same_source_scores <= 0:
+            raise ValueError("Minimo de scores de mesma origem deve ser maior que zero.")
+        if self.minimum_different_source_scores <= 0:
+            raise ValueError("Minimo de scores de origem distinta deve ser maior que zero.")
+        if self.minimum_unique_scores_per_distribution < 2:
+            raise ValueError("Minimo de scores unicos por distribuicao deve ser ao menos 2.")
+        _validate_positive_number(self.kde_bandwidth_scale, "Escala de banda da KDE")
+        _validate_probability(self.kde_uniform_floor_weight, "Peso do piso uniforme da KDE")
+        if self.kde_uniform_floor_weight >= 1.0:
+            raise ValueError("Peso do piso uniforme da KDE deve ser menor que 1.0.")
+        _validate_positive_number(self.kde_min_density, "Densidade minima da KDE")
+
+
+@dataclass(frozen=True)
 class DistributedSettings:
     """Coordenacao de lotes compartilhados entre nos ou instancias."""
 
@@ -319,4 +350,5 @@ class AppConfig:
     tracking: TrackingSettings = field(default_factory=TrackingSettings)
     enhancement: EnhancementSettings = field(default_factory=EnhancementSettings)
     search: SearchSettings = field(default_factory=SearchSettings)
+    likelihood_ratio: LikelihoodRatioSettings = field(default_factory=LikelihoodRatioSettings)
     distributed: DistributedSettings = field(default_factory=DistributedSettings)

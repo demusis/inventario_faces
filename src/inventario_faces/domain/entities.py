@@ -6,6 +6,8 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
+from inventario_faces.domain.config import LikelihoodRatioSettings
+
 
 class MediaType(StrEnum):
     IMAGE = "image"
@@ -76,6 +78,7 @@ class DetectedFace:
     crop_bgr: Any
     embedding: list[float] = field(default_factory=list)
     landmarks: tuple[tuple[float, float], ...] = field(default_factory=tuple)
+    biometric_landmarks: tuple[tuple[float, float], ...] = field(default_factory=tuple)
     quality_metrics: FaceQualityMetrics | None = None
     enhancement_metadata: EnhancementMetadata | None = None
     embedding_source: str | None = None
@@ -129,6 +132,7 @@ class FaceOccurrence:
     is_keyframe: bool = False
     track_position: int | None = None
     embedding_source: str | None = None
+    biometric_landmarks: tuple[tuple[float, float], ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True)
@@ -146,6 +150,7 @@ class KeyFrame:
     context_image_path: Path | None = None
     embedding: list[float] = field(default_factory=list)
     preview_path: Path | None = None
+    biometric_landmarks: tuple[tuple[float, float], ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True)
@@ -306,3 +311,147 @@ class FaceSearchResult:
     summary: FaceSearchSummary
     report: ReportArtifacts
     export_path: Path | None = None
+
+
+@dataclass(frozen=True)
+class FaceSetComparisonInput:
+    set_label: str
+    source_path: Path
+    sha512: str
+    detected_faces: int
+    selected_faces: int
+    tracks: int
+    keyframes: int
+    identity_label: str | None = None
+    processing_error: str | None = None
+    export_source_copy: Path | None = None
+
+
+@dataclass(frozen=True)
+class FaceSetComparisonEntry:
+    entry_id: str
+    set_label: str
+    source_path: Path
+    sha512: str
+    track_id: str
+    occurrence_id: str
+    keyframe_id: str | None
+    bbox: BoundingBox
+    detection_score: float
+    quality_score: float | None
+    sharpness: float | None
+    brightness: float | None
+    illumination: float | None
+    frontality: float | None
+    embedding_dimension: int
+    embedding_source: str | None
+    crop_path: Path | None
+    context_image_path: Path | None
+    identity_label: str | None = None
+    embedding: list[float] = field(default_factory=list)
+    mesh_crop_path: Path | None = None
+    mesh_context_path: Path | None = None
+    selection_reasons: tuple[str, ...] = field(default_factory=tuple)
+    biometric_landmarks: tuple[tuple[float, float], ...] = field(default_factory=tuple)
+
+
+@dataclass(frozen=True)
+class FaceSetComparisonMatch:
+    rank: int
+    left_entry_id: str
+    right_entry_id: str
+    left_track_id: str
+    right_track_id: str
+    similarity: float
+    classification: str
+    left_quality_score: float | None = None
+    right_quality_score: float | None = None
+    likelihood_ratio: float | None = None
+    log10_likelihood_ratio: float | None = None
+    same_source_density: float | None = None
+    different_source_density: float | None = None
+    evidence_label: str | None = None
+
+
+@dataclass(frozen=True)
+class FaceSetComparisonCalibrationSummary:
+    dataset_root: Path
+    identity_count: int = 0
+    processed_identities: int = 0
+    input_images: int = 0
+    processed_images: int = 0
+    selected_faces: int = 0
+    identities_with_selected_faces: int = 0
+    genuine_pair_total: int = 0
+    impostor_pair_total: int = 0
+    genuine_score_count: int = 0
+    impostor_score_count: int = 0
+    support_ready: bool = False
+    support_note: str | None = None
+    score_min: float | None = None
+    score_max: float | None = None
+    density_method: str = "gaussian_kde"
+    smoothing_note: str | None = None
+
+
+@dataclass(frozen=True)
+class FaceSetComparisonCalibration:
+    summary: FaceSetComparisonCalibrationSummary
+    inputs: list[FaceSetComparisonInput] = field(default_factory=list)
+    entries: list[FaceSetComparisonEntry] = field(default_factory=list)
+    genuine_scores: list[float] = field(default_factory=list)
+    impostor_scores: list[float] = field(default_factory=list)
+    procedure_details: tuple[str, ...] = field(default_factory=tuple)
+    settings_snapshot: LikelihoodRatioSettings | None = None
+    model_path: Path | None = None
+    loaded_from_model: bool = False
+
+
+@dataclass(frozen=True)
+class FaceSetComparisonSummary:
+    set_a_images: int = 0
+    set_b_images: int = 0
+    set_a_detected_faces: int = 0
+    set_b_detected_faces: int = 0
+    set_a_selected_faces: int = 0
+    set_b_selected_faces: int = 0
+    set_a_images_without_faces: int = 0
+    set_b_images_without_faces: int = 0
+    total_pair_comparisons: int = 0
+    assignment_matches: int = 0
+    candidate_matches: int = 0
+    best_similarity: float | None = None
+    worst_similarity: float | None = None
+    mean_similarity: float | None = None
+    median_similarity: float | None = None
+    stddev_similarity: float | None = None
+    q1_similarity: float | None = None
+    q3_similarity: float | None = None
+    mean_confidence_low: float | None = None
+    mean_confidence_high: float | None = None
+    candidate_threshold: float = 0.0
+    assignment_threshold: float = 0.0
+    likelihood_ratio_calibrated: bool = False
+    calibrated_matches: int = 0
+    mean_log10_likelihood_ratio: float | None = None
+    median_log10_likelihood_ratio: float | None = None
+    min_log10_likelihood_ratio: float | None = None
+    max_log10_likelihood_ratio: float | None = None
+
+
+@dataclass(frozen=True)
+class FaceSetComparisonResult:
+    run_directory: Path
+    started_at_utc: datetime
+    finished_at_utc: datetime
+    logs_directory: Path
+    export_directory: Path
+    manifest_path: Path
+    set_a_inputs: list[FaceSetComparisonInput] = field(default_factory=list)
+    set_b_inputs: list[FaceSetComparisonInput] = field(default_factory=list)
+    set_a_faces: list[FaceSetComparisonEntry] = field(default_factory=list)
+    set_b_faces: list[FaceSetComparisonEntry] = field(default_factory=list)
+    matches: list[FaceSetComparisonMatch] = field(default_factory=list)
+    summary: FaceSetComparisonSummary = field(default_factory=FaceSetComparisonSummary)
+    calibration: FaceSetComparisonCalibration | None = None
+    procedure_details: tuple[str, ...] = field(default_factory=tuple)

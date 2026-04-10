@@ -1,4 +1,5 @@
 # -*- mode: python ; coding: utf-8 -*-
+import importlib.util
 from pathlib import Path
 
 import yaml
@@ -29,6 +30,19 @@ def _collect_tree(source_root: Path, target_root: str) -> list[tuple[str, str]]:
     return collected
 
 
+def _package_roots(package_name: str) -> list[Path]:
+    spec = importlib.util.find_spec(package_name)
+    if spec is None:
+        return []
+
+    roots: list[Path] = []
+    if spec.submodule_search_locations:
+        roots.extend(Path(location).resolve() for location in spec.submodule_search_locations)
+    elif spec.origin:
+        roots.append(Path(spec.origin).resolve().parent)
+    return roots
+
+
 defaults_path = project_root / "config" / "defaults.yaml"
 default_model_name = "buffalo_l"
 try:
@@ -49,6 +63,8 @@ datas = [
     (str(project_root / "models" / "README.txt"), "models"),
 ]
 datas += _collect_tree(project_root / "models" / default_model_name, f"models/{default_model_name}")
+for package_root in _package_roots("nvidia"):
+    datas += _collect_tree(package_root, "nvidia")
 
 a = Analysis(
     [str(project_root / "src" / "inventario_faces" / "__main__.py")],

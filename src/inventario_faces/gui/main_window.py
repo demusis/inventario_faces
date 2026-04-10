@@ -26,6 +26,7 @@ from inventario_faces.app import load_default_runtime_config, persist_runtime_co
 from inventario_faces.domain.config import AppConfig
 from inventario_faces.gui.config_dialog import ConfigDialog
 from inventario_faces.gui.distributed_monitor_dialog import DistributedMonitorDialog
+from inventario_faces.gui.face_set_comparison_dialog import FaceSetComparisonDialog
 from inventario_faces.gui.worker import FaceSearchWorker, InventoryWorker
 from inventario_faces.services.inventory_service import InventoryService
 
@@ -44,6 +45,7 @@ class MainWindow(QMainWindow):
         self._thread: QThread | None = None
         self._worker: InventoryWorker | FaceSearchWorker | None = None
         self._monitor_dialog: DistributedMonitorDialog | None = None
+        self._comparison_dialog: FaceSetComparisonDialog | None = None
         self._close_requested = False
         self._build_ui()
 
@@ -75,6 +77,8 @@ class MainWindow(QMainWindow):
         self._run_button.clicked.connect(self._start_processing)
         self._face_search_button = QPushButton("Busca por face")
         self._face_search_button.clicked.connect(self._start_face_search)
+        self._face_set_comparison_button = QPushButton("Comparar conjuntos")
+        self._face_set_comparison_button.clicked.connect(self._open_face_set_comparison_dialog)
         self._distributed_health_button = QPushButton("Monitor")
         self._distributed_health_button.clicked.connect(self._inspect_distributed_health)
         self._open_report_button = QPushButton("Abrir Relatório")
@@ -83,6 +87,7 @@ class MainWindow(QMainWindow):
         controls_layout.addWidget(self._config_button)
         controls_layout.addWidget(self._run_button)
         controls_layout.addWidget(self._face_search_button)
+        controls_layout.addWidget(self._face_set_comparison_button)
         controls_layout.addWidget(self._distributed_health_button)
         controls_layout.addWidget(self._open_report_button)
         controls_layout.addStretch(1)
@@ -241,6 +246,32 @@ class MainWindow(QMainWindow):
         self._monitor_dialog.raise_()
         self._monitor_dialog.activateWindow()
 
+    def _open_face_set_comparison_dialog(self) -> None:
+        initial_directory: Path | None = None
+        folder = self._folder_input.text().strip()
+        if folder:
+            candidate = Path(folder)
+            if candidate.exists():
+                initial_directory = candidate
+
+        if self._comparison_dialog is not None:
+            self._comparison_dialog.show()
+            self._comparison_dialog.raise_()
+            self._comparison_dialog.activateWindow()
+            return
+
+        self._comparison_dialog = FaceSetComparisonDialog(
+            service_factory=lambda: self._service_factory(self._current_config),
+            config=self._current_config,
+            initial_input_directory=initial_directory,
+            initial_work_directory=self._last_work_directory or initial_directory,
+            parent=self,
+        )
+        self._comparison_dialog.destroyed.connect(self._clear_comparison_dialog)
+        self._comparison_dialog.show()
+        self._comparison_dialog.raise_()
+        self._comparison_dialog.activateWindow()
+
     def _prepare_execution_logs(self, *messages: str) -> None:
         self._set_running_state(True)
         self._current_report_path = None
@@ -338,9 +369,16 @@ class MainWindow(QMainWindow):
             self._close_requested = False
             self.close()
 
+    def _clear_comparison_dialog(self, *_args: object) -> None:
+        self._comparison_dialog = None
+        if self._close_requested and not self._is_task_running():
+            self._close_requested = False
+            self.close()
+
     def _set_running_state(self, running: bool) -> None:
         self._run_button.setEnabled(not running)
         self._face_search_button.setEnabled(not running)
+        self._face_set_comparison_button.setEnabled(not running)
         self._distributed_health_button.setEnabled(True)
         self._config_button.setEnabled(not running)
         self._folder_input.setEnabled(not running)
@@ -364,6 +402,12 @@ class MainWindow(QMainWindow):
         if self._monitor_dialog is not None and not self._monitor_dialog.request_close():
             self._close_requested = True
             self._append_log("Aguardando encerramento do monitor antes de fechar o aplicativo.")
+            event.ignore()
+            return
+
+        if self._comparison_dialog is not None and not self._comparison_dialog.request_close():
+            self._close_requested = True
+            self._append_log("Aguardando encerramento da comparacao antes de fechar o aplicativo.")
             event.ignore()
             return
 
