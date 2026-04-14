@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import csv
 import json
+import statistics
 from pathlib import Path
+
+from scipy.stats import mannwhitneyu
 
 from inventario_faces.domain.entities import (
     FaceCluster,
@@ -18,6 +21,7 @@ from inventario_faces.domain.entities import (
     KeyFrame,
     SearchArtifacts,
 )
+from inventario_faces.utils.density_utils import score_density_method_label
 from inventario_faces.utils.path_utils import ensure_directory
 from inventario_faces.utils.serialization import to_serializable
 
@@ -42,6 +46,94 @@ class ExportService:
         if distribution == "different_source":
             return "padrao_questionado_origem_distinta"
         return distribution
+
+    def _format_p_value(self, value: float | None) -> str:
+        if value is None:
+            return "-"
+        if value < 1e-4:
+            return f"{value:.2e}"
+        return f"{value:.6f}"
+
+    def _quality_group_mann_whitney_summary(
+        self,
+        result: FaceSetComparisonResult,
+        *,
+        alpha: float = 0.05,
+    ) -> list[str]:
+        def _fmt(value: float | None) -> str:
+            return "-" if value is None else f"{value:.4f}"
+
+        left_values = [
+            float(entry.quality_score)
+            for entry in result.set_a_faces
+            if entry.quality_score is not None
+        ]
+        right_values = [
+            float(entry.quality_score)
+            for entry in result.set_b_faces
+            if entry.quality_score is not None
+        ]
+        if len(left_values) < 2 or len(right_values) < 2:
+            return [
+                "Teste nao parametrico entre grupos:",
+                (
+                    "Teste U de Mann-Whitney indisponivel: sao necessarias ao menos 2 observacoes "
+                    "validas de qualidade facial em cada grupo."
+                ),
+            ]
+
+        try:
+            test_result = mannwhitneyu(left_values, right_values, alternative="two-sided", method="auto")
+        except TypeError:
+            test_result = mannwhitneyu(left_values, right_values, alternative="two-sided")
+        except ValueError as exc:
+            return [
+                "Teste nao parametrico entre grupos:",
+                f"Teste U de Mann-Whitney indisponivel: {exc}",
+            ]
+
+        pair_count = len(left_values) * len(right_values)
+        u_statistic = float(test_result.statistic)
+        p_value = float(test_result.pvalue)
+        common_language_effect = (u_statistic / pair_count) if pair_count > 0 else None
+        rank_biserial = (
+            (2.0 * common_language_effect) - 1.0
+            if common_language_effect is not None
+            else None
+        )
+
+        direction = "sem tendencia direcional relevante entre os grupos"
+        if rank_biserial is not None:
+            if rank_biserial > 0.05:
+                direction = "Padrao tende a apresentar qualidade facial maior"
+            elif rank_biserial < -0.05:
+                direction = "Questionado tende a apresentar qualidade facial maior"
+
+        significance_label = (
+            f"diferenca estatisticamente significativa ao nivel de {alpha * 100.0:.2f}%"
+            if p_value <= alpha
+            else f"diferenca nao significativa ao nivel de {alpha * 100.0:.2f}%"
+        )
+        return [
+            "Teste nao parametrico entre grupos:",
+            (
+                "U de Mann-Whitney bilateral sobre qualidade facial das faces selecionadas "
+                f"(alpha de referencia: {alpha * 100.0:.2f}%)."
+            ),
+            f"n: Padrao {len(left_values)} | Questionado {len(right_values)}",
+            (
+                f"Medianas: Padrao {_fmt(float(statistics.median(left_values)))} | "
+                f"Questionado {_fmt(float(statistics.median(right_values)))}"
+            ),
+            f"U: {_fmt(u_statistic)}",
+            f"p-valor bilateral: {self._format_p_value(p_value)}",
+            f"Correlacao bisserial de postos: {_fmt(rank_biserial)}",
+            (
+                "Probabilidade de superioridade comum "
+                f"(Padrao > Questionado): {_fmt(common_language_effect)}"
+            ),
+            f"Interpretacao: {significance_label}; {direction}.",
+        ]
 
     @property
     def inventory_directory(self) -> Path:
@@ -469,6 +561,7 @@ class ExportService:
         summary = result.summary
         def _fmt(value: float | None) -> str:
             return "-" if value is None else f"{value:.4f}"
+        group_test_lines = self._quality_group_mann_whitney_summary(result)
 
         lines = [
             "Inventario Faces - Comparacao entre conjuntos",
@@ -501,6 +594,8 @@ class ExportService:
             f"IC95% da media - limite superior: {_fmt(summary.mean_confidence_high)}",
             f"Limiar candidato: {summary.candidate_threshold:.4f}",
             f"Limiar atribuicao: {summary.assignment_threshold:.4f}",
+            "",
+            *group_test_lines,
         ]
         if summary.likelihood_ratio_calibrated:
             lines.extend(
@@ -533,7 +628,7 @@ class ExportService:
                         "Scores Padrão/Questionado, origem distinta, utilizados/possiveis: "
                         f"{calibration_summary.impostor_score_count}/{calibration_summary.impostor_pair_total}"
                     ),
-                    f"Metodo de densidade: {calibration_summary.density_method}",
+                    f"Metodo de densidade: {score_density_method_label(calibration_summary.density_method)} ({calibration_summary.density_method})",
                     f"Ajuste pronto: {'sim' if calibration_summary.support_ready else 'nao'}",
                 ]
             )
@@ -562,7 +657,8 @@ class ExportService:
                             f"min_distintos={settings.minimum_unique_scores_per_distribution}"
                         ),
                         (
-                            "Parametros KDE: "
+                            "Parametros do estimador: "
+                            f"metodo={score_density_method_label(settings.density_estimator)} | "
                             f"banda_x={settings.kde_bandwidth_scale:.3f} | "
                             f"piso_uniforme={settings.kde_uniform_floor_weight:.4%} | "
                             f"densidade_minima={settings.kde_min_density:.1e}"

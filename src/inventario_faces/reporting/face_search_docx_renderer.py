@@ -8,7 +8,13 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.shared import Inches, Pt
 
 from inventario_faces.domain.config import AppConfig
-from inventario_faces.domain.entities import FaceSearchMatch, FaceSearchResult, ReportArtifacts
+from inventario_faces.domain.entities import (
+    FaceSearchMatch,
+    FaceSearchQuery,
+    FaceSearchQueryEvent,
+    FaceSearchResult,
+    ReportArtifacts,
+)
 from inventario_faces.reporting.report_support import (
     face_search_methodology_items,
     software_reference_abnt_text,
@@ -41,19 +47,50 @@ class FaceSearchDocxReportGenerator:
 
         self._add_report_header(
             document,
-            f"{self._config.app.report_title} - Busca por Face",
+            f"{self._config.app.report_title} - Busca por Faces",
             result.inventory_result.finished_at_utc,
         )
 
         self._add_heading(document, "Resumo Executivo", 1)
-        self._add_paragraph(
-            document,
-            (
-                f"A consulta utilizou o arquivo {result.query.source_path} e retornou "
-                f"{result.summary.compatible_tracks} track(s) compatíveis, distribuídos em "
+        queries = self._queries(result)
+        if not queries:
+            summary_text = (
+                f"A busca facial recebeu {result.summary.query_image_count} arquivo(s) de consulta. "
+                "Nenhum deles gerou face de referência utilizável para a etapa de busca vetorial. "
+                "Todos os eventos das consultas, inclusive erros de leitura, corrupção e descartes por critérios técnicos, "
+                "foram individualizados na seção de arquivos de consulta informados. "
+            )
+            search_outcome = (
+                f"O diretório {result.inventory_result.root_directory} foi processado, mas a busca vetorial "
+                "não foi executada por ausência de referência facial válida."
+            )
+        elif len(queries) == 1 and result.summary.query_image_count == 1:
+            summary_text = (
+                f"A consulta utilizou o arquivo {queries[0].source_path}. "
+                f"Foram detectadas {result.summary.query_faces_detected} face(s) elegíveis na imagem de consulta "
+                f"e a face selecionada automaticamente para a pesquisa corresponde ao track {queries[0].selected_track_id}. "
+            )
+            search_outcome = (
+                f"A varredura retornou {result.summary.compatible_tracks} track(s) compatíveis, distribuídos em "
                 f"{result.summary.compatible_clusters} grupo(s), com limiar probabilístico de "
                 f"{result.summary.compatibility_threshold:.2f}."
-            ),
+            )
+        else:
+            summary_text = (
+                f"A busca facial recebeu {result.summary.query_image_count} arquivo(s) de consulta. "
+                f"{result.summary.query_faces_selected} arquivo(s) geraram face(s) de referência utilizável(is), com "
+                f"{result.summary.query_faces_detected} face(s) elegíveis detectadas nas consultas válidas. "
+                f"{result.summary.query_images_rejected} arquivo(s) foram descartados, permanecendo individualizados "
+                "com o motivo do descarte na seção de arquivos de consulta informados. "
+            )
+            search_outcome = (
+                f"A varredura retornou {result.summary.compatible_tracks} track(s) compatíveis, distribuídos em "
+                f"{result.summary.compatible_clusters} grupo(s), com limiar probabilístico de "
+                f"{result.summary.compatibility_threshold:.2f}."
+            )
+        self._add_paragraph(
+            document,
+            f"{summary_text}{search_outcome}",
         )
         self._add_notice(
             document,
@@ -62,10 +99,13 @@ class FaceSearchDocxReportGenerator:
         )
 
         self._add_heading(document, "Metodologia da Busca", 1)
-        for item in face_search_methodology_items(result.query.selected_track_id):
+        for item in face_search_methodology_items(
+            result.summary.query_image_count,
+            [query.selected_track_id for query in queries],
+        ):
             self._add_list_item(document, item)
 
-        self._add_heading(document, "Face Consultada", 1)
+        self._add_heading(document, "Arquivos de Consulta Informados", 1)
         self._add_query_table(document, result)
 
         self._add_heading(document, "Resultados Compatíveis", 1)
@@ -97,36 +137,56 @@ class FaceSearchDocxReportGenerator:
         meta_run.font.size = Pt(10)
 
     def _add_query_table(self, document: Document, result: FaceSearchResult) -> None:
-        table = document.add_table(rows=1, cols=3)
+        table = document.add_table(rows=1, cols=5)
         table.style = "Table Grid"
         table.alignment = WD_TABLE_ALIGNMENT.CENTER
-        self._set_cell_text(table.rows[0].cells[0], "Recorte da consulta", alignment=WD_ALIGN_PARAGRAPH.CENTER, bold=True)
-        self._set_cell_text(table.rows[0].cells[1], "Quadro de origem da consulta", alignment=WD_ALIGN_PARAGRAPH.CENTER, bold=True)
-        self._set_cell_text(table.rows[0].cells[2], "Metadados da consulta", alignment=WD_ALIGN_PARAGRAPH.CENTER, bold=True)
+        self._set_cell_text(table.rows[0].cells[0], "Consulta", alignment=WD_ALIGN_PARAGRAPH.CENTER, bold=True)
+        self._set_cell_text(table.rows[0].cells[1], "Situação", alignment=WD_ALIGN_PARAGRAPH.CENTER, bold=True)
+        self._set_cell_text(table.rows[0].cells[2], "Recorte da consulta", alignment=WD_ALIGN_PARAGRAPH.CENTER, bold=True)
+        self._set_cell_text(table.rows[0].cells[3], "Quadro de origem da consulta", alignment=WD_ALIGN_PARAGRAPH.CENTER, bold=True)
+        self._set_cell_text(table.rows[0].cells[4], "Metadados da consulta", alignment=WD_ALIGN_PARAGRAPH.CENTER, bold=True)
 
-        row = table.add_row().cells
-        self._add_cell_image(row[0], result.query.crop_path, width=Inches(1.5))
-        self._add_cell_image(row[1], result.query.context_image_path, width=Inches(2.5))
-        quality = "-" if result.query.quality_score is None else f"{result.query.quality_score:.3f}"
-        self._set_cell_text(
-            row[2],
-            "\n".join(
-                [
-                    f"Arquivo consultado: {result.query.source_path}",
-                    f"SHA-512: {result.query.sha512}",
-                    f"Faces elegíveis detectadas: {result.query.detected_face_count}",
-                    f"Track selecionado: {result.query.selected_track_id}",
-                    f"Ocorrência selecionada: {result.query.selected_occurrence_id}",
-                    f"Keyframe de referência: {result.query.selected_keyframe_id or '-'}",
-                    f"Qualidade da face consultada: {quality}",
-                ]
-            ),
-        )
+        for event in self._query_events(result):
+            row = table.add_row().cells
+            self._set_cell_text(row[0], str(event.query_index), alignment=WD_ALIGN_PARAGRAPH.CENTER)
+            self._set_cell_text(
+                row[1],
+                "Selecionada" if event.status == "selected" else "Descartada",
+                alignment=WD_ALIGN_PARAGRAPH.CENTER,
+            )
+            self._add_cell_image(row[2], event.crop_path, width=Inches(1.35))
+            self._add_cell_image(row[3], event.context_image_path, width=Inches(2.1))
+            quality = "-" if event.quality_score is None else f"{event.quality_score:.3f}"
+            detected_faces = "-" if event.detected_face_count is None else str(event.detected_face_count)
+            self._set_cell_text(
+                row[4],
+                "\n".join(
+                    [
+                        f"Arquivo consultado: {event.source_path}",
+                        f"SHA-512: {event.sha512 or '-'}",
+                        f"Situação da consulta: {'Selecionada' if event.status == 'selected' else 'Descartada'}",
+                        f"Faces elegíveis detectadas: {detected_faces}",
+                        f"Track selecionado: {event.selected_track_id or '-'}",
+                        f"Ocorrência selecionada: {event.selected_occurrence_id or '-'}",
+                        f"Keyframe de referência: {event.selected_keyframe_id or '-'}",
+                        f"Qualidade da face consultada: {quality}",
+                        (
+                            f"Evento reportado: {event.error_type} - {event.error_message}"
+                            if event.error_message is not None and event.error_type is not None
+                            else (
+                                f"Evento reportado: {event.error_message}"
+                                if event.error_message is not None
+                                else "Evento reportado: processamento concluído sem erro."
+                            )
+                        ),
+                    ]
+                ),
+            )
         document.add_paragraph()
 
     def _add_matches_table(self, document: Document, matches: list[FaceSearchMatch]) -> None:
         if not matches:
-            self._add_paragraph(document, "Nenhum track compatível superou o limiar probabilístico configurado para a consulta.")
+            self._add_paragraph(document, "Nenhum track compatível superou o limiar probabilístico configurado para as consultas.")
             return
 
         table = document.add_table(rows=1, cols=6)
@@ -153,6 +213,9 @@ class FaceSearchDocxReportGenerator:
         occurrence_score = "-" if match.occurrence_score is None else f"{match.occurrence_score:.3f}"
         cluster_score = "-" if match.cluster_score is None else f"{match.cluster_score:.3f}"
         return [
+            f"Consulta que sustentou o score: {match.query_source_path}" if match.query_source_path is not None else "Consulta que sustentou o score: -",
+            f"Track da consulta: {match.query_selected_track_id or '-'}",
+            f"Ocorrência da consulta: {match.query_selected_occurrence_id or '-'}",
             f"Origem: {match.source_path.name}",
             f"Ocorrência: {match.occurrence_id or '-'}",
             f"Instante da ocorrência: {format_seconds(match.timestamp_seconds)}",
@@ -161,6 +224,31 @@ class FaceSearchDocxReportGenerator:
             f"Similaridade do grupo: {cluster_score}",
             f"Similaridade do track: {match.track_score:.3f}",
             f"Similaridade da ocorrência: {occurrence_score}",
+        ]
+
+    def _queries(self, result: FaceSearchResult) -> list[FaceSearchQuery]:
+        if result.queries:
+            return list(result.queries)
+        return [result.query] if result.query is not None else []
+
+    def _query_events(self, result: FaceSearchResult) -> list[FaceSearchQueryEvent]:
+        if result.query_events:
+            return list(result.query_events)
+        return [
+            FaceSearchQueryEvent(
+                query_index=query.query_index,
+                source_path=query.source_path,
+                status="selected",
+                sha512=query.sha512,
+                detected_face_count=query.detected_face_count,
+                selected_track_id=query.selected_track_id,
+                selected_occurrence_id=query.selected_occurrence_id,
+                selected_keyframe_id=query.selected_keyframe_id,
+                crop_path=query.crop_path,
+                context_image_path=query.context_image_path,
+                quality_score=query.quality_score,
+            )
+            for query in self._queries(result)
         ]
 
     def _add_heading(self, document: Document, text: str, level: int) -> None:

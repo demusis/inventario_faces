@@ -16,6 +16,9 @@ Issues e atualizações: [https://github.com/demusis/inventario_faces/issues](ht
 - representa cada track por embedding médio normalizado;
 - agrupa possíveis indivíduos por track, não por frame isolado;
 - cria índice vetorial para busca coarse-to-fine;
+- executa `Busca por faces` com uma ou mais imagens de consulta, preservando no relatório também as consultas rejeitadas;
+- compara conjuntos `Padrão` e `Questionado`, com ranking par-a-par, malha biométrica e revisão visual;
+- calibra scores por razão de verossimilhança (LR) a partir de base rotulada ou de modelo JSON já salvo;
 - gera inventário estruturado, logs e relatório técnico em `.tex`, `.pdf` e `.docx`.
 
 ## Avisos críticos
@@ -45,7 +48,7 @@ O pipeline foi reorganizado em módulos coesos:
 
 ## Saídas geradas
 
-Cada execução cria uma pasta `inventario_faces_output/run_YYYYMMDD_HHMMSS/` com:
+Cada execução cria uma pasta própria sob `inventario_faces_output/`. No inventário principal, o formato típico é `run_YYYYMMDD_HHMMSS/`, com:
 
 - `inventory/files.csv`
 - `inventory/occurrences.csv`
@@ -63,6 +66,11 @@ Cada execução cria uma pasta `inventario_faces_output/run_YYYYMMDD_HHMMSS/` co
 - `report/relatorio_forense.pdf`
 - `report/relatorio_forense.docx`
 
+Operações especializadas geram subpastas próprias dentro da execução:
+
+- `search/`: artefatos estruturados da `Busca por faces`, incluindo relatório, eventos das consultas e compatibilidades encontradas;
+- `comparison/`: artefatos da `Comparação entre grupos faciais`, incluindo ranking de pares, resumo estatístico, JSON da comparação e arquivos da calibração LR.
+
 ## Configuração externa
 
 Os parâmetros ficam em `config/defaults.yaml` e podem ser sobrescritos por configuração persistente do usuário. A interface agora expõe os grupos técnicos do pipeline, e os metadados de mídia são extraídos internamente pelo próprio aplicativo.
@@ -71,9 +79,10 @@ Os valores padrão atuais foram endurecidos para um uso pericial mais conservado
 
 - amostragem temporal mais densa em vídeo;
 - ausência de teto padrão de quadros amostrados por vídeo;
-- inferência facial em CPU, com foco em estabilidade e reprodutibilidade entre estações;
+- seleção automática de provider, com preferência por GPU quando disponível e fallback para CPU;
 - thresholds mais conservadores para tracking e clustering;
 - busca vetorial com maior cobertura de candidatos;
+- calibração LR com estimador de densidade não paramétrico limitado ao suporte do score;
 - nota institucional explícita sobre a natureza probabilística dos resultados.
 
 - `video`: taxa de amostragem, teto de quadros, intervalo de keyframe e limiar de mudança significativa.
@@ -82,6 +91,7 @@ Os valores padrão atuais foram endurecidos para um uso pericial mais conservado
 - `clustering`: limiares de atribuição/sugestão e mínimos de grupo e de track.
 - `enhancement`: pré-processamento, brilho-gatilho, CLAHE, gamma e denoise.
 - `search`: habilitação da indexação, preferência por FAISS, coarse search e refine search.
+- `likelihood_ratio`: amostragem máxima, mínimos de suporte, estimador de densidade e parâmetros de suavização da LR.
 - `distributed`: modo compartilhado, identificador do lote, heartbeat do nó, timeout de lock órfão, auto-finalização, validação de integridade dos parciais e recuperação automática de itens ausentes/corrompidos.
 - `app`: nome institucional, pasta derivada de saída, nível de log e uso opcional de cópia temporária local da mídia antes da leitura.
 - `reporting`: compilação do PDF, densidade das seções e nota de cadeia de custódia.
@@ -117,6 +127,8 @@ pip install -r requirements.txt
 pip install -e .
 ```
 
+No Windows, `requirements.txt` já instala `onnxruntime-gpu[cuda,cudnn]`. O aplicativo tenta usar GPU automaticamente quando houver provider compatível e faz fallback para CPU quando necessário.
+
 Para análise facial real:
 
 ```powershell
@@ -128,6 +140,8 @@ Opcionalmente, para busca vetorial com FAISS:
 ```powershell
 pip install "faiss-cpu>=1.8"
 ```
+
+Importante: execute `python -m inventario_faces` com o mesmo interpretador em que o pacote foi instalado. Na prática, isso normalmente significa ativar a `.venv` do projeto antes de abrir o aplicativo.
 
 ## Execução
 
@@ -141,8 +155,34 @@ Fluxo esperado na interface:
 
 1. selecionar a pasta de entrada;
 2. revisar os parâmetros em `Configurações`;
-3. clicar em `Criar inventário`;
-4. abrir o relatório e a pasta da execução ao final.
+3. escolher entre `Criar inventário`, `Busca por faces` ou `Comparar conjuntos`;
+4. abrir o relatório ou a pasta da execução ao final.
+
+## Busca por faces
+
+Na janela principal, `Busca por faces` aceita uma ou mais imagens de consulta.
+
+- cada consulta passa pelo mesmo pipeline de detecção, filtros e embeddings do inventário;
+- quando uma consulta é válida, o sistema seleciona uma face de referência para aquela imagem;
+- a pesquisa vetorial é executada por consulta e depois consolidada pelo maior score por entidade;
+- consultas inválidas, corrompidas ou sem face elegível continuam aparecendo no relatório para fins de cadeia de custódia.
+
+## Comparação entre grupos faciais e LR
+
+A ação `Comparar conjuntos` foi desenhada para confrontar um grupo `Padrão` contra um grupo `Questionado`.
+
+- o sistema compara todas as faces elegíveis do Padrão contra todas as faces elegíveis do Questionado;
+- o resumo estatístico descreve o conjunto inteiro de pares, não apenas o primeiro item do ranking;
+- a janela de LR pode usar uma base rotulada com uma subpasta por identidade ou um modelo LR já salvo em JSON;
+- quando a calibração é calculada na execução, o modelo é salvo automaticamente para reaproveitamento posterior.
+
+Em execuções desse tipo, a pasta `comparison/` passa a incluir artefatos como:
+
+- `face_set_comparison.json`
+- `face_set_comparison_matches.csv`
+- `face_set_comparison_summary.txt`
+- `face_set_comparison_calibration_scores.csv`
+- `face_set_comparison_calibration_model.json`
 
 ## Processamento em múltiplos PCs/instâncias
 
@@ -162,7 +202,7 @@ Em ambiente Windows, prefira caminho UNC ou outro mapeamento idêntico em todas 
 
 ## Diretório de trabalho
 
-Ao iniciar `Criar inventário` ou `Busca por face`, a interface solicita um diretório de trabalho separado da pasta de evidências. Esse diretório recebe logs, relatórios, arquivos de monitoramento e inventários derivados.
+Ao iniciar `Criar inventário`, `Busca por faces` ou `Comparar conjuntos`, a interface solicita um diretório de trabalho separado da pasta de evidências. Esse diretório recebe logs, relatórios, arquivos de monitoramento e artefatos derivados.
 
 Quando a opção de cópia temporária local está ativada, cada imagem ou vídeo é copiado temporariamente para o disco local da estação antes da decodificação. O hash SHA-512 continua sendo calculado a partir do arquivo original.
 
@@ -190,7 +230,9 @@ A suíte cobre:
 - clustering consistente;
 - reprodutibilidade;
 - persistência de configuração;
-- geração de relatório.
+- geração de relatório;
+- busca por múltiplas faces;
+- comparação entre conjuntos com calibração LR.
 
 ## Requisitos
 

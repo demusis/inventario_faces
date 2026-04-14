@@ -5,13 +5,13 @@ import importlib.util
 import os
 from pathlib import Path
 import shutil
+import site
 import sys
+import sysconfig
 from typing import Any
 from urllib.request import urlopen
 import warnings
 import zipfile
-
-import onnxruntime as ort
 
 from inventario_faces.domain.config import FaceModelSettings
 from inventario_faces.domain.entities import BoundingBox, DetectedFace, SampledFrame
@@ -29,26 +29,58 @@ GPU_EXECUTION_PROVIDERS = (
     "DmlExecutionProvider",
 )
 _WINDOWS_DLL_DIRECTORY_HANDLES: list[Any] = []
+_ORT_MODULE: Any | None = None
 
 
 class FaceAnalyzerInitializationError(RuntimeError):
     """Erro ao inicializar o backend facial."""
 
 
-def _register_runtime_dll_directories() -> None:
-    candidate_directories: list[Path] = []
-    root_candidates = [
+def _runtime_search_roots() -> list[Path]:
+    executable_path = Path(sys.executable).resolve()
+    candidates: list[Path | None] = [
         Path(getattr(sys, "_MEIPASS", "")).resolve() if getattr(sys, "_MEIPASS", None) else None,
-        Path(sys.executable).resolve().parent,
+        executable_path.parent,
+        executable_path.parent.parent,
+        Path(sys.prefix).resolve() if getattr(sys, "prefix", None) else None,
+        Path(sys.base_prefix).resolve() if getattr(sys, "base_prefix", None) else None,
         Path(__file__).resolve().parents[3],
     ]
-    seen_roots: set[Path] = set()
-    for root in root_candidates:
-        if root is None or not root.exists():
+
+    try:
+        candidates.extend(Path(path).resolve() for path in site.getsitepackages())
+    except Exception:
+        pass
+    try:
+        user_site = site.getusersitepackages()
+    except Exception:
+        user_site = None
+    if user_site:
+        candidates.append(Path(user_site).resolve())
+    try:
+        sysconfig_paths = sysconfig.get_paths()
+    except Exception:
+        sysconfig_paths = {}
+    for key in ("purelib", "platlib"):
+        raw_path = sysconfig_paths.get(key)
+        if raw_path:
+            candidates.append(Path(raw_path).resolve())
+
+    resolved: list[Path] = []
+    seen: set[Path] = set()
+    for candidate in candidates:
+        if candidate is None or not candidate.exists():
             continue
-        if root in seen_roots:
+        if candidate in seen:
             continue
-        seen_roots.add(root)
+        seen.add(candidate)
+        resolved.append(candidate)
+    return resolved
+
+
+def _collect_runtime_dll_directories(search_roots: list[Path] | None = None) -> list[Path]:
+    candidate_directories: list[Path] = []
+    for root in search_roots or _runtime_search_roots():
         capi_directory = root / "onnxruntime" / "capi"
         if capi_directory.exists():
             candidate_directories.append(capi_directory)
@@ -56,9 +88,20 @@ def _register_runtime_dll_directories() -> None:
         if nvidia_root.exists():
             candidate_directories.extend(path for path in nvidia_root.rglob("bin") if path.is_dir())
 
+    resolved: list[Path] = []
+    seen: set[Path] = set()
+    for directory in candidate_directories:
+        if directory in seen:
+            continue
+        seen.add(directory)
+        resolved.append(directory)
+    return resolved
+
+
+def _register_runtime_dll_directories() -> None:
     seen_directories: set[Path] = set()
     path_entries = os.environ.get("PATH", "").split(os.pathsep) if os.environ.get("PATH") else []
-    for directory in candidate_directories:
+    for directory in _collect_runtime_dll_directories():
         if directory in seen_directories:
             continue
         seen_directories.add(directory)
@@ -78,8 +121,19 @@ def _register_runtime_dll_directories() -> None:
         os.environ["PATH"] = os.pathsep.join(path_entries)
 
 
-def _try_preload_onnxruntime_gpu_dlls() -> None:
+def _get_onnxruntime_module() -> Any:
+    global _ORT_MODULE
+    if _ORT_MODULE is not None:
+        return _ORT_MODULE
     _register_runtime_dll_directories()
+    import onnxruntime as ort
+
+    _ORT_MODULE = ort
+    return ort
+
+
+def _try_preload_onnxruntime_gpu_dlls() -> None:
+    ort = _get_onnxruntime_module()
     preload = getattr(ort, "preload_dlls", None)
     if preload is None:
         return
@@ -304,6 +358,7 @@ class InsightFaceAnalyzer:
         )
 
     def _available_execution_providers(self) -> list[str]:
+        ort = _get_onnxruntime_module()
         return list(dict.fromkeys(str(provider) for provider in ort.get_available_providers()))
 
     def _resolve_providers(self, available_providers: list[str]) -> list[str]:

@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QToolButton,
     QVBoxLayout,
     QWidget,
+    QStyle,
 )
 
 from inventario_faces.domain.config import (
@@ -41,18 +42,20 @@ from inventario_faces.domain.config import (
     TrackingSettings,
     VideoSettings,
 )
-
-INSIGHTFACE_URL = "https://github.com/deepinsight/insightface"
-ARCFACE_URL = (
-    "https://openaccess.thecvf.com/content_CVPR_2019/html/"
-    "Deng_ArcFace_Additive_Angular_Margin_Loss_for_Deep_Face_Recognition_CVPR_2019_paper.html"
+from inventario_faces.gui.config_help import (
+    ARCFACE_URL,
+    FAISS_URL,
+    INSIGHTFACE_URL,
+    ONNXRUNTIME_EP_URL,
+    OPENCV_VIDEOCAPTURE_URL,
+    SCRFD_URL,
+    build_config_help_html,
 )
-SCRFD_URL = "https://arxiv.org/abs/2105.04714"
-ONNXRUNTIME_EP_URL = "https://onnxruntime.ai/docs/execution-providers/"
-OPENCV_VIDEOCAPTURE_URL = "https://docs.opencv.org/4.x/d8/dfe/classcv_1_1VideoCapture.html"
-MEDIAINFO_URL = "https://mediaarea.net/en/MediaInfo"
-FAISS_URL = "https://github.com/facebookresearch/faiss"
-ABNT_ACCESS_DATE = "Acesso em: 4 abr. 2026."
+from inventario_faces.gui.icon_utils import apply_standard_icon
+from inventario_faces.utils.density_utils import (
+    DEFAULT_SCORE_DENSITY_METHOD,
+    SCORE_DENSITY_METHOD_CHOICES,
+)
 
 
 class ConfigDialog(QDialog):
@@ -135,14 +138,18 @@ class ConfigDialog(QDialog):
         cancel_button = button_box.button(QDialogButtonBox.Cancel)
         if apply_button is not None:
             apply_button.setText("Aplicar")
+            apply_standard_icon(self, apply_button, QStyle.SP_DialogApplyButton)
         if cancel_button is not None:
             cancel_button.setText("Cancelar")
+            apply_standard_icon(self, cancel_button, QStyle.SP_DialogCancelButton)
 
         restore_loaded_button = QPushButton("Restaurar valores carregados", self)
+        apply_standard_icon(self, restore_loaded_button, QStyle.SP_DialogResetButton)
         restore_loaded_button.clicked.connect(self._restore_selected_config)
         button_box.addButton(restore_loaded_button, QDialogButtonBox.ResetRole)
 
         restore_default_button = QPushButton("Restaurar valores padrão", self)
+        apply_standard_icon(self, restore_default_button, QStyle.SP_DialogResetButton)
         restore_default_button.clicked.connect(self._restore_default_config)
         button_box.addButton(restore_default_button, QDialogButtonBox.ResetRole)
         button_box.accepted.connect(self._accept_configuration)
@@ -366,7 +373,7 @@ class ConfigDialog(QDialog):
         form.addRow("Tamanho de detecção:", self._with_help(det_size_widget, "Tamanho de detecção", self._help_html(
             definition="Resolução operacional usada pelo detector facial antes da inferência, sem alterar o arquivo original.",
             operational_effect="Valores maiores tendem a ajudar em faces pequenas, mas aumentam tempo e memória.",
-            recommendation="O padrão pericial usa 800x800 em CPU para privilegiar estabilidade com melhor sensibilidade a faces menores. Aumente apenas se houver necessidade comprovada.",
+            recommendation="O padrão pericial usa 800x800 com seleção automática de provider, preferindo GPU quando disponível e caindo para CPU em fallback. Aumente apenas se houver necessidade comprovada.",
             caveat="Ao manter a resolução original, o detector usa a própria geometria do quadro analisado.",
             references=[("SCRFD", SCRFD_URL)],
         )))
@@ -540,6 +547,9 @@ class ConfigDialog(QDialog):
         self._lr_min_different_scores_spin.setRange(1, 1_000_000)
         self._lr_min_unique_scores_spin = QSpinBox(tab)
         self._lr_min_unique_scores_spin.setRange(2, 10_000)
+        self._lr_density_method_combo = QComboBox(tab)
+        for method, label in SCORE_DENSITY_METHOD_CHOICES:
+            self._lr_density_method_combo.addItem(label, method)
         self._lr_bandwidth_scale_spin = self._double_spin_box(0.05, 20.0, 3, 0.05)
         self._lr_uniform_floor_spin = self._double_spin_box(0.0, 0.5, 5, 0.0005)
         self._lr_min_density_input = QLineEdit(tab)
@@ -606,12 +616,33 @@ class ConfigDialog(QDialog):
             ),
         )
         form.addRow(
-            "Escala da banda KDE:",
+            "Estimador de densidade:",
+            self._with_help(
+                self._lr_density_method_combo,
+                "Estimador de densidade",
+                self._help_html(
+                    definition=(
+                        "Procedimento nao parametrico usado para ajustar as densidades H1/H2. "
+                        "A opcao limitada por logito respeita melhor o suporte teorico da similaridade em [-1, 1]."
+                    ),
+                    operational_effect=(
+                        "A opcao recomendada reduz vies de borda e tende a produzir curvas mais robustas "
+                        "quando a distribuicao real nao segue formas aproximadamente gaussianas."
+                    ),
+                    recommendation=(
+                        "Use KDE limitada por logito como padrao. Deixe a KDE gaussiana direta apenas "
+                        "para reproduzir modelos e estudos legados."
+                    ),
+                ),
+            ),
+        )
+        form.addRow(
+            "Escala da banda:",
             self._with_help(
                 self._lr_bandwidth_scale_spin,
-                "Escala da banda KDE",
+                "Escala da banda",
                 self._help_html(
-                    definition="Fator multiplicativo aplicado à largura de banda Scott da gaussian_kde.",
+                    definition="Fator multiplicativo aplicado à largura de banda Scott do estimador de densidade.",
                     operational_effect="Valores maiores suavizam mais as curvas; valores menores tornam a densidade mais sensível a picos e irregularidades.",
                     recommendation="Comece em 1,0. Suba quando a curva ficar serrilhada demais; desça apenas em estudos controlados e com base grande.",
                 ),
@@ -782,6 +813,10 @@ class ConfigDialog(QDialog):
         self._lr_min_same_scores_spin.setValue(config.likelihood_ratio.minimum_same_source_scores)
         self._lr_min_different_scores_spin.setValue(config.likelihood_ratio.minimum_different_source_scores)
         self._lr_min_unique_scores_spin.setValue(config.likelihood_ratio.minimum_unique_scores_per_distribution)
+        density_method_index = self._lr_density_method_combo.findData(config.likelihood_ratio.density_estimator)
+        self._lr_density_method_combo.setCurrentIndex(
+            density_method_index if density_method_index >= 0 else 0
+        )
         self._lr_bandwidth_scale_spin.setValue(config.likelihood_ratio.kde_bandwidth_scale)
         self._lr_uniform_floor_spin.setValue(config.likelihood_ratio.kde_uniform_floor_weight)
         self._lr_min_density_input.setText(f"{config.likelihood_ratio.kde_min_density:.12g}")
@@ -910,6 +945,9 @@ class ConfigDialog(QDialog):
                 minimum_same_source_scores=int(self._lr_min_same_scores_spin.value()),
                 minimum_different_source_scores=int(self._lr_min_different_scores_spin.value()),
                 minimum_unique_scores_per_distribution=int(self._lr_min_unique_scores_spin.value()),
+                density_estimator=str(
+                    self._lr_density_method_combo.currentData() or DEFAULT_SCORE_DENSITY_METHOD
+                ),
                 kde_bandwidth_scale=float(self._lr_bandwidth_scale_spin.value()),
                 kde_uniform_floor_weight=float(self._lr_uniform_floor_spin.value()),
                 kde_min_density=float(lr_min_density_text),
@@ -933,8 +971,10 @@ class ConfigDialog(QDialog):
         layout.addWidget(widget)
 
         help_button = QToolButton(container)
-        help_button.setText("?")
+        apply_standard_icon(self, help_button, QStyle.SP_DialogHelpButton)
+        help_button.setText("")
         help_button.setToolTip("Ajuda técnica")
+        help_button.setAutoRaise(True)
         help_button.setFocusPolicy(Qt.NoFocus)
         help_button.clicked.connect(lambda _checked=False, t=title, b=body: self._show_help(t, b))
         layout.addWidget(help_button)
@@ -946,6 +986,7 @@ class ConfigDialog(QDialog):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(line_edit)
         browse_button = QPushButton("Selecionar...", container)
+        apply_standard_icon(self, browse_button, QStyle.SP_DirOpenIcon)
         browse_button.clicked.connect(lambda _checked=False, target=line_edit, dialog_caption=caption: self._select_directory(target, dialog_caption))
         layout.addWidget(browse_button)
         return container
@@ -969,55 +1010,12 @@ class ConfigDialog(QDialog):
         caveat: str | None = None,
         references: list[tuple[str, str]] | None = None,
     ) -> str:
-        reference_items = references or []
-        references_html = "".join(f"<li>{self._abnt_reference_html(label, url)}</li>" for label, url in reference_items)
-        caveat_html = f"<p><b>Observação.</b> {caveat}</p>" if caveat else ""
-        references_block = f"<p><b>Referências.</b></p><ul>{references_html}</ul>" if reference_items else ""
-        return (
-            "<div style='font-family: Segoe UI, sans-serif; font-size: 10pt;'>"
-            f"<p><b>Definição.</b> {definition}</p>"
-            f"<p><b>Efeito operacional.</b> {operational_effect}</p>"
-            f"<p><b>Recomendação técnica.</b> {recommendation}</p>"
-            f"{caveat_html}"
-            f"{references_block}"
-            "</div>"
-        )
-
-    def _abnt_reference_html(self, label: str, url: str) -> str:
-        entries = {
-            INSIGHTFACE_URL: (
-                "INSIGHTFACE. <i>InsightFace: an open source 2D and 3D deep face analysis library</i>. "
-                f"Disponível em: &lt;<a href='{url}'>{url}</a>&gt;. {ABNT_ACCESS_DATE}"
-            ),
-            ARCFACE_URL: (
-                "DENG, Jiankang et al. <i>ArcFace: additive angular margin loss for deep face recognition</i>. "
-                "In: IEEE/CVF Conference on Computer Vision and Pattern Recognition, 2019. "
-                f"Disponível em: &lt;<a href='{url}'>{url}</a>&gt;. {ABNT_ACCESS_DATE}"
-            ),
-            SCRFD_URL: (
-                "GUO, Jia et al. <i>Sample and computation redistribution for efficient face detection</i>. "
-                f"arXiv, 2021. Disponível em: &lt;<a href='{url}'>{url}</a>&gt;. {ABNT_ACCESS_DATE}"
-            ),
-            ONNXRUNTIME_EP_URL: (
-                "MICROSOFT. <i>ONNX Runtime: execution providers</i>. "
-                f"Disponível em: &lt;<a href='{url}'>{url}</a>&gt;. {ABNT_ACCESS_DATE}"
-            ),
-            OPENCV_VIDEOCAPTURE_URL: (
-                "OPENCV. <i>OpenCV 4.x documentation: VideoCapture class reference</i>. "
-                f"Disponível em: &lt;<a href='{url}'>{url}</a>&gt;. {ABNT_ACCESS_DATE}"
-            ),
-            MEDIAINFO_URL: (
-                "MEDIAAREA. <i>MediaInfo</i>. "
-                f"Disponível em: &lt;<a href='{url}'>{url}</a>&gt;. {ABNT_ACCESS_DATE}"
-            ),
-            FAISS_URL: (
-                "META AI. <i>FAISS</i>. "
-                f"Disponível em: &lt;<a href='{url}'>{url}</a>&gt;. {ABNT_ACCESS_DATE}"
-            ),
-        }
-        return entries.get(
-            url,
-            f"{label}. Disponível em: &lt;<a href='{url}'>{url}</a>&gt;. {ABNT_ACCESS_DATE}",
+        return build_config_help_html(
+            definition=definition,
+            operational_effect=operational_effect,
+            recommendation=recommendation,
+            caveat=caveat,
+            references=references,
         )
 
     def _double_spin_box(self, minimum: float, maximum: float, decimals: int, step: float, suffix: str = "") -> QDoubleSpinBox:

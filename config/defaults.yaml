@@ -96,6 +96,8 @@ likelihood_ratio:
   minimum_different_source_scores: 5
   # Quantidade minima de valores distintos em cada distribuicao para evitar KDE degenerada.
   minimum_unique_scores_per_distribution: 2
+  # Estimador de densidade nao parametrico usado no LR: bounded_logit_kde ou gaussian_kde.
+  density_estimator: bounded_logit_kde
   # Fator multiplicativo da largura de banda Scott da gaussian_kde.
   kde_bandwidth_scale: 1.0
   # Peso do piso uniforme misturado a cada densidade para evitar zeros numericos.

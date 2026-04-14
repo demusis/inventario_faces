@@ -1,14 +1,20 @@
 from __future__ import annotations
 
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
 from tests._bootstrap import PROJECT_ROOT  # noqa: F401
 from inventario_faces.domain.config import FaceModelSettings
 from inventario_faces.domain.entities import BoundingBox, DetectedFace, SampledFrame
-from inventario_faces.infrastructure.face_analyzer_insight import InsightFaceAnalyzer
+from inventario_faces.infrastructure.face_analyzer_insight import (
+    InsightFaceAnalyzer,
+    _collect_runtime_dll_directories,
+    _runtime_search_roots,
+)
 
 
 class _RecognizerStub:
@@ -94,6 +100,58 @@ class InsightFaceAdapterTests(unittest.TestCase):
 
         self.assertEqual(6, len(points))
         self.assertEqual((10.0, 12.0), points[0])
+
+    def test_collect_runtime_dll_directories_finds_onnxruntime_and_nvidia_bins(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ort_capi = root / "onnxruntime" / "capi"
+            nvrtc_bin = root / "nvidia" / "cuda_nvrtc" / "bin"
+            cudnn_bin = root / "nvidia" / "cudnn" / "bin"
+            ort_capi.mkdir(parents=True, exist_ok=True)
+            nvrtc_bin.mkdir(parents=True, exist_ok=True)
+            cudnn_bin.mkdir(parents=True, exist_ok=True)
+
+            directories = _collect_runtime_dll_directories([root])
+
+            self.assertEqual(
+                [ort_capi, nvrtc_bin, cudnn_bin],
+                directories,
+            )
+
+    def test_runtime_search_roots_include_site_package_locations(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            python_executable = temp_root / "Scripts" / "python.exe"
+            python_executable.parent.mkdir(parents=True, exist_ok=True)
+            python_executable.write_text("", encoding="utf-8")
+            prefix_root = temp_root / "venv"
+            prefix_root.mkdir(parents=True, exist_ok=True)
+            site_packages = temp_root / "venv" / "Lib" / "site-packages"
+            site_packages.mkdir(parents=True, exist_ok=True)
+            user_site = temp_root / "usersite"
+            user_site.mkdir(parents=True, exist_ok=True)
+
+            with (
+                mock.patch("inventario_faces.infrastructure.face_analyzer_insight.sys.executable", str(python_executable)),
+                mock.patch("inventario_faces.infrastructure.face_analyzer_insight.sys.prefix", str(prefix_root)),
+                mock.patch("inventario_faces.infrastructure.face_analyzer_insight.sys.base_prefix", str(prefix_root)),
+                mock.patch(
+                    "inventario_faces.infrastructure.face_analyzer_insight.site.getsitepackages",
+                    return_value=[str(site_packages)],
+                ),
+                mock.patch(
+                    "inventario_faces.infrastructure.face_analyzer_insight.site.getusersitepackages",
+                    return_value=str(user_site),
+                ),
+                mock.patch(
+                    "inventario_faces.infrastructure.face_analyzer_insight.sysconfig.get_paths",
+                    return_value={"purelib": str(site_packages), "platlib": str(site_packages)},
+                ),
+            ):
+                roots = _runtime_search_roots()
+
+            self.assertIn(site_packages.resolve(), roots)
+            self.assertIn(user_site.resolve(), roots)
 
 
 if __name__ == "__main__":

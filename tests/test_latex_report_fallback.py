@@ -58,6 +58,13 @@ class LatexReportFallbackTests(unittest.TestCase):
             warning_path = root / "report" / "relatorio_forense_pdf_erro.txt"
             self.assertTrue(warning_path.exists())
             self.assertIn("pdflatex nao encontrado no PATH.", warning_path.read_text(encoding="utf-8"))
+            tex_content = artifacts.tex_path.read_text(encoding="utf-8")
+            self.assertIn("Arquivo de origem:", tex_content)
+            self.assertIn("Intervalo temporal do track: 00:00:10.000 - 00:00:10.000", tex_content)
+            self.assertIn("Faixa de quadros do track:", tex_content)
+            self.assertIn("Quadro de refer", tex_content)
+            self.assertIn("000010", tex_content)
+            self.assertIn("Motivos da sele", tex_content)
 
     def _config(self) -> AppConfig:
         return AppConfig(

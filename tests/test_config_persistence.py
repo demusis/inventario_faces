@@ -100,6 +100,7 @@ class ConfigPersistenceTests(unittest.TestCase):
                 minimum_same_source_scores=7,
                 minimum_different_source_scores=9,
                 minimum_unique_scores_per_distribution=4,
+                density_estimator="gaussian_kde",
                 kde_bandwidth_scale=1.25,
                 kde_uniform_floor_weight=0.0025,
                 kde_min_density=1e-10,
@@ -158,6 +159,7 @@ class ConfigPersistenceTests(unittest.TestCase):
             config.likelihood_ratio.minimum_unique_scores_per_distribution,
             loaded.likelihood_ratio.minimum_unique_scores_per_distribution,
         )
+        self.assertEqual(config.likelihood_ratio.density_estimator, loaded.likelihood_ratio.density_estimator)
         self.assertEqual(config.likelihood_ratio.kde_bandwidth_scale, loaded.likelihood_ratio.kde_bandwidth_scale)
         self.assertEqual(
             config.likelihood_ratio.kde_uniform_floor_weight,
@@ -343,6 +345,7 @@ forensics:
         self.assertEqual(5, loaded.likelihood_ratio.minimum_same_source_scores)
         self.assertEqual(5, loaded.likelihood_ratio.minimum_different_source_scores)
         self.assertEqual(2, loaded.likelihood_ratio.minimum_unique_scores_per_distribution)
+        self.assertEqual("bounded_logit_kde", loaded.likelihood_ratio.density_estimator)
         self.assertEqual(1.0, loaded.likelihood_ratio.kde_bandwidth_scale)
         self.assertEqual(0.001, loaded.likelihood_ratio.kde_uniform_floor_weight)
         self.assertEqual(1e-12, loaded.likelihood_ratio.kde_min_density)

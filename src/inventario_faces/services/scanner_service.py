@@ -21,7 +21,10 @@ class ScannerService:
         return MediaType.OTHER
 
     def iter_scan(self, root_directory: Path, excluded_directories: set[Path] | None = None):
-        root_directory = root_directory.resolve()
+        # Preserve the caller's path spelling during os.walk so reports and tests
+        # keep the same visible path form on Windows (for example, avoiding
+        # unwanted expansion between short and long path representations).
+        root_directory = Path(os.path.abspath(root_directory))
         excluded = {path.resolve() for path in (excluded_directories or set())}
         for current_root, directory_names, file_names in os.walk(root_directory, topdown=True):
             current_path = Path(current_root)

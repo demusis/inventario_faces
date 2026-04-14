@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QStyle,
     QVBoxLayout,
     QWidget,
 )
@@ -27,6 +28,7 @@ from inventario_faces.domain.config import AppConfig
 from inventario_faces.gui.config_dialog import ConfigDialog
 from inventario_faces.gui.distributed_monitor_dialog import DistributedMonitorDialog
 from inventario_faces.gui.face_set_comparison_dialog import FaceSetComparisonDialog
+from inventario_faces.gui.icon_utils import apply_standard_icon
 from inventario_faces.gui.worker import FaceSearchWorker, InventoryWorker
 from inventario_faces.services.inventory_service import InventoryService
 
@@ -64,24 +66,32 @@ class MainWindow(QMainWindow):
         self._folder_input = QLineEdit()
         self._folder_input.setPlaceholderText("Selecione o diretório raiz da evidência")
         self._browse_button = QPushButton("Selecionar Pasta")
+        apply_standard_icon(self, self._browse_button, QStyle.SP_DirOpenIcon)
         self._browse_button.clicked.connect(self._select_folder)
         selector_layout.addWidget(self._folder_input)
         selector_layout.addWidget(self._browse_button)
 
         controls_layout = QHBoxLayout()
         self._config_button = QPushButton("Configurações")
+        apply_standard_icon(self, self._config_button, QStyle.SP_FileDialogDetailedView)
         self._config_button.clicked.connect(self._open_configuration_dialog)
         self._about_button = QPushButton("Sobre")
+        apply_standard_icon(self, self._about_button, QStyle.SP_MessageBoxInformation)
         self._about_button.clicked.connect(self._show_about_dialog)
         self._run_button = QPushButton("Criar inventário")
+        apply_standard_icon(self, self._run_button, QStyle.SP_MediaPlay)
         self._run_button.clicked.connect(self._start_processing)
-        self._face_search_button = QPushButton("Busca por face")
+        self._face_search_button = QPushButton("Busca por faces")
+        apply_standard_icon(self, self._face_search_button, QStyle.SP_FileDialogContentsView)
         self._face_search_button.clicked.connect(self._start_face_search)
         self._face_set_comparison_button = QPushButton("Comparar conjuntos")
+        apply_standard_icon(self, self._face_set_comparison_button, QStyle.SP_FileDialogInfoView)
         self._face_set_comparison_button.clicked.connect(self._open_face_set_comparison_dialog)
         self._distributed_health_button = QPushButton("Monitor")
+        apply_standard_icon(self, self._distributed_health_button, QStyle.SP_ComputerIcon)
         self._distributed_health_button.clicked.connect(self._inspect_distributed_health)
         self._open_report_button = QPushButton("Abrir Relatório")
+        apply_standard_icon(self, self._open_report_button, QStyle.SP_DialogOpenButton)
         self._open_report_button.setEnabled(False)
         self._open_report_button.clicked.connect(self._open_report)
         controls_layout.addWidget(self._config_button)
@@ -134,25 +144,18 @@ class MainWindow(QMainWindow):
             self._append_log(f"Configurações persistidas em: {saved_path}")
 
     def _start_processing(self) -> None:
-        folder = self._folder_input.text().strip()
-        if not folder:
-            QMessageBox.warning(self, "Diretório obrigatório", "Selecione uma pasta de entrada.")
+        root_directory = self._require_root_directory()
+        if root_directory is None:
             return
 
-        root_directory = Path(folder)
-        if not root_directory.exists():
-            QMessageBox.warning(self, "Diretório inválido", "A pasta selecionada não existe.")
-            return
-
-        work_directory = self._select_work_directory(
+        work_directory = self._choose_work_directory(
             caption="Selecionar diretorio de trabalho",
-            initial_directory=self._last_work_directory or root_directory,
+            root_directory=root_directory,
         )
         if work_directory is None:
             return
 
         service = self._service_factory(self._current_config)
-        self._last_work_directory = work_directory
         self._prepare_execution_logs(
             f"Iniciando processamento de {root_directory}...",
             f"Diretorio de trabalho: {work_directory}",
@@ -160,52 +163,49 @@ class MainWindow(QMainWindow):
         self._start_worker(InventoryWorker(service, root_directory, work_directory))
 
     def _start_face_search(self) -> None:
-        folder = self._folder_input.text().strip()
-        if not folder:
-            QMessageBox.warning(self, "Diretório obrigatório", "Selecione uma pasta de entrada.")
+        root_directory = self._require_root_directory()
+        if root_directory is None:
             return
 
-        root_directory = Path(folder)
-        if not root_directory.exists():
-            QMessageBox.warning(self, "Diretório inválido", "A pasta selecionada não existe.")
-            return
-
-        selected_path, _ = QFileDialog.getOpenFileName(
+        selected_paths, _ = QFileDialog.getOpenFileNames(
             self,
-            "Selecionar imagem para busca por face",
+            "Selecionar imagens para busca por faces",
             str(root_directory),
             self._image_file_filter(),
         )
-        if not selected_path:
+        if not selected_paths:
             return
 
-        query_image_path = Path(selected_path)
-        if not query_image_path.exists():
-            QMessageBox.warning(self, "Arquivo inválido", "A imagem de consulta selecionada não existe.")
+        query_image_paths = [Path(selected_path) for selected_path in selected_paths]
+        invalid_paths = [path for path in query_image_paths if not path.exists()]
+        if invalid_paths:
+            QMessageBox.warning(
+                self,
+                "Arquivo inválido",
+                "Uma ou mais imagens de consulta selecionadas não existem mais no disco.",
+            )
             return
 
-        work_directory = self._select_work_directory(
+        work_directory = self._choose_work_directory(
             caption="Selecionar diretorio de trabalho",
-            initial_directory=self._last_work_directory or root_directory,
+            root_directory=root_directory,
         )
         if work_directory is None:
             return
 
         service = self._service_factory(self._current_config)
-        self._last_work_directory = work_directory
         self._prepare_execution_logs(
-            f"Iniciando busca por face em {root_directory}...",
-            f"Imagem de consulta: {query_image_path}",
+            f"Iniciando busca por faces em {root_directory}...",
+            f"Imagens de consulta: {len(query_image_paths)}",
+            *[
+                f"Consulta {index}: {query_path}"
+                for index, query_path in enumerate(query_image_paths, start=1)
+            ],
             f"Diretorio de trabalho: {work_directory}",
         )
-        self._start_worker(FaceSearchWorker(service, root_directory, query_image_path, work_directory))
+        self._start_worker(FaceSearchWorker(service, root_directory, query_image_paths, work_directory))
 
     def _inspect_distributed_health(self) -> None:
-        folder = self._folder_input.text().strip()
-        if not folder:
-            QMessageBox.warning(self, "Diretório obrigatório", "Selecione uma pasta de entrada.")
-            return
-
         if not self._current_config.distributed.enabled:
             QMessageBox.warning(
                 self,
@@ -214,19 +214,17 @@ class MainWindow(QMainWindow):
             )
             return
 
-        root_directory = Path(folder)
-        if not root_directory.exists():
-            QMessageBox.warning(self, "Diretório inválido", "A pasta selecionada não existe.")
+        root_directory = self._require_root_directory()
+        if root_directory is None:
             return
 
-        work_directory = self._select_work_directory(
+        work_directory = self._choose_work_directory(
             caption="Selecionar diretorio onde o processamento esta sendo gravado",
-            initial_directory=self._last_work_directory or root_directory,
+            root_directory=root_directory,
         )
         if work_directory is None:
             return
 
-        self._last_work_directory = work_directory
         self._append_log(f"Abrindo monitor distribuído em {root_directory}...")
         self._append_log(f"Diretório de trabalho: {work_directory}")
 
@@ -286,6 +284,27 @@ class MainWindow(QMainWindow):
         if not selected:
             return None
         return Path(selected)
+
+    def _require_root_directory(self) -> Path | None:
+        folder = self._folder_input.text().strip()
+        if not folder:
+            QMessageBox.warning(self, "Diretório obrigatório", "Selecione uma pasta de entrada.")
+            return None
+
+        root_directory = Path(folder)
+        if not root_directory.exists():
+            QMessageBox.warning(self, "Diretório inválido", "A pasta selecionada não existe.")
+            return None
+        return root_directory
+
+    def _choose_work_directory(self, *, caption: str, root_directory: Path) -> Path | None:
+        work_directory = self._select_work_directory(
+            caption=caption,
+            initial_directory=self._last_work_directory or root_directory,
+        )
+        if work_directory is not None:
+            self._last_work_directory = work_directory
+        return work_directory
 
     def _start_worker(self, worker: InventoryWorker | FaceSearchWorker) -> None:
         self._thread = QThread(self)

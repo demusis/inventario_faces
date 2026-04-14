@@ -195,6 +195,9 @@ def load_app_config(config_path: Path | None = None) -> AppConfig:
                 minimum_unique_scores_per_distribution=int(
                     merged.get("likelihood_ratio", {}).get("minimum_unique_scores_per_distribution", 2)
                 ),
+                density_estimator=str(
+                    merged.get("likelihood_ratio", {}).get("density_estimator", "bounded_logit_kde")
+                ),
                 kde_bandwidth_scale=float(
                     merged.get("likelihood_ratio", {}).get("kde_bandwidth_scale", 1.0)
                 ),

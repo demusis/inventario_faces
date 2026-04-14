@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QProgressBar,
     QSpinBox,
+    QStyle,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -28,6 +29,7 @@ from inventario_faces.infrastructure.distributed_coordination import (
     DistributedNodeStatus,
     DistributedPartialValidation,
 )
+from inventario_faces.gui.icon_utils import apply_standard_icon
 from inventario_faces.services.inventory_service import DistributedHealthResult, InventoryService
 from inventario_faces.utils.time_utils import format_local_datetime
 
@@ -115,19 +117,23 @@ class DistributedMonitorDialog(QDialog):
         controls_layout.addWidget(self._interval_spin)
 
         self._refresh_button = QPushButton("Atualizar agora")
+        apply_standard_icon(self, self._refresh_button, QStyle.SP_BrowserReload)
         self._refresh_button.clicked.connect(self.request_refresh)
         controls_layout.addWidget(self._refresh_button)
 
         self._pause_button = QPushButton("Pausar")
+        apply_standard_icon(self, self._pause_button, QStyle.SP_MediaPause)
         self._pause_button.clicked.connect(self._toggle_timer)
         controls_layout.addWidget(self._pause_button)
 
         self._open_text_button = QPushButton("Abrir TXT")
+        apply_standard_icon(self, self._open_text_button, QStyle.SP_DialogOpenButton)
         self._open_text_button.clicked.connect(self._open_text_report)
         self._open_text_button.setEnabled(False)
         controls_layout.addWidget(self._open_text_button)
 
         self._open_json_button = QPushButton("Abrir JSON")
+        apply_standard_icon(self, self._open_json_button, QStyle.SP_DialogOpenButton)
         self._open_json_button.clicked.connect(self._open_json_report)
         self._open_json_button.setEnabled(False)
         controls_layout.addWidget(self._open_json_button)
@@ -211,10 +217,12 @@ class DistributedMonitorDialog(QDialog):
         if self._timer.isActive():
             self._timer.stop()
             self._pause_button.setText("Retomar")
+            apply_standard_icon(self, self._pause_button, QStyle.SP_MediaPlay)
             self._status_label.setText("Atualizacao automatica pausada.")
         else:
             self._timer.start()
             self._pause_button.setText("Pausar")
+            apply_standard_icon(self, self._pause_button, QStyle.SP_MediaPause)
             self._status_label.setText(
                 f"Atualizacao automatica ativa a cada {self._interval_spin.value()} segundo(s)."
             )

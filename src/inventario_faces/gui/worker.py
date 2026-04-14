@@ -56,18 +56,18 @@ class FaceSearchWorker(_BaseWorker):
         self,
         service: InventoryService,
         root_directory: Path,
-        query_image_path: Path,
+        query_image_paths: list[Path],
         work_directory: Path | None = None,
     ) -> None:
         super().__init__(service, root_directory, work_directory)
-        self._query_image_path = query_image_path
+        self._query_image_paths = list(query_image_paths)
 
     @Slot()
     def run(self) -> None:
         self._execute(
             lambda: self._service.run_face_search(
                 self._root_directory,
-                self._query_image_path,
+                self._query_image_paths,
                 work_directory=self._work_directory,
                 progress_callback=self._on_progress,
                 log_callback=self.log_message.emit,

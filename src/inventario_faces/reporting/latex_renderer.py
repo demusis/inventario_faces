@@ -15,12 +15,14 @@ from inventario_faces.reporting.report_support import (
     candidate_cluster_map,
     format_group_similarity,
     inventory_methodology_items,
-    keyframe_reference_text,
+    keyframe_reference_lines,
     media_track_type_label,
     software_reference_abnt_latex,
     technical_parameter_items,
+    track_frame_interval_text,
+    track_interval_text,
 )
-from inventario_faces.utils.latex import break_monospace_text, break_wrappable_text, escape_latex, format_seconds
+from inventario_faces.utils.latex import break_monospace_text, break_wrappable_text, escape_latex
 from inventario_faces.utils.path_utils import ensure_directory
 from inventario_faces.utils.time_utils import format_local_datetime
 
@@ -170,15 +172,15 @@ Track & Recorte & Quadro de origem & Metadados \\
         crop_cell = self._table_image_cell(crop_path, tex_path, width="0.92\\linewidth", height="0.16\\textheight")
         context_cell = self._table_image_cell(context_path, tex_path, width="0.95\\linewidth", height="0.17\\textheight")
         metadata_lines = [
-            rf"Origem: \texttt{{{break_wrappable_text(track.source_path.name)}}}",
-            f"Intervalo: {self._track_interval(track)}",
-            rf"Frames: \texttt{{{escape_latex(self._frame_interval(track))}}}",
-            f"Detec\\c{{c}}\\~oes: {len(track.occurrence_ids)}",
-            f"Keyframes: {len(track.keyframe_ids)}",
-            f"Qualidade m\\'edia: {track.quality_statistics.mean_quality_score:.3f}",
+            rf"Arquivo de origem: \texttt{{{break_wrappable_text(track.source_path.name)}}}",
+            f"Intervalo temporal do track: {track_interval_text(track)}",
+            rf"Faixa de quadros do track: \texttt{{{break_wrappable_text(track_frame_interval_text(track))}}}",
+            f"Ocorr\\^encias faciais no track: {len(track.occurrence_ids)}",
+            f"Quadros de refer\\^encia do track: {len(track.keyframe_ids)}",
+            f"Qualidade facial m\\'edia do track: {track.quality_statistics.mean_quality_score:.3f}",
         ]
         if keyframe is not None:
-            metadata_lines.append(escape_latex(keyframe_reference_text(keyframe)))
+            metadata_lines.extend(escape_latex(line) for line in keyframe_reference_lines(keyframe))
         metadata = (
             r"\begin{minipage}[t]{\linewidth}\raggedright\setlength{\parskip}{0.25em}\vspace{0pt}"
             + r" \par ".join(metadata_lines)
@@ -294,14 +296,6 @@ Conjunto & Quantidade & M\'edia (px) & Desvio padr\~ao (px) \\
 \end{{scriptsize}}
 \endgroup
 """
-
-    def _track_interval(self, track: FaceTrack) -> str:
-        return f"{format_seconds(track.start_time)} - {format_seconds(track.end_time)}"
-
-    def _frame_interval(self, track: FaceTrack) -> str:
-        start = "-" if track.start_frame is None else f"{track.start_frame:06d}"
-        end = "-" if track.end_frame is None else f"{track.end_frame:06d}"
-        return f"{start} - {end}"
 
     def _include_image(self, artifact_path: Path | None, tex_path: Path, width: str, height: str) -> str:
         if artifact_path is None:

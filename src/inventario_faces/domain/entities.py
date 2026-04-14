@@ -256,6 +256,24 @@ class FaceSearchQuery:
     crop_path: Path | None
     context_image_path: Path | None
     quality_score: float | None
+    query_index: int = 1
+
+
+@dataclass(frozen=True)
+class FaceSearchQueryEvent:
+    query_index: int
+    source_path: Path
+    status: str
+    sha512: str | None = None
+    detected_face_count: int | None = None
+    selected_track_id: str | None = None
+    selected_occurrence_id: str | None = None
+    selected_keyframe_id: str | None = None
+    crop_path: Path | None = None
+    context_image_path: Path | None = None
+    quality_score: float | None = None
+    error_message: str | None = None
+    error_type: str | None = None
 
 
 @dataclass(frozen=True)
@@ -274,6 +292,9 @@ class FaceSearchMatch:
     track_end_time: float | None
     crop_path: Path | None
     context_image_path: Path | None
+    query_source_path: Path | None = None
+    query_selected_track_id: str | None = None
+    query_selected_occurrence_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -283,6 +304,9 @@ class FaceSearchSummary:
     compatible_tracks: int
     compatible_occurrences: int
     compatibility_threshold: float
+    query_image_count: int = 1
+    query_faces_selected: int = 1
+    query_images_rejected: int = 0
 
 
 @dataclass(frozen=True)
@@ -306,11 +330,13 @@ class InventoryResult:
 @dataclass(frozen=True)
 class FaceSearchResult:
     inventory_result: InventoryResult
-    query: FaceSearchQuery
+    query: FaceSearchQuery | None
     matches: list[FaceSearchMatch]
     summary: FaceSearchSummary
     report: ReportArtifacts
     export_path: Path | None = None
+    queries: list[FaceSearchQuery] = field(default_factory=list)
+    query_events: list[FaceSearchQueryEvent] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -390,7 +416,7 @@ class FaceSetComparisonCalibrationSummary:
     support_note: str | None = None
     score_min: float | None = None
     score_max: float | None = None
-    density_method: str = "gaussian_kde"
+    density_method: str = "bounded_logit_kde"
     smoothing_note: str | None = None
 
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest import mock
@@ -363,6 +364,126 @@ class InventoryPipelineTests(unittest.TestCase):
             self.assertTrue(result.report.docx_path.exists())
             self.assertTrue((result.inventory_result.run_directory / "inventory" / "face_search.json").exists())
 
+    def test_face_search_pipeline_accepts_multiple_query_images(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            root = temp_root / "acervo"
+            root.mkdir(parents=True, exist_ok=True)
+            self._create_test_image(root / "face_1.jpg")
+            self._create_test_image(root / "face_2.jpg")
+            query_images = [
+                temp_root / "consulta_1.jpg",
+                temp_root / "consulta_2.jpg",
+            ]
+            for query_image in query_images:
+                self._create_test_image(query_image)
+
+            config = self._config()
+            service = InventoryService(
+                config=config,
+                scanner_service=ScannerService(config.media),
+                hashing_service=HashingService(),
+                media_service=VideoService(config.video),
+                clustering_service=ClusteringService(config.clustering),
+                report_generator=_FakeReportGenerator(),
+                face_analyzer_factory=_FakeAnalyzer,
+                face_search_report_generator=_FakeFaceSearchReportGenerator(),
+            )
+
+            result = service.run_face_search(root, query_images)
+
+            self.assertEqual(2, result.summary.query_image_count)
+            self.assertEqual(2, result.summary.query_faces_selected)
+            self.assertEqual(0, result.summary.query_images_rejected)
+            self.assertEqual(2, len(result.queries))
+            self.assertEqual(query_images[0].resolve(), result.query.source_path)
+            self.assertEqual(
+                {path.resolve() for path in query_images},
+                {query.source_path for query in result.queries},
+            )
+            self.assertEqual(2, len(result.query_events))
+            self.assertTrue(all(event.status == "selected" for event in result.query_events))
+            self.assertGreaterEqual(len(result.matches), 1)
+            self.assertIn(
+                result.matches[0].query_source_path,
+                {path.resolve() for path in query_images},
+            )
+            self.assertTrue(result.report.tex_path.exists())
+            self.assertTrue(result.report.docx_path.exists())
+            self.assertTrue((result.inventory_result.run_directory / "inventory" / "face_search.json").exists())
+
+    def test_face_search_pipeline_reports_rejected_query_files_for_chain_of_custody(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            root = temp_root / "acervo"
+            root.mkdir(parents=True, exist_ok=True)
+            self._create_test_image(root / "face_1.jpg")
+            valid_query = temp_root / "consulta_valida.jpg"
+            invalid_query = temp_root / "consulta_corrompida.jpg"
+            self._create_test_image(valid_query)
+            invalid_query.write_text("arquivo corrompido", encoding="utf-8")
+
+            config = self._config()
+            service = InventoryService(
+                config=config,
+                scanner_service=ScannerService(config.media),
+                hashing_service=HashingService(),
+                media_service=VideoService(config.video),
+                clustering_service=ClusteringService(config.clustering),
+                report_generator=_FakeReportGenerator(),
+                face_analyzer_factory=_FakeAnalyzer,
+                face_search_report_generator=_FakeFaceSearchReportGenerator(),
+            )
+
+            result = service.run_face_search(root, [valid_query, invalid_query])
+
+            self.assertEqual(2, result.summary.query_image_count)
+            self.assertEqual(1, result.summary.query_faces_selected)
+            self.assertEqual(1, result.summary.query_images_rejected)
+            self.assertEqual(2, len(result.query_events))
+            rejected = next(event for event in result.query_events if event.status == "rejected")
+            self.assertEqual(invalid_query.resolve(), rejected.source_path)
+            self.assertEqual("MediaDecodeError", rejected.error_type)
+            self.assertIsNotNone(rejected.error_message)
+            self.assertIn("Nao foi possivel ler a imagem", rejected.error_message)
+            exported = (result.inventory_result.run_directory / "inventory" / "face_search.json").read_text(encoding="utf-8")
+            self.assertIn("query_events", exported)
+            self.assertIn("consulta_corrompida.jpg", exported)
+
+    def test_face_search_pipeline_generates_auditable_report_when_all_queries_fail(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            root = temp_root / "acervo"
+            root.mkdir(parents=True, exist_ok=True)
+            self._create_test_image(root / "face_1.jpg")
+            invalid_query = temp_root / "consulta_corrompida.jpg"
+            invalid_query.write_text("arquivo corrompido", encoding="utf-8")
+
+            config = self._config()
+            service = InventoryService(
+                config=config,
+                scanner_service=ScannerService(config.media),
+                hashing_service=HashingService(),
+                media_service=VideoService(config.video),
+                clustering_service=ClusteringService(config.clustering),
+                report_generator=_FakeReportGenerator(),
+                face_analyzer_factory=_FakeAnalyzer,
+                face_search_report_generator=_FakeFaceSearchReportGenerator(),
+            )
+
+            result = service.run_face_search(root, [invalid_query])
+
+            self.assertIsNone(result.query)
+            self.assertEqual([], result.queries)
+            self.assertEqual(1, result.summary.query_image_count)
+            self.assertEqual(0, result.summary.query_faces_selected)
+            self.assertEqual(1, result.summary.query_images_rejected)
+            self.assertEqual(0, len(result.matches))
+            self.assertEqual(1, len(result.query_events))
+            self.assertEqual("rejected", result.query_events[0].status)
+            self.assertTrue(result.report.tex_path.exists())
+            self.assertTrue(result.report.docx_path.exists())
+
     def test_face_set_comparison_exports_matches_and_mesh_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_root = Path(temp_dir)
@@ -455,6 +576,37 @@ class InventoryPipelineTests(unittest.TestCase):
             self.assertTrue((result.export_directory / "face_set_comparison_calibration_scores.csv").exists())
             self.assertTrue((result.export_directory / "face_set_comparison_calibration_model.json").exists())
 
+    def test_face_set_comparison_summary_text_includes_mann_whitney_quality_test(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            set_a_images = [temp_root / "set_a_1.jpg", temp_root / "set_a_2.jpg"]
+            set_b_images = [temp_root / "set_b_1.jpg", temp_root / "set_b_2.jpg"]
+            for path in [*set_a_images, *set_b_images]:
+                self._create_test_image(path)
+
+            config = self._config()
+            service = InventoryService(
+                config=config,
+                scanner_service=ScannerService(config.media),
+                hashing_service=HashingService(),
+                media_service=VideoService(config.video),
+                clustering_service=ClusteringService(config.clustering),
+                report_generator=_FakeReportGenerator(),
+                face_analyzer_factory=_FakeAnalyzer,
+            )
+
+            result = service.compare_face_sets(
+                set_a_images,
+                set_b_images,
+                work_directory=temp_root / "trabalho",
+            )
+
+            summary_text = (result.export_directory / "face_set_comparison_summary.txt").read_text(encoding="utf-8")
+            self.assertIn("Teste nao parametrico entre grupos:", summary_text)
+            self.assertIn("U de Mann-Whitney bilateral sobre qualidade facial", summary_text)
+            self.assertIn("p-valor bilateral:", summary_text)
+            self.assertIn("n: Padrao 2 | Questionado 2", summary_text)
+
     def test_face_set_comparison_can_reuse_saved_likelihood_ratio_model(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_root = Path(temp_dir)
@@ -512,6 +664,83 @@ class InventoryPipelineTests(unittest.TestCase):
             self.assertFalse((reused_result.export_directory / "face_set_comparison_calibration_inputs.csv").exists())
             self.assertFalse((reused_result.export_directory / "face_set_comparison_calibration_entries.csv").exists())
             self.assertTrue((reused_result.export_directory / "face_set_comparison_calibration_model.json").exists())
+
+    def test_face_set_comparison_can_migrate_saved_likelihood_ratio_model_without_reprocessing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            set_a_image = temp_root / "query_a.jpg"
+            set_b_image = temp_root / "query_b.jpg"
+            self._create_test_image(set_a_image)
+            self._create_test_image(set_b_image)
+
+            calibration_root = temp_root / "calibracao"
+            for identity_label in ("alice", "bob"):
+                identity_root = calibration_root / identity_label
+                identity_root.mkdir(parents=True, exist_ok=True)
+                for index in range(1, 5):
+                    self._create_test_image(identity_root / f"{identity_label}_{index}.jpg")
+
+            base_config = self._config()
+            legacy_config = replace(
+                base_config,
+                likelihood_ratio=replace(base_config.likelihood_ratio, density_estimator="gaussian_kde"),
+            )
+            legacy_service = InventoryService(
+                config=legacy_config,
+                scanner_service=ScannerService(legacy_config.media),
+                hashing_service=HashingService(),
+                media_service=VideoService(legacy_config.video),
+                clustering_service=ClusteringService(legacy_config.clustering),
+                report_generator=_FakeReportGenerator(),
+                face_analyzer_factory=_CalibrationAwareAnalyzer,
+            )
+
+            legacy_result = legacy_service.compare_face_sets(
+                [set_a_image],
+                [set_b_image],
+                work_directory=temp_root / "trabalho_legado",
+                calibration_root=calibration_root,
+            )
+            legacy_model_path = legacy_result.export_directory / "face_set_comparison_calibration_model.json"
+
+            current_service = InventoryService(
+                config=base_config,
+                scanner_service=ScannerService(base_config.media),
+                hashing_service=HashingService(),
+                media_service=VideoService(base_config.video),
+                clustering_service=ClusteringService(base_config.clustering),
+                report_generator=_FakeReportGenerator(),
+                face_analyzer_factory=_CalibrationAwareAnalyzer,
+            )
+            migrated_model_path = current_service.migrate_face_set_comparison_calibration_model(
+                legacy_model_path,
+                temp_root / "modelo_migrado.json",
+            )
+            migrated_model = current_service.load_face_set_comparison_calibration_model(migrated_model_path)
+
+            self.assertEqual("gaussian_kde", legacy_result.calibration.summary.density_method)
+            self.assertEqual("bounded_logit_kde", migrated_model.summary.density_method)
+            self.assertIsNotNone(migrated_model.settings_snapshot)
+            self.assertEqual("bounded_logit_kde", migrated_model.settings_snapshot.density_estimator)
+            self.assertEqual(legacy_result.calibration.genuine_scores, migrated_model.genuine_scores)
+            self.assertEqual(legacy_result.calibration.impostor_scores, migrated_model.impostor_scores)
+            self.assertTrue(
+                any(
+                    "Modelo migrado sem reprocessar imagens" in line
+                    for line in migrated_model.procedure_details
+                )
+            )
+
+            reused_result = current_service.compare_face_sets(
+                [set_a_image],
+                [set_b_image],
+                work_directory=temp_root / "trabalho_migrado",
+                calibration_model_path=migrated_model_path,
+            )
+
+            self.assertTrue(reused_result.summary.likelihood_ratio_calibrated)
+            self.assertIsNotNone(reused_result.matches[0].likelihood_ratio)
+            self.assertIsNotNone(reused_result.matches[0].log10_likelihood_ratio)
 
     def test_face_set_comparison_emits_phase_logs_for_calibration_and_matching(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -572,7 +801,9 @@ class InventoryPipelineTests(unittest.TestCase):
                 any("[Calibracao LR] Aplicacao de LR concluida | pares_calibrados=1" in line for line in logs)
             )
             self.assertTrue(any("Calibracao LR: preparando pares estatisticos" in message for message in progress_messages))
-            self.assertTrue(any("Calibracao LR: ajustando densidades KDE" in message for message in progress_messages))
+            self.assertTrue(
+                any("Calibracao LR: ajustando densidades" in message for message in progress_messages)
+            )
 
     def test_face_set_comparison_uses_custom_likelihood_ratio_settings(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -608,6 +839,7 @@ class InventoryPipelineTests(unittest.TestCase):
                     minimum_same_source_scores=3,
                     minimum_different_source_scores=3,
                     minimum_unique_scores_per_distribution=2,
+                    density_estimator="gaussian_kde",
                     kde_bandwidth_scale=1.3,
                     kde_uniform_floor_weight=0.01,
                     kde_min_density=1e-9,
@@ -634,6 +866,8 @@ class InventoryPipelineTests(unittest.TestCase):
             self.assertEqual(3, result.calibration.summary.genuine_score_count)
             self.assertEqual(3, result.calibration.summary.impostor_score_count)
             self.assertIsNotNone(result.calibration.settings_snapshot)
+            self.assertEqual("gaussian_kde", result.calibration.summary.density_method)
+            self.assertEqual("gaussian_kde", result.calibration.settings_snapshot.density_estimator)
             self.assertEqual(1.3, result.calibration.settings_snapshot.kde_bandwidth_scale)
             self.assertEqual(0.01, result.calibration.settings_snapshot.kde_uniform_floor_weight)
             self.assertEqual(1e-9, result.calibration.settings_snapshot.kde_min_density)

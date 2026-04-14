@@ -6,7 +6,7 @@ from html import escape
 from pathlib import Path
 import zipfile
 
-from PySide6.QtCore import QPointF, QThread, QTimer, Qt, QUrl
+from PySide6.QtCore import QPointF, QRectF, QThread, QTimer, Qt, QUrl
 from PySide6.QtGui import QColor, QDesktopServices, QPainter, QPen, QPixmap, QPolygonF
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -33,10 +33,11 @@ from PySide6.QtWidgets import (
     QTextBrowser,
     QVBoxLayout,
     QWidget,
+    QStyle,
 )
 
 import numpy as np
-from scipy.stats import gaussian_kde
+from scipy.stats import mannwhitneyu
 
 from inventario_faces.domain.config import AppConfig
 from inventario_faces.domain.entities import (
@@ -45,7 +46,10 @@ from inventario_faces.domain.entities import (
     FaceSetComparisonMatch,
     FaceSetComparisonResult,
 )
+from inventario_faces.gui.face_set_comparison_help import build_face_set_comparison_help_html
+from inventario_faces.gui.icon_utils import apply_standard_icon
 from inventario_faces.gui.worker import FaceSetComparisonWorker
+from inventario_faces.utils.density_utils import fit_score_density_model, score_density_method_label
 
 
 class AdaptiveImageLabel(QLabel):
@@ -108,12 +112,236 @@ class _DistributionSeries:
     ci_high: float | None = None
 
 
+@dataclass(frozen=True)
+class _GroupComparisonTestResult:
+    metric_label: str
+    left_label: str
+    right_label: str
+    left_count: int
+    right_count: int
+    left_median: float | None = None
+    right_median: float | None = None
+    u_statistic: float | None = None
+    p_value: float | None = None
+    rank_biserial: float | None = None
+    common_language_effect: float | None = None
+    significant: bool | None = None
+    available: bool = False
+    note: str | None = None
+
+
+def _expanded_score_range(
+    values: list[float] | tuple[float, ...],
+    *,
+    observed_score: float | None = None,
+    minimum_span: float = 0.2,
+) -> tuple[float, float]:
+    numeric_values = [float(value) for value in values]
+    if observed_score is not None:
+        numeric_values.append(float(observed_score))
+    if not numeric_values:
+        return 0.0, 1.0
+
+    min_value = min(numeric_values)
+    max_value = max(numeric_values)
+    lower = min_value
+    upper = max_value
+    span = upper - lower
+    padding = max(span * 0.08, 0.02)
+    lower -= padding
+    upper += padding
+
+    if (upper - lower) < minimum_span:
+        center = (lower + upper) / 2.0
+        lower = center - (minimum_span / 2.0)
+        upper = center + (minimum_span / 2.0)
+
+    if min_value >= 0.0:
+        lower = max(0.0, lower)
+        upper = max(upper, min(1.0, lower + minimum_span))
+    if max_value <= 0.0:
+        upper = min(0.0, upper)
+        lower = min(lower, max(-1.0, upper - minimum_span))
+
+    lower = max(-1.0, lower)
+    upper = min(1.0, upper)
+
+    if upper <= lower:
+        if min_value >= 0.0:
+            lower = 0.0
+            upper = min(1.0, max(minimum_span, max_value + 0.02))
+        elif max_value <= 0.0:
+            upper = 0.0
+            lower = max(-1.0, min(-minimum_span, min_value - 0.02))
+        else:
+            lower = max(-1.0, min_value - 0.1)
+            upper = min(1.0, max_value + 0.1)
+
+    return float(lower), float(upper)
+
+
+def _histogram_density(
+    values: list[float] | tuple[float, ...],
+    *,
+    lower: float,
+    upper: float,
+    minimum_bins: int = 16,
+    maximum_bins: int = 48,
+) -> tuple[tuple[float, ...], tuple[float, ...]]:
+    if not values or upper <= lower:
+        return (), ()
+
+    array = np.asarray(values, dtype=np.float64)
+    sample_size = int(array.size)
+    if sample_size <= 1:
+        return (), ()
+
+    q1, q3 = np.quantile(array, [0.25, 0.75], method="linear")
+    iqr = float(q3 - q1)
+    if iqr > 1e-12:
+        bin_width = 2.0 * iqr * (sample_size ** (-1.0 / 3.0))
+        estimated_bins = int(np.ceil((upper - lower) / bin_width)) if bin_width > 1e-12 else minimum_bins
+    else:
+        estimated_bins = int(np.ceil(np.sqrt(sample_size)))
+    bin_count = max(minimum_bins, min(maximum_bins, estimated_bins))
+
+    histogram, edges = np.histogram(array, bins=bin_count, range=(lower, upper), density=True)
+    return (
+        tuple(float(value) for value in edges),
+        tuple(float(value) for value in histogram),
+    )
+
+
+def _mann_whitney_group_comparison(
+    left_values: list[float] | tuple[float, ...],
+    right_values: list[float] | tuple[float, ...],
+    *,
+    alpha: float,
+    metric_label: str,
+    left_label: str = "Padrão",
+    right_label: str = "Questionado",
+) -> _GroupComparisonTestResult:
+    left_sample = [float(value) for value in left_values]
+    right_sample = [float(value) for value in right_values]
+    left_count = len(left_sample)
+    right_count = len(right_sample)
+    if left_count < 2 or right_count < 2:
+        return _GroupComparisonTestResult(
+            metric_label=metric_label,
+            left_label=left_label,
+            right_label=right_label,
+            left_count=left_count,
+            right_count=right_count,
+            available=False,
+            note=(
+                "Teste U de Mann-Whitney indisponível: são necessárias ao menos 2 observações válidas "
+                f"em cada grupo de {metric_label.lower()}."
+            ),
+        )
+
+    left_array = np.asarray(left_sample, dtype=np.float64)
+    right_array = np.asarray(right_sample, dtype=np.float64)
+    try:
+        test_result = mannwhitneyu(left_array, right_array, alternative="two-sided", method="auto")
+    except TypeError:
+        test_result = mannwhitneyu(left_array, right_array, alternative="two-sided")
+    except ValueError as exc:
+        return _GroupComparisonTestResult(
+            metric_label=metric_label,
+            left_label=left_label,
+            right_label=right_label,
+            left_count=left_count,
+            right_count=right_count,
+            available=False,
+            note=f"Teste U de Mann-Whitney indisponível: {exc}",
+        )
+
+    pair_count = left_count * right_count
+    u_statistic = float(test_result.statistic)
+    p_value = float(test_result.pvalue)
+    common_language_effect = (u_statistic / pair_count) if pair_count > 0 else None
+    rank_biserial = (
+        (2.0 * common_language_effect) - 1.0 if common_language_effect is not None else None
+    )
+    return _GroupComparisonTestResult(
+        metric_label=metric_label,
+        left_label=left_label,
+        right_label=right_label,
+        left_count=left_count,
+        right_count=right_count,
+        left_median=float(np.median(left_array)),
+        right_median=float(np.median(right_array)),
+        u_statistic=u_statistic,
+        p_value=p_value,
+        rank_biserial=rank_biserial,
+        common_language_effect=common_language_effect,
+        significant=(p_value <= alpha),
+        available=True,
+    )
+
+
+def _format_density_value(value: float | None) -> str:
+    if value is None or not np.isfinite(value):
+        return "-"
+    absolute = abs(float(value))
+    if absolute == 0.0:
+        return "0"
+    if 1e-3 <= absolute < 1e3:
+        return f"{value:.6f}".rstrip("0").rstrip(".")
+    return f"{value:.3e}"
+
+
+def _likelihood_ratio_selection_html(
+    match: FaceSetComparisonMatch | None,
+    *,
+    left_name: str = "-",
+    right_name: str = "-",
+) -> str:
+    if match is None:
+        return "Linha tracejada azul: nenhum confronto selecionado."
+
+    left = escape(left_name)
+    right = escape(right_name)
+    score_text = f"{match.similarity:.4f}"
+    header = (
+        "Linha tracejada azul: confronto selecionado na tabela | "
+        f"rank {match.rank} | similaridade {score_text} | {left} x {right}"
+    )
+    if (
+        match.same_source_density is None
+        or match.different_source_density is None
+        or match.likelihood_ratio is None
+        or match.log10_likelihood_ratio is None
+    ):
+        return (
+            f"{header}<br>"
+            "<b>Leitura do gráfico</b>: o LR é obtido pela razão entre as alturas "
+            "das curvas H1 e H2 exatamente no ponto da linha tracejada."
+        )
+
+    h1_density = _format_density_value(match.same_source_density)
+    h2_density = _format_density_value(match.different_source_density)
+    lr_value = _format_density_value(match.likelihood_ratio)
+    log10_lr = f"{match.log10_likelihood_ratio:.4f}"
+    favored_hypothesis = "H1 (mesma origem)" if match.likelihood_ratio >= 1.0 else "H2 (origem distinta)"
+    return (
+        f"{header}<br>"
+        f"<b>Leitura do gráfico</b>: no score selecionado <code>x={score_text}</code>, "
+        f"a curva verde fornece <code>f(score|H1)={h1_density}</code> e a curva vermelha "
+        f"<code>f(score|H2)={h2_density}</code>.<br>"
+        f"<b>Cálculo</b>: <code>LR = f(score|H1) / f(score|H2) = {h1_density} / {h2_density} = {lr_value}</code><br>"
+        f"<b>Escala log</b>: <code>log10(LR) = {log10_lr}</code> | "
+        f"<b>Leitura</b>: neste ponto, a evidência favorece <b>{escape(favored_hypothesis)}</b>."
+    )
+
+
 class SimilarityDistributionWidget(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._series: list[_DistributionSeries] = []
         self._candidate = 0.0
         self._assignment = 0.0
+        self._observed_score: float | None = None
         self._overall_ci_low: float | None = None
         self._overall_ci_high: float | None = None
         self._overall_mean: float | None = None
@@ -127,6 +355,7 @@ class SimilarityDistributionWidget(QWidget):
         *,
         candidate_threshold: float,
         assignment_threshold: float,
+        observed_score: float | None,
         mean_value: float | None,
         ci_low: float | None,
         ci_high: float | None,
@@ -136,6 +365,7 @@ class SimilarityDistributionWidget(QWidget):
         self._series = list(series)
         self._candidate = candidate_threshold
         self._assignment = assignment_threshold
+        self._observed_score = observed_score
         self._overall_mean = mean_value
         self._overall_ci_low = ci_low
         self._overall_ci_high = ci_high
@@ -169,11 +399,14 @@ class SimilarityDistributionWidget(QWidget):
             return
 
         all_values = [value for series in drawable_series for value in series.values]
-        lower = min(0.0, min(all_values), self._candidate, self._assignment, self._overall_ci_low or 0.0)
-        upper = max(1.0, max(all_values), self._candidate, self._assignment, self._overall_ci_high or 1.0)
-        if upper - lower < 0.2:
-            lower -= 0.1
-            upper += 0.1
+        axis_values = [*all_values, self._candidate, self._assignment]
+        if self._overall_ci_low is not None:
+            axis_values.append(self._overall_ci_low)
+        if self._overall_ci_high is not None:
+            axis_values.append(self._overall_ci_high)
+        if self._observed_score is not None:
+            axis_values.append(self._observed_score)
+        lower, upper = _expanded_score_range(axis_values, minimum_span=0.2)
 
         if self._overall_ci_low is not None and self._overall_ci_high is not None:
             x1 = self._map_x(self._overall_ci_low, plot, lower, upper)
@@ -215,6 +448,8 @@ class SimilarityDistributionWidget(QWidget):
         self._draw_marker(painter, plot, lower, upper, self._assignment, QColor("#0f766e"), "atrib.")
         if self._overall_mean is not None:
             self._draw_marker(painter, plot, lower, upper, self._overall_mean, QColor("#1e293b"), "média")
+        if self._observed_score is not None:
+            self._draw_marker(painter, plot, lower, upper, self._observed_score, QColor("#2563eb"), None)
 
         painter.setPen(QPen(QColor("#475569"), 1))
         painter.drawLine(plot.left(), plot.bottom(), plot.right(), plot.bottom())
@@ -236,25 +471,28 @@ class SimilarityDistributionWidget(QWidget):
         upper: float,
         value: float,
         color: QColor,
-        label: str,
+        label: str | None,
     ) -> None:
         x = self._map_x(value, plot, lower, upper)
         pen = QPen(color, 2)
         pen.setStyle(Qt.DashLine)
         painter.setPen(pen)
         painter.drawLine(int(x), plot.top(), int(x), plot.bottom())
-        painter.setPen(QPen(color, 1))
-        painter.drawText(int(x - 26), plot.top() - 4, 52, 14, Qt.AlignCenter, label)
+        if label:
+            painter.setPen(QPen(color, 1))
+            painter.drawText(int(x - 26), plot.top() - 4, 52, 14, Qt.AlignCenter, label)
 
 
 class LikelihoodRatioDensityWidget(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._series: list[_DistributionSeries] = []
+        self._observed_score: float | None = None
         self.setMinimumHeight(260)
 
-    def set_series(self, series: list[_DistributionSeries]) -> None:
+    def set_series(self, series: list[_DistributionSeries], *, observed_score: float | None = None) -> None:
         self._series = list(series)
+        self._observed_score = observed_score
         self.update()
 
     def paintEvent(self, event) -> None:  # type: ignore[override]
@@ -278,20 +516,44 @@ class LikelihoodRatioDensityWidget(QWidget):
             return
 
         all_values = [value for series in drawable_series for value in series.values]
-        lower = min(-1.0, min(all_values))
-        upper = max(1.0, max(all_values))
-        if upper - lower < 0.2:
-            lower -= 0.1
-            upper += 0.1
+        lower, upper = _expanded_score_range(
+            all_values,
+            observed_score=self._observed_score,
+            minimum_span=0.2,
+        )
 
         painter.setPen(QPen(QColor("#e7edf4"), 1))
         for ratio in (0.25, 0.5, 0.75):
             y = plot.bottom() - (plot.height() * ratio)
             painter.drawLine(plot.left(), int(y), plot.right(), int(y))
 
-        max_density = max(max(series.kde_y) for series in drawable_series if series.kde_y) or 1.0
+        histogram_series: list[tuple[_DistributionSeries, tuple[float, ...], tuple[float, ...]]] = []
+        histogram_max_density = 0.0
+        for series in drawable_series:
+            edges, histogram = _histogram_density(series.values, lower=lower, upper=upper)
+            histogram_series.append((series, edges, histogram))
+            if histogram:
+                histogram_max_density = max(histogram_max_density, max(histogram))
+
+        curve_max_density = max(max(series.kde_y) for series in drawable_series if series.kde_y) or 1.0
+        max_density = max(curve_max_density, histogram_max_density, 1.0)
         legend_x = plot.left() + 10
         legend_y = plot.top() + 8
+
+        for series, edges, histogram in histogram_series:
+            if not edges or not histogram:
+                continue
+            color = QColor(series.color)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(color.red(), color.green(), color.blue(), 26))
+            for left_edge, right_edge, density in zip(edges[:-1], edges[1:], histogram):
+                if density <= 0.0:
+                    continue
+                x1 = self._map_x(left_edge, plot, lower, upper)
+                x2 = self._map_x(right_edge, plot, lower, upper)
+                top = plot.bottom() - ((density / max_density) * plot.height())
+                rect = QRectF(min(x1, x2), top, max(1.0, abs(x2 - x1)), plot.bottom() - top)
+                painter.drawRect(rect)
 
         for series in drawable_series:
             color = QColor(series.color)
@@ -314,6 +576,22 @@ class LikelihoodRatioDensityWidget(QWidget):
             painter.drawText(legend_x + 18, legend_y - 1, 240, 14, Qt.AlignLeft | Qt.AlignVCenter, series.label)
             legend_y += 18
 
+        painter.setBrush(QColor(148, 163, 184, 38))
+        painter.setPen(QPen(QColor("#94a3b8"), 1))
+        painter.drawRect(QRectF(legend_x, legend_y, 12, 12))
+        painter.setPen(QPen(QColor("#334155"), 1))
+        painter.drawText(
+            legend_x + 18,
+            legend_y - 1,
+            240,
+            14,
+            Qt.AlignLeft | Qt.AlignVCenter,
+            "barras: histograma bruto",
+        )
+
+        if self._observed_score is not None:
+            self._draw_marker(painter, plot, lower, upper, self._observed_score, QColor("#2563eb"))
+
         painter.setPen(QPen(QColor("#475569"), 1))
         painter.drawLine(plot.left(), plot.bottom(), plot.right(), plot.bottom())
         for ratio in (0.0, 0.25, 0.5, 0.75, 1.0):
@@ -325,6 +603,21 @@ class LikelihoodRatioDensityWidget(QWidget):
         if upper <= lower:
             return float(plot.left())
         return plot.left() + (plot.width() * ((value - lower) / (upper - lower)))
+
+    def _draw_marker(
+        self,
+        painter: QPainter,
+        plot,
+        lower: float,
+        upper: float,
+        value: float,
+        color: QColor,
+    ) -> None:
+        x = self._map_x(value, plot, lower, upper)
+        pen = QPen(color, 2)
+        pen.setStyle(Qt.DashLine)
+        painter.setPen(pen)
+        painter.drawLine(int(x), plot.top(), int(x), plot.bottom())
 
 
 class FaceSetComparisonDialog(QDialog):
@@ -478,26 +771,32 @@ class FaceSetComparisonDialog(QDialog):
         self._work_directory_input = QLineEdit(self)
         layout.addWidget(self._work_directory_input, 0, 1)
         self._browse_work_directory_button = QPushButton("Selecionar")
+        apply_standard_icon(self, self._browse_work_directory_button, QStyle.SP_DirOpenIcon)
         self._browse_work_directory_button.clicked.connect(self._select_work_directory)
         layout.addWidget(self._browse_work_directory_button, 0, 2)
         self._run_button = QPushButton("Comparar conjuntos")
+        apply_standard_icon(self, self._run_button, QStyle.SP_MediaPlay)
         self._run_button.setObjectName("PrimaryButton")
         self._run_button.clicked.connect(self._start_comparison)
         layout.addWidget(self._run_button, 0, 3)
         self._help_button = QPushButton("Ajuda")
+        apply_standard_icon(self, self._help_button, QStyle.SP_DialogHelpButton)
         self._help_button.clicked.connect(self._open_help_popup)
         layout.addWidget(self._help_button, 0, 4)
         self._export_button = QPushButton("Exportar ZIP")
+        apply_standard_icon(self, self._export_button, QStyle.SP_DialogSaveButton)
         self._export_button.setEnabled(False)
         self._export_button.clicked.connect(self._export_results_zip)
         layout.addWidget(self._export_button, 0, 5)
         self._open_export_button = QPushButton("Abrir execução")
+        apply_standard_icon(self, self._open_export_button, QStyle.SP_DialogOpenButton)
         self._open_export_button.setEnabled(False)
         self._open_export_button.clicked.connect(self._open_export_directory)
         layout.addWidget(self._open_export_button, 0, 6)
         self._calibration_directory_input = QLineEdit(self)
         self._calibration_directory_input.setPlaceholderText("Uma subpasta por identidade rotulada")
         self._browse_calibration_directory_button = QPushButton("Selecionar base")
+        apply_standard_icon(self, self._browse_calibration_directory_button, QStyle.SP_DirOpenIcon)
         self._browse_calibration_directory_button.clicked.connect(self._select_calibration_directory)
         layout.addWidget(QLabel("Base de calibração LR (opcional):"), 1, 0)
         layout.addWidget(self._calibration_directory_input, 1, 1, 1, 5)
@@ -505,6 +804,7 @@ class FaceSetComparisonDialog(QDialog):
         self._calibration_model_input = QLineEdit(self)
         self._calibration_model_input.setPlaceholderText("Arquivo JSON com modelo LR já calculado")
         self._browse_calibration_model_button = QPushButton("Carregar modelo")
+        apply_standard_icon(self, self._browse_calibration_model_button, QStyle.SP_DialogOpenButton)
         self._browse_calibration_model_button.clicked.connect(self._select_calibration_model)
         layout.addWidget(QLabel("Modelo de calibração LR (opcional):"), 2, 0)
         layout.addWidget(self._calibration_model_input, 2, 1, 1, 5)
@@ -532,25 +832,28 @@ class FaceSetComparisonDialog(QDialog):
         self._significance_input.setMaximumWidth(96)
         layout.addWidget(self._significance_input)
         buttons = [
-            ("Resumo estatístico", self._open_summary_popup),
-            ("Distribuição", self._open_distribution_popup),
-            ("Entradas processadas", self._open_inputs_popup),
-            ("Correspondências", self._open_matches_popup),
-            ("Malha biométrica", self._open_preview_popup),
+            ("Resumo estatístico", self._open_summary_popup, QStyle.SP_FileDialogInfoView),
+            ("Distribuição", self._open_distribution_popup, QStyle.SP_FileDialogListView),
+            ("Entradas processadas", self._open_inputs_popup, QStyle.SP_FileIcon),
+            ("Correspondências", self._open_matches_popup, QStyle.SP_FileDialogDetailedView),
+            ("Malha biométrica", self._open_preview_popup, QStyle.SP_DesktopIcon),
         ]
         self._result_buttons: list[QPushButton] = []
-        for label, handler in buttons:
+        for label, handler, icon in buttons:
             button = QPushButton(label)
+            apply_standard_icon(self, button, icon)
             button.setEnabled(False)
             button.clicked.connect(handler)
             layout.addWidget(button)
             self._result_buttons.append(button)
         likelihood_button = QPushButton("Razão de verossimilhança")
+        apply_standard_icon(self, likelihood_button, QStyle.SP_FileDialogInfoView)
         likelihood_button.setEnabled(False)
         likelihood_button.clicked.connect(self._open_likelihood_ratio_popup)
         layout.addWidget(likelihood_button)
         self._result_buttons.append(likelihood_button)
         self._save_calibration_model_button = QPushButton("Salvar modelo LR")
+        apply_standard_icon(self, self._save_calibration_model_button, QStyle.SP_DialogSaveButton)
         self._save_calibration_model_button.setEnabled(False)
         self._save_calibration_model_button.clicked.connect(self._save_calibration_model)
         layout.addWidget(self._save_calibration_model_button)
@@ -567,12 +870,15 @@ class FaceSetComparisonDialog(QDialog):
 
         controls = QHBoxLayout()
         add_button = QPushButton("Adicionar imagens")
+        apply_standard_icon(self, add_button, QStyle.SP_DialogOpenButton)
         add_button.clicked.connect(lambda: self._add_images(set_label))
         controls.addWidget(add_button)
         remove_button = QPushButton("Remover selecionadas")
+        apply_standard_icon(self, remove_button, QStyle.SP_TrashIcon)
         remove_button.clicked.connect(lambda: self._remove_selected_images(set_label))
         controls.addWidget(remove_button)
         clear_button = QPushButton("Limpar")
+        apply_standard_icon(self, clear_button, QStyle.SP_LineEditClearButton)
         clear_button.clicked.connect(lambda: self._clear_images(set_label))
         controls.addWidget(clear_button)
         layout.addLayout(controls)
@@ -843,6 +1149,77 @@ class FaceSetComparisonDialog(QDialog):
     def _bootstrap_resamples(self) -> int:
         return int(self._bootstrap_resamples_input.value())
 
+    def _quality_group_comparison_test(self, result: FaceSetComparisonResult) -> _GroupComparisonTestResult:
+        left_values = [
+            float(entry.quality_score)
+            for entry in result.set_a_faces
+            if entry.quality_score is not None
+        ]
+        right_values = [
+            float(entry.quality_score)
+            for entry in result.set_b_faces
+            if entry.quality_score is not None
+        ]
+        return _mann_whitney_group_comparison(
+            left_values,
+            right_values,
+            alpha=self._bootstrap_alpha(),
+            metric_label="qualidade facial",
+            left_label="Padrão",
+            right_label="Questionado",
+        )
+
+    def _group_comparison_summary_lines(
+        self,
+        test_result: _GroupComparisonTestResult,
+        *,
+        significance_percent: float,
+    ) -> list[str]:
+        if not test_result.available:
+            return [
+                "Teste não paramétrico entre grupos:",
+                test_result.note or "Teste U de Mann-Whitney indisponível.",
+            ]
+
+        direction = "sem tendência direcional relevante entre os grupos"
+        if test_result.rank_biserial is not None:
+            if test_result.rank_biserial > 0.05:
+                direction = f"{test_result.left_label} tende a apresentar {test_result.metric_label} maior"
+            elif test_result.rank_biserial < -0.05:
+                direction = f"{test_result.right_label} tende a apresentar {test_result.metric_label} maior"
+
+        significance_label = (
+            f"diferença estatisticamente significativa ao nível de {significance_percent:.2f}%"
+            if test_result.significant
+            else f"diferença não significativa ao nível de {significance_percent:.2f}%"
+        )
+        return [
+            "Teste não paramétrico entre grupos:",
+            (
+                "U de Mann-Whitney bilateral sobre a distribuição de qualidade facial "
+                "das faces selecionadas em Padrão e Questionado."
+            ),
+            (
+                f"n: {test_result.left_label} {test_result.left_count} | "
+                f"{test_result.right_label} {test_result.right_count}"
+            ),
+            (
+                f"Medianas: {test_result.left_label} {self._format_optional_float(test_result.left_median)} | "
+                f"{test_result.right_label} {self._format_optional_float(test_result.right_median)}"
+            ),
+            f"U: {self._format_optional_float(test_result.u_statistic)}",
+            f"p-valor bilateral: {self._format_p_value(test_result.p_value)}",
+            (
+                "Correlação bisserial de postos: "
+                f"{self._format_optional_float(test_result.rank_biserial)}"
+            ),
+            (
+                f"Probabilidade de superioridade comum ({test_result.left_label} > {test_result.right_label}): "
+                f"{self._format_optional_float(test_result.common_language_effect)}"
+            ),
+            f"Interpretação: {significance_label}; {direction}.",
+        ]
+
     def _has_statistical_support(self, values: list[float], minimum_count: int = 5) -> tuple[bool, str | None]:
         if len(values) < minimum_count:
             return False, f"Amostra insuficiente para inferência: são necessárias ao menos {minimum_count} repetições."
@@ -875,15 +1252,22 @@ class FaceSetComparisonDialog(QDialog):
         upper: float,
         points: int = 256,
         bandwidth_scale: float = 1.0,
+        density_method: str | None = None,
+        uniform_floor_weight: float = 0.0,
+        min_density: float = 0.0,
     ) -> tuple[tuple[float, ...], tuple[float, ...]]:
-        array = np.asarray(values, dtype=np.float64)
-        if abs(bandwidth_scale - 1.0) <= 1e-12:
-            kde = gaussian_kde(array)
-        else:
-            kde = gaussian_kde(array, bw_method=lambda model: model.scotts_factor() * bandwidth_scale)
-        grid = np.linspace(lower, upper, points)
-        density = kde(grid)
-        return tuple(float(value) for value in grid), tuple(float(value) for value in density)
+        model = fit_score_density_model(
+            values,
+            method=density_method or self._config.likelihood_ratio.density_estimator,
+            bandwidth_scale=bandwidth_scale,
+        )
+        return model.curve(
+            lower=lower,
+            upper=upper,
+            points=points,
+            uniform_floor_weight=uniform_floor_weight,
+            min_density=min_density,
+        )
 
     def _match_groups(self, result: FaceSetComparisonResult) -> dict[str, list[float]]:
         groups: dict[str, list[float]] = {
@@ -902,11 +1286,11 @@ class FaceSetComparisonDialog(QDialog):
         groups = self._match_groups(result)
         all_values = [item.similarity for item in result.matches]
         support, note = self._has_statistical_support(all_values)
-        lower = min(0.0, min(all_values)) if all_values else 0.0
-        upper = max(1.0, max(all_values)) if all_values else 1.0
-        if upper - lower < 0.2:
-            lower -= 0.1
-            upper += 0.1
+        lower, upper = _expanded_score_range(
+            all_values,
+            observed_score=result.summary.best_similarity,
+            minimum_span=0.2,
+        )
         resamples = self._bootstrap_resamples()
         alpha = self._bootstrap_alpha()
         overall_stats: dict[str, float | None] = {
@@ -937,7 +1321,13 @@ class FaceSetComparisonDialog(QDialog):
             label, color = palettes.get(classification, (classification, "#334155"))
             class_support, class_note = self._has_statistical_support(values)
             if class_support:
-                kde_x, kde_y = self._kde_curve(values, lower=lower, upper=upper)
+                kde_x, kde_y = self._kde_curve(
+                    values,
+                    lower=lower,
+                    upper=upper,
+                    density_method=self._config.likelihood_ratio.density_estimator,
+                    bandwidth_scale=self._config.likelihood_ratio.kde_bandwidth_scale,
+                )
                 mean_value = float(np.mean(values))
                 median_value = float(np.median(values))
                 quartiles = np.quantile(np.asarray(values, dtype=np.float64), [0.25, 0.75], method="linear")
@@ -978,6 +1368,9 @@ class FaceSetComparisonDialog(QDialog):
             return
         summary = result.summary
         series_list, (support, note), overall_stats = self._distribution_analysis(result)
+        significance = self._significance_input.value()
+        confidence_level = max(0.0, 100.0 - significance)
+        group_test = self._quality_group_comparison_test(result)
         dialog = self._create_popup("Resumo estatístico", 980, 760)
         layout = QVBoxLayout(dialog)
         if support:
@@ -990,10 +1383,14 @@ class FaceSetComparisonDialog(QDialog):
                 ),
                 ("Atribuições", str(summary.assignment_matches)),
                 ("Candidatas", str(summary.candidate_matches)),
+                ("Significância", f"{significance:.2f}%"),
                 ("Média", self._format_optional_float(overall_stats["mean"])),
                 ("Mediana", self._format_optional_float(overall_stats["median"])),
                 ("Q1 / Q3", f"{self._format_optional_float(overall_stats['q1'])} / {self._format_optional_float(overall_stats['q3'])}"),
-                ("IC bootstrap", f"{self._format_optional_float(overall_stats['ci_low'])} .. {self._format_optional_float(overall_stats['ci_high'])}"),
+                (
+                    f"IC bootstrap ({confidence_level:.2f}%)",
+                    f"{self._format_optional_float(overall_stats['ci_low'])} .. {self._format_optional_float(overall_stats['ci_high'])}",
+                ),
             ]
             for index, (title, value) in enumerate(cards):
                 metrics.addWidget(self._create_metric_card(title, value), index // 4, index % 4)
@@ -1010,11 +1407,23 @@ class FaceSetComparisonDialog(QDialog):
                             f"Faces selecionadas: Padrão {summary.set_a_selected_faces} | "
                             f"Questionado {summary.set_b_selected_faces}"
                         ),
+                        f"Significância configurada para o IC bootstrap: {significance:.2f}%",
                     ]
                 )
             )
             info.setMaximumHeight(180)
             layout.addWidget(info)
+        group_test_browser = QTextBrowser(dialog)
+        group_test_browser.setPlainText(
+            "\n".join(
+                self._group_comparison_summary_lines(
+                    group_test,
+                    significance_percent=significance,
+                )
+            )
+        )
+        group_test_browser.setMaximumHeight(210)
+        layout.addWidget(group_test_browser)
         class_notes = QTextBrowser(dialog)
         class_notes.setPlainText(
             "\n".join(
@@ -1028,7 +1437,39 @@ class FaceSetComparisonDialog(QDialog):
         layout.addWidget(class_notes)
         layout.addWidget(QLabel("Procedimento e configuração usada"))
         browser = QTextBrowser(dialog)
-        browser.setPlainText("\n".join(result.procedure_details))
+        browser.setPlainText(
+            "\n".join(
+                [
+                    *result.procedure_details,
+                    (
+                        f"[Resumo estatístico] IC bootstrap da média com "
+                        f"{self._bootstrap_resamples()} reamostragens e significância de {significance:.2f}% "
+                        f"(confiança nominal aproximada de {confidence_level:.2f}%)."
+                    ),
+                    (
+                        "[Resumo estatístico] O IC é obtido por bootstrap percentílico não paramétrico, "
+                        "reamostrando com reposição os scores observados."
+                    ),
+                    (
+                        "[Resumo estatístico] Comparação não paramétrica entre grupos por U de Mann-Whitney "
+                        "bilateral sobre a qualidade facial das faces selecionadas."
+                    ),
+                    (
+                        "[Resumo estatístico] Resultado do teste: "
+                        f"U={self._format_optional_float(group_test.u_statistic)} | "
+                        f"p={self._format_p_value(group_test.p_value)} | "
+                        f"rb={self._format_optional_float(group_test.rank_biserial)} | "
+                        f"{'significativo' if group_test.significant else 'não significativo'} "
+                        f"ao nível de {significance:.2f}%."
+                        if group_test.available
+                        else (
+                            "[Resumo estatístico] "
+                            f"{group_test.note or 'Teste U de Mann-Whitney indisponível.'}"
+                        )
+                    ),
+                ]
+            )
+        )
         layout.addWidget(browser, stretch=1)
         dialog.exec()
 
@@ -1052,370 +1493,7 @@ class FaceSetComparisonDialog(QDialog):
         dialog.exec()
 
     def _comparison_help_html(self) -> str:
-        image_extensions = ", ".join(self._config.media.image_extensions)
-        det_size = (
-            f"{self._config.face_model.det_size[0]}x{self._config.face_model.det_size[1]}"
-            if self._config.face_model.det_size is not None
-            else "resolução original do quadro"
-        )
-        providers = (
-            ", ".join(self._config.face_model.providers)
-            if self._config.face_model.providers
-            else "seleção automática com preferência por GPU e fallback para CPU"
-        )
-        return f"""
-<html>
-<head>
-<style>
-body {{
-    font-family: 'Segoe UI', sans-serif;
-    color: #0f172a;
-    line-height: 1.45;
-}}
-h1 {{
-    font-size: 22px;
-    color: #0f172a;
-    margin: 0 0 10px 0;
-}}
-h2 {{
-    font-size: 17px;
-    color: #0f766e;
-    margin: 18px 0 6px 0;
-}}
-h3 {{
-    font-size: 14px;
-    color: #334155;
-    margin: 14px 0 4px 0;
-}}
-p, li {{
-    font-size: 13px;
-}}
-code {{
-    background: #f1f5f9;
-    padding: 1px 4px;
-    border-radius: 4px;
-}}
-table {{
-    border-collapse: collapse;
-    width: 100%;
-    margin-top: 8px;
-}}
-th, td {{
-    border: 1px solid #d7e0ea;
-    padding: 6px 8px;
-    text-align: left;
-    vertical-align: top;
-}}
-th {{
-    background: #eef4fa;
-}}
-</style>
-</head>
-<body>
-<h1>Ajuda da comparação entre grupos faciais</h1>
-<p>
-Esta janela compara dois conjuntos de imagens faciais, normalmente um conjunto de referência
-(<b>Padrão</b>) e um conjunto sob exame (<b>Questionado</b>). O sistema processa as imagens,
-seleciona faces elegíveis, compara as representações faciais e organiza o resultado em saídas auditáveis.
-</p>
-
-<h2>Objetivo da janela</h2>
-<ul>
-    <li>Comparar diretamente dois grupos de imagens faciais.</li>
-    <li>Classificar os pares por nível de interesse: atribuição, candidata ou abaixo do limiar.</li>
-    <li>Exibir medidas descritivas e inferenciais quando houver repetição e variabilidade suficientes.</li>
-    <li>Aplicar razão de verossimilhança calibrada quando houver base LR ou modelo LR salvo.</li>
-    <li>Gerar artefatos exportáveis, logs e trilha de auditoria da execução.</li>
-</ul>
-
-<h2>Fluxo recomendado de uso</h2>
-<ol>
-    <li>Adicione as imagens do grupo <b>Padrão</b>.</li>
-    <li>Adicione as imagens do grupo <b>Questionado</b>.</li>
-    <li>Confirme o <b>Diretório de trabalho</b>.</li>
-    <li>Se necessário, informe a <b>Base de calibração LR</b> ou carregue um <b>Modelo de calibração LR</b>.</li>
-    <li>Clique em <b>Comparar conjuntos</b>.</li>
-    <li>Ao final, revise <b>Resumo estatístico</b>, <b>Correspondências</b> e, se houver, <b>Razão de verossimilhança</b>.</li>
-    <li>Se a calibração for útil para execuções futuras, preserve o JSON salvo automaticamente ou use <b>Salvar modelo LR</b>.</li>
-</ol>
-
-<h2>Controles principais</h2>
-<table>
-    <tr><th>Controle</th><th>Função</th><th>Orientação</th></tr>
-    <tr>
-        <td><b>Padrão</b></td>
-        <td>Grupo de referência usado como fonte das faces do conjunto A.</td>
-        <td>Use imagens representativas e bem documentadas. Extensões aceitas nesta configuração: <code>{escape(image_extensions)}</code>.</td>
-    </tr>
-    <tr>
-        <td><b>Questionado</b></td>
-        <td>Grupo examinado, tratado como conjunto B na comparação.</td>
-        <td>Mantenha apenas material pertinente à hipótese examinada para evitar inflar o número de pares sem necessidade.</td>
-    </tr>
-    <tr>
-        <td><b>Adicionar imagens</b></td>
-        <td>Inclui novos arquivos no grupo.</td>
-        <td>Ideal para montar o conjunto de forma incremental.</td>
-    </tr>
-    <tr>
-        <td><b>Remover selecionadas</b></td>
-        <td>Retira apenas os itens marcados na lista.</td>
-        <td>Útil para limpar erros de seleção sem reiniciar tudo.</td>
-    </tr>
-    <tr>
-        <td><b>Limpar</b></td>
-        <td>Esvazia completamente o grupo correspondente.</td>
-        <td>Use quando quiser reiniciar a montagem do conjunto.</td>
-    </tr>
-    <tr>
-        <td><b>Diretório de trabalho</b></td>
-        <td>Local em que a execução grava logs, tabelas, gráficos, JSONs, ZIP e demais artefatos.</td>
-        <td>Escolha uma pasta com espaço suficiente e preservável para auditoria posterior.</td>
-    </tr>
-    <tr>
-        <td><b>Base de calibração LR (opcional)</b></td>
-        <td>Diretório com uma subpasta por identidade rotulada, usado para estimar as distribuições de mesma origem e de origem distinta.</td>
-        <td>É a opção mais completa, mas também a mais custosa em tempo de processamento.</td>
-    </tr>
-    <tr>
-        <td><b>Modelo de calibração LR (opcional)</b></td>
-        <td>Arquivo JSON com o modelo LR já calculado em execução anterior.</td>
-        <td>Se a base de calibração não mudou, esta é a forma recomendada de reaproveitar a LR sem recalcular tudo.</td>
-    </tr>
-    <tr>
-        <td><b>Comparar conjuntos</b></td>
-        <td>Inicia o pipeline da comparação.</td>
-        <td>Durante a execução, os controles de entrada são bloqueados para manter a consistência do procedimento.</td>
-    </tr>
-    <tr>
-        <td><b>Ajuda</b></td>
-        <td>Abre este painel explicativo.</td>
-        <td>Use-o como referência rápida operacional e interpretativa.</td>
-    </tr>
-    <tr>
-        <td><b>Exportar ZIP</b></td>
-        <td>Compacta o diretório de execução concluída.</td>
-        <td>Útil para preservação do procedimento e circulação controlada dos artefatos.</td>
-    </tr>
-    <tr>
-        <td><b>Abrir execução</b></td>
-        <td>Abre a pasta da execução atual.</td>
-        <td>Permite acessar diretamente os arquivos exportados, logs e modelos LR.</td>
-    </tr>
-</table>
-
-<h2>Barra de resultados</h2>
-<table>
-    <tr><th>Controle</th><th>Uso</th><th>Leitura</th></tr>
-    <tr>
-        <td><b>Reamostragens</b></td>
-        <td>Quantidade de amostras bootstrap usada nos intervalos de confiança.</td>
-        <td>Valores maiores tendem a estabilizar a inferência, porém aumentam o custo computacional.</td>
-    </tr>
-    <tr>
-        <td><b>Significância (%)</b></td>
-        <td>Nível de significância aplicado à inferência bootstrap.</td>
-        <td>Por exemplo, 5% produz um intervalo bilateral aproximado de 95%.</td>
-    </tr>
-    <tr>
-        <td><b>Resumo estatístico</b></td>
-        <td>Mostra contagens, média, mediana, quartis, IC bootstrap e procedimento.</td>
-        <td>É o melhor ponto de partida para avaliar robustez quantitativa da execução.</td>
-    </tr>
-    <tr>
-        <td><b>Distribuição</b></td>
-        <td>Exibe curvas KDE por classe decisória e marcadores dos limiares.</td>
-        <td>Ajuda a visualizar dispersão, separação entre classes e estabilidade dos scores.</td>
-    </tr>
-    <tr>
-        <td><b>Entradas processadas</b></td>
-        <td>Lista arquivo a arquivo com detectadas, selecionadas, tracks, keyframes e estado.</td>
-        <td>É a saída primária para auditoria operacional e checagem de aproveitamento das imagens.</td>
-    </tr>
-    <tr>
-        <td><b>Correspondências</b></td>
-        <td>Mostra o ranking dos pares comparados.</td>
-        <td>É a saída central para revisão pericial; deve ser lida junto com a inspeção visual.</td>
-    </tr>
-    <tr>
-        <td><b>Malha biométrica</b></td>
-        <td>Mostra a tabela de correspondências com as imagens/derivados associados ao par selecionado.</td>
-        <td>Serve para revisar contexto, recorte, qualidade, keyframe e coerência visual do par.</td>
-    </tr>
-    <tr>
-        <td><b>Razão de verossimilhança</b></td>
-        <td>Exibe estado da calibração LR, densidades H1/H2 e a tabela com <code>LR</code>, <code>log10(LR)</code> e evidência.</td>
-        <td>Use quando a execução estiver calibrada e a base ou modelo LR forem tecnicamente compatíveis com o caso.</td>
-    </tr>
-    <tr>
-        <td><b>Salvar modelo LR</b></td>
-        <td>Salva manualmente o modelo LR corrente em JSON.</td>
-        <td>Disponível apenas depois de uma execução com calibração LR.</td>
-    </tr>
-</table>
-
-<h2>Pipeline técnico resumido</h2>
-<h3>1. Preparação e leitura das imagens</h3>
-<p>
-As imagens dos dois grupos são abertas individualmente e registradas como entradas processadas. A comparação não trabalha
-com a “pasta inteira” como uma única unidade, mas com as faces elegíveis encontradas em cada arquivo.
-</p>
-
-<h3>2. Detecção, filtros e extração facial</h3>
-<p>
-O backend atual é <code>{escape(self._config.face_model.backend)}</code>, com modelo
-<code>{escape(self._config.face_model.model_name)}</code>, tamanho de detecção
-<code>{escape(det_size)}</code>, qualidade mínima
-<code>{self._config.face_model.minimum_face_quality:.2f}</code>, tamanho mínimo de face
-<code>{self._config.face_model.minimum_face_size_pixels}px</code>, <code>ctx_id={self._config.face_model.ctx_id}</code>
-e providers configurados como <code>{escape(providers)}</code>.
-</p>
-<p>
-Cada imagem passa por detecção facial, filtros de qualidade e tamanho, seleção de ocorrências elegíveis e geração de embeddings.
-Faces inelegíveis podem ser descartadas antes da comparação propriamente dita.
-</p>
-
-<h3>3. Comparação entre Padrão e Questionado</h3>
-<p>
-Depois da seleção das faces válidas, o sistema compara cada face elegível do grupo Padrão com cada face elegível do grupo
-Questionado. Em termos práticos, o número de comparações cresce aproximadamente com
-<code>faces_padrão × faces_questionado</code>.
-</p>
-
-<h3>4. Similaridade e classes decisórias</h3>
-<p>
-Cada par recebe uma similaridade facial. Em seguida, o sistema o classifica segundo os limiares de decisão da configuração:
-</p>
-<ul>
-    <li><b>Atribuição</b>: resultado que atinge o limiar principal de atribuição.</li>
-    <li><b>Candidata</b>: resultado abaixo da atribuição, mas acima do limiar de sugestão investigativa.</li>
-    <li><b>Abaixo do limiar</b>: resultado que não atingiu o patamar mínimo de interesse definido.</li>
-</ul>
-<p>
-Na configuração carregada nesta sessão, o limiar de atribuição é
-<code>{self._config.clustering.assignment_similarity:.2f}</code> e o limiar de sugestão é
-<code>{self._config.clustering.candidate_similarity:.2f}</code>.
-</p>
-
-<h3>5. Inferência estatística</h3>
-<p>
-Se houver número suficiente de repetições e variabilidade entre os valores, a janela calcula média, mediana, quartis,
-intervalo de confiança bootstrap e densidades KDE. Se a amostra for pequena demais ou quase constante, a interface informa
-que a inferência não pôde ser apresentada.
-</p>
-
-<h3>6. Calibração por razão de verossimilhança (LR)</h3>
-<p>
-Quando uma base rotulada ou um modelo LR salvo é informado, o sistema pode calibrar a interpretação do score. Em vez de
-usar apenas a similaridade bruta, ele estima o quanto aquele valor é compatível com:
-</p>
-<ul>
-    <li><b>H1</b>: mesma origem.</li>
-    <li><b>H2</b>: origem distinta.</li>
-</ul>
-<p>
-Se a base rotulada for usada, o sistema gera scores de mesma origem e origem distinta a partir das subpastas-identidade,
-ajusta densidades e calcula <code>LR</code> e <code>log10(LR)</code> para os pares do caso.
-Se um modelo salvo for carregado, essa etapa é reaproveitada sem recalcular toda a base.
-</p>
-<p><b>Importante:</b> se a base rotulada e o modelo salvo forem informados ao mesmo tempo, o <b>modelo salvo tem prioridade</b>.</p>
-
-<h2>Interpretação dos campos principais</h2>
-<h3>Similaridade</h3>
-<p>
-É a medida comparativa bruta entre os embeddings das duas faces. Similaridade alta indica maior proximidade no espaço do
-modelo, mas não equivale, isoladamente, a identificação conclusiva.
-</p>
-
-<h3>Classe</h3>
-<p>
-A classe mostra a posição do par em relação aos limiares. <b>Atribuição</b> representa um resultado mais forte do que
-<b>Candidata</b>, porém ambos exigem revisão humana. <b>Abaixo do limiar</b> indica que o par não atingiu o patamar mínimo
-de interesse configurado.
-</p>
-
-<h3>Qualidade</h3>
-<p>
-As colunas de qualidade ajudam a julgar o valor prático do par. Um score alto vindo de faces ruins pede cautela extra; um
-score moderado vindo de material ruim também pode estar artificialmente deprimido pela qualidade da entrada.
-</p>
-
-<h3>Resumo estatístico</h3>
-<p>
-Use esta janela para verificar quantos pares foram comparados, quantos ultrapassaram os limiares, se houve suporte
-suficiente para inferência e como a distribuição geral se comporta.
-</p>
-
-<h3>Distribuição</h3>
-<p>
-As curvas KDE ajudam a enxergar concentração, separação e dispersão dos scores. Curvas muito sobrepostas sugerem menor
-separação prática; curvas mais apartadas indicam comportamento mais estável dos resultados.
-</p>
-
-<h3>Entradas processadas</h3>
-<p>
-É a visão mais importante para auditoria do processamento. Antes de interpretar qualquer ranking, vale conferir se as
-imagens relevantes foram realmente aproveitadas, quantas faces foram detectadas e se houve erro em algum arquivo.
-</p>
-
-<h3>Correspondências</h3>
-<p>
-O ranking organiza os pares mais relevantes da comparação. Em geral, a revisão começa pelos primeiros itens, mas a ordem
-não substitui a análise pericial do contexto e da qualidade do material.
-</p>
-
-<h3>Malha biométrica</h3>
-<p>
-Esta visualização integra números e imagem. Ela serve para inspeção qualitativa do par selecionado, verificando contexto,
-recorte, qualidade, keyframe e coerência geral do material exibido.
-</p>
-
-<h3>LR, log10(LR) e evidência</h3>
-<ul>
-    <li><code>LR &gt; 1</code> favorece a hipótese de mesma origem.</li>
-    <li><code>LR &lt; 1</code> favorece a hipótese de origem distinta.</li>
-    <li><code>log10(LR) = 0</code> é aproximadamente neutro entre H1 e H2.</li>
-    <li><code>log10(LR) &gt; 0</code> favorece mesma origem; quanto maior, mais forte o suporte.</li>
-    <li><code>log10(LR) &lt; 0</code> favorece origem distinta; quanto menor, mais forte o suporte para H2.</li>
-</ul>
-<p>
-O rótulo textual de <b>Evidência</b> resume essa magnitude. Ainda assim, a força da LR depende da adequação da base ou do
-modelo LR ao pipeline realmente usado no caso.
-</p>
-
-<h2>Quando reutilizar um modelo LR salvo</h2>
-<ul>
-    <li>Quando a base de calibração é a mesma.</li>
-    <li>Quando backend, modelo facial, thresholds e condições operacionais continuam compatíveis.</li>
-    <li>Quando o objetivo é comparar novos grupos Padrão/Questionado sem recalcular a calibração inteira.</li>
-</ul>
-<p>
-Se houver mudança material na base rotulada, no pipeline ou na configuração, o mais prudente é recalibrar.
-</p>
-
-<h2>Cautelas periciais e boas práticas</h2>
-<ul>
-    <li>Não trate o resultado automático como prova conclusiva de identidade.</li>
-    <li>Combine leitura numérica, revisão visual e contexto do caso.</li>
-    <li>Leve em conta a qualidade das faces antes de valorar a força de um par.</li>
-    <li>Ao usar LR, confirme se a calibração estava realmente disponível e com suporte suficiente.</li>
-    <li>Preserve o diretório de execução ou o ZIP exportado como parte da trilha de auditoria.</li>
-</ul>
-
-<h2>Arquivos gerados e rastreabilidade</h2>
-<p>
-Cada execução grava um diretório próprio com logs, tabelas, resumos, artefatos de imagem e, quando aplicável, arquivos da
-calibração LR. O botão <b>Abrir execução</b> leva diretamente a essa pasta, e <b>Exportar ZIP</b> permite empacotá-la.
-</p>
-
-<h2>Se a distribuição ou a LR não aparecerem</h2>
-<p>
-As saídas inferenciais podem ficar indisponíveis quando houver amostra insuficiente, variabilidade muito baixa, calibração
-ausente ou base/modelo LR sem suporte suficiente. Nesses casos, os popups e o log informam o motivo de forma explícita.
-</p>
-</body>
-</html>
-"""
+        return build_face_set_comparison_help_html(self._config)
 
     def _open_distribution_popup(self) -> None:
         result = self._require_result("Distribuição de similaridades")
@@ -1431,6 +1509,7 @@ ausente ou base/modelo LR sem suporte suficiente. Nesses casos, os popups e o lo
                 series_list,
                 candidate_threshold=summary.candidate_threshold,
                 assignment_threshold=summary.assignment_threshold,
+                observed_score=summary.best_similarity,
                 mean_value=overall_stats["mean"],
                 ci_low=overall_stats["ci_low"],
                 ci_high=overall_stats["ci_high"],
@@ -1441,7 +1520,7 @@ ausente ou base/modelo LR sem suporte suficiente. Nesses casos, os popups e o lo
             info.setPlainText(
                 "\n".join(
                     [
-                        "A distribuição KDE não será exibida para esta comparação.",
+                        "A curva de densidade não será exibida para esta comparação.",
                         note or "Amostra insuficiente.",
                         f"Comparações disponíveis: {summary.total_pair_comparisons}",
                     ]
@@ -1452,7 +1531,15 @@ ausente ou base/modelo LR sem suporte suficiente. Nesses casos, os popups e o lo
         caption.setPlainText(
             "\n".join(
                 [
-                    "Curvas KDE separadas por classe de decisão.",
+                    "Curvas de densidade não paramétricas separadas por classe de decisão.",
+                    (
+                        "Linha tracejada azul: melhor escore observado no ranking atual "
+                        f"({self._format_optional_float(summary.best_similarity)})."
+                    ),
+                    (
+                        f"As estatísticas desta janela resumem todos os {summary.total_pair_comparisons} "
+                        "pares comparados entre Padrão e Questionado."
+                    ),
                     f"Reamostragens bootstrap: {self._bootstrap_resamples()}",
                     f"Nível de significância: {self._significance_input.value():.2f}%",
                     f"Média: {self._format_optional_float(overall_stats['mean'])}",
@@ -1469,7 +1556,7 @@ ausente ou base/modelo LR sem suporte suficiente. Nesses casos, os popups e o lo
                     "",
                     *[
                         f"{series.label}: n={len(series.values)} | "
-                        f"{'KDE exibida' if series.sufficient else series.note}"
+                        f"{'curva exibida' if series.sufficient else series.note}"
                         for series in series_list
                     ],
                 ]
@@ -1491,19 +1578,28 @@ ausente ou base/modelo LR sem suporte suficiente. Nesses casos, os popups e o lo
             return [], summary.support_note or "A base de calibração não teve suporte suficiente."
         settings = calibration.settings_snapshot or self._config.likelihood_ratio
 
-        lower = min(-1.0, min([*calibration.genuine_scores, *calibration.impostor_scores]))
-        upper = max(1.0, max([*calibration.genuine_scores, *calibration.impostor_scores]))
+        lower, upper = _expanded_score_range(
+            [*calibration.genuine_scores, *calibration.impostor_scores],
+            observed_score=result.summary.best_similarity,
+            minimum_span=0.2,
+        )
         same_x, same_y = self._kde_curve(
             calibration.genuine_scores,
             lower=lower,
             upper=upper,
             bandwidth_scale=settings.kde_bandwidth_scale,
+            density_method=settings.density_estimator,
+            uniform_floor_weight=settings.kde_uniform_floor_weight,
+            min_density=settings.kde_min_density,
         )
         diff_x, diff_y = self._kde_curve(
             calibration.impostor_scores,
             lower=lower,
             upper=upper,
             bandwidth_scale=settings.kde_bandwidth_scale,
+            density_method=settings.density_estimator,
+            uniform_floor_weight=settings.kde_uniform_floor_weight,
+            min_density=settings.kde_min_density,
         )
         return (
             [
@@ -1567,7 +1663,7 @@ ausente ou base/modelo LR sem suporte suficiente. Nesses casos, os popups e o lo
                 "Scores Padrão/Questionado (origem distinta)",
                 f"{calibration_summary.impostor_score_count}/{calibration_summary.impostor_pair_total}",
             ),
-            ("Ajuste KDE", "pronto" if calibration_summary.support_ready else "indisponível"),
+            ("Ajuste de densidade", "pronto" if calibration_summary.support_ready else "indisponível"),
             ("Pares calibrados", str(result.summary.calibrated_matches)),
             ("Média log10(LR)", self._format_optional_float(result.summary.mean_log10_likelihood_ratio)),
             ("Mediana log10(LR)", self._format_optional_float(result.summary.median_log10_likelihood_ratio)),
@@ -1593,6 +1689,19 @@ ausente ou base/modelo LR sem suporte suficiente. Nesses casos, os popups e o lo
             )
         if calibration_summary.smoothing_note:
             info_lines.append(f"Estabilização: {calibration_summary.smoothing_note}")
+        if result.matches:
+            info_lines.append(
+                "Linha tracejada azul: acompanha a linha selecionada na tabela de confrontos "
+                "e, ao abrir esta janela, inicia no primeiro item do ranking."
+            )
+            info_lines.append(
+                "Barras translúcidas: histograma dos scores brutos observados; "
+                "curvas preenchidas: densidade suavizada usada na calibração LR."
+            )
+            info_lines.append(
+                "Leitura do LR no gráfico: no score da linha tracejada, o sistema calcula "
+                "LR = altura da curva H1 / altura da curva H2."
+            )
         if calibration.settings_snapshot is not None:
             settings = calibration.settings_snapshot
             info_lines.append(
@@ -1604,7 +1713,8 @@ ausente ou base/modelo LR sem suporte suficiente. Nesses casos, os popups e o lo
                 f"min_distintos={settings.minimum_unique_scores_per_distribution}"
             )
             info_lines.append(
-                "Parâmetros KDE: "
+                "Parâmetros do estimador: "
+                f"metodo={score_density_method_label(settings.density_estimator)} | "
                 f"banda_x={settings.kde_bandwidth_scale:.3f} | "
                 f"piso_uniforme={settings.kde_uniform_floor_weight:.4%} | "
                 f"densidade_minima={settings.kde_min_density:.1e}"
@@ -1616,16 +1726,42 @@ ausente ou base/modelo LR sem suporte suficiente. Nesses casos, os popups e o lo
         series, note = self._likelihood_ratio_series(result)
         if series:
             density_widget = LikelihoodRatioDensityWidget(dialog)
-            density_widget.set_series(series)
+            density_widget.set_series(series, observed_score=result.summary.best_similarity)
             layout.addWidget(density_widget, stretch=1)
+            selection_label = QLabel(dialog)
+            selection_label.setObjectName("SectionHint")
+            selection_label.setTextFormat(Qt.RichText)
+            selection_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            selection_label.setWordWrap(True)
+            layout.addWidget(selection_label)
         else:
             density_info = QTextBrowser(dialog)
             density_info.setPlainText(note or "A densidade calibrada não está disponível.")
             layout.addWidget(density_info)
+            selection_label = None
 
         table = self._create_matches_table(dialog)
         self._populate_matches_table(table, result)
         layout.addWidget(table, stretch=1)
+        if series:
+            table.itemSelectionChanged.connect(
+                lambda: self._sync_likelihood_ratio_selection(
+                    result=result,
+                    table=table,
+                    density_widget=density_widget,
+                    selection_label=selection_label,
+                    series=series,
+                )
+            )
+            if result.matches:
+                table.selectRow(0)
+            self._sync_likelihood_ratio_selection(
+                result=result,
+                table=table,
+                density_widget=density_widget,
+                selection_label=selection_label,
+                series=series,
+            )
         dialog.exec()
 
     def _open_inputs_popup(self) -> None:
@@ -1855,6 +1991,58 @@ ausente ou base/modelo LR sem suporte suficiente. Nesses casos, os popups e o lo
 
     def _format_optional_float(self, value: float | None) -> str:
         return "-" if value is None else f"{value:.4f}"
+
+    def _format_p_value(self, value: float | None) -> str:
+        if value is None:
+            return "-"
+        if value < 1e-4:
+            return f"{value:.2e}"
+        return f"{value:.6f}"
+
+    def _selected_match_from_table(
+        self,
+        *,
+        table: QTableWidget,
+        result: FaceSetComparisonResult,
+    ) -> FaceSetComparisonMatch | None:
+        selected = table.selectedRanges()
+        if not selected:
+            return result.matches[0] if result.matches else None
+        row = selected[0].topRow()
+        rank_item = table.item(row, 0)
+        match_index = int(rank_item.data(Qt.UserRole)) if rank_item and rank_item.data(Qt.UserRole) is not None else row
+        if 0 <= match_index < len(result.matches):
+            return result.matches[match_index]
+        return result.matches[0] if result.matches else None
+
+    def _sync_likelihood_ratio_selection(
+        self,
+        *,
+        result: FaceSetComparisonResult,
+        table: QTableWidget,
+        density_widget: LikelihoodRatioDensityWidget,
+        selection_label: QLabel | None,
+        series: list[_DistributionSeries],
+    ) -> None:
+        match = self._selected_match_from_table(table=table, result=result)
+        observed_score = match.similarity if match is not None else None
+        density_widget.set_series(series, observed_score=observed_score)
+        if selection_label is None:
+            return
+        if match is None:
+            selection_label.setText(_likelihood_ratio_selection_html(None))
+            return
+        left = self._entry_by_id.get(match.left_entry_id)
+        right = self._entry_by_id.get(match.right_entry_id)
+        left_name = left.source_path.name if left is not None else "-"
+        right_name = right.source_path.name if right is not None else "-"
+        selection_label.setText(
+            _likelihood_ratio_selection_html(
+                match,
+                left_name=left_name,
+                right_name=right_name,
+            )
+        )
 
     def _classification_label(self, classification: str) -> str:
         if classification == "assignment":

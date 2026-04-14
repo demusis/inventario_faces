@@ -22,37 +22,39 @@ from inventario_faces.domain.entities import (
     BoundingBox,
     FaceCluster,
     FaceOccurrence,
+    FaceSearchQuery,
+    FaceSearchQueryEvent,
+    FaceSearchResult,
+    FaceSearchSummary,
     FaceSizeStatistics,
     FaceTrack,
     FileRecord,
     InventoryResult,
     KeyFrame,
-    MediaInfoAttribute,
-    MediaInfoTrack,
     MediaType,
     ProcessingSummary,
     ReportArtifacts,
     SearchArtifacts,
     TrackQualityStatistics,
 )
-from inventario_faces.reporting.docx_renderer import DocxReportGenerator
+from inventario_faces.reporting.face_search_docx_renderer import FaceSearchDocxReportGenerator
+from inventario_faces.reporting.face_search_latex_renderer import FaceSearchLatexReportGenerator
 
 
-class DocxReportGeneratorTests(unittest.TestCase):
-    def test_generate_docx_report_with_main_sections(self) -> None:
+class _UnusedCompiler:
+    def compile(self, tex_path: Path) -> Path:
+        return tex_path.with_suffix(".pdf")
+
+
+class FaceSearchReportGeneratorTests(unittest.TestCase):
+    def test_docx_report_lists_rejected_query_files(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             logs_dir = root / "logs"
             logs_dir.mkdir(parents=True, exist_ok=True)
-            (logs_dir / "run.log").write_text("linha de log", encoding="utf-8")
+            generator = FaceSearchDocxReportGenerator(self._config())
 
-            generator = DocxReportGenerator(self._config())
-            result = self._result(root, logs_dir)
-
-            artifacts = generator.generate(result)
-
-            self.assertIsNotNone(artifacts.docx_path)
-            self.assertTrue(artifacts.docx_path.exists())
+            artifacts = generator.generate(self._result(root, logs_dir))
 
             document = Document(str(artifacts.docx_path))
             full_text = "\n".join(paragraph.text for paragraph in document.paragraphs)
@@ -62,34 +64,32 @@ class DocxReportGeneratorTests(unittest.TestCase):
                 for row in table.rows
                 for cell in row.cells
             )
-            self.assertIn("Resumo Executivo", full_text)
-            self.assertIn("Metodologia", full_text)
-            self.assertIn("Anexo técnico", full_text)
-            self.assertIn("Metadados técnicos da mídia", full_text)
-            self.assertIn("Estatísticas de tamanho das faces", full_text)
-            self.assertLess(
-                full_text.index("Estatísticas de tamanho das faces"),
-                full_text.index("Anexo técnico"),
-            )
-            self.assertNotIn("Quadro consolidado de relações intergrupos para revisão", full_text)
-            self.assertNotIn("Galeria Visual por Grupo", full_text)
-            self.assertIn("Inventario Faces", full_text)
-            self.assertIn("Emitido em", full_text)
-            self.assertIn("Acesso em: 4 abr. 2026.", full_text)
-            self.assertIn("https://github.com/demusis/inventario_faces", full_text)
-            self.assertIn("similaridade média entre tracks=n/a (grupo unitário)", full_text)
-            self.assertIn("Arquivo de origem: evidencia.mp4", full_text)
-            self.assertIn("Intervalo temporal do track: 00:00:10.000 - 00:00:10.000", full_text)
-            self.assertIn("Faixa de quadros do track: 000010 - 000010", full_text)
-            self.assertIn("Quadro de referência selecionado para representar o track: 000010", full_text)
-            self.assertIn("Motivos da seleção da referência: início do track, pico de qualidade", full_text)
+            self.assertIn("Arquivos de Consulta Informados", full_text)
+            self.assertIn("consulta_corrompida.jpg", full_text)
+            self.assertIn("MediaDecodeError - Nao foi possivel ler a imagem", full_text)
+            self.assertIn("Situação da consulta: Descartada", full_text)
+
+    def test_latex_report_lists_rejected_query_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            logs_dir = root / "logs"
+            logs_dir.mkdir(parents=True, exist_ok=True)
+            generator = FaceSearchLatexReportGenerator(self._config(), _UnusedCompiler())
+
+            artifacts = generator.generate(self._result(root, logs_dir))
+
+            tex_content = artifacts.tex_path.read_text(encoding="utf-8")
+            self.assertIn("Arquivos de Consulta Informados", tex_content)
+            self.assertIn("consulta\\_\\allowbreak{}corrompida.\\allowbreak{}jpg", tex_content)
+            self.assertIn("MediaDecodeError - Nao foi possivel ler a imagem", tex_content)
+            self.assertIn("Situa", tex_content)
 
     def _config(self) -> AppConfig:
         return AppConfig(
             app=AppSettings(
                 name="Inventario Faces",
                 output_directory_name="inventario_faces_output",
-                report_title="Relatório Forense de Inventário Facial",
+                report_title="Relatório de Busca Facial",
                 organization="Laboratório Teste",
                 log_level="INFO",
             ),
@@ -123,7 +123,7 @@ class DocxReportGeneratorTests(unittest.TestCase):
             ),
         )
 
-    def _result(self, root: Path, logs_dir: Path) -> InventoryResult:
+    def _result(self, root: Path, logs_dir: Path) -> FaceSearchResult:
         occurrence = FaceOccurrence(
             occurrence_id="O000001",
             source_path=Path("evidencia.mp4"),
@@ -183,7 +183,7 @@ class DocxReportGeneratorTests(unittest.TestCase):
             source_path=Path("evidencia.mp4"),
             frame_index=10,
             timestamp_seconds=10.0,
-            selection_reasons=("track_start", "quality_peak"),
+            selection_reasons=("track_start",),
             detection_score=0.83,
             embedding=[1.0, 0.0, 0.0],
         )
@@ -194,15 +194,6 @@ class DocxReportGeneratorTests(unittest.TestCase):
             size_bytes=123456,
             discovered_at_utc=datetime.now(UTC),
             modified_at_utc=datetime.now(UTC),
-            media_info_tracks=(
-                MediaInfoTrack(
-                    track_type="Geral",
-                    attributes=(
-                        MediaInfoAttribute(label="Formato", value="MPEG-4"),
-                        MediaInfoAttribute(label="Duração", value="00:00:10.000"),
-                    ),
-                ),
-            ),
         )
         summary = ProcessingSummary(
             total_files=1,
@@ -217,7 +208,7 @@ class DocxReportGeneratorTests(unittest.TestCase):
             total_detected_face_sizes=FaceSizeStatistics(count=1, min_pixels=50, max_pixels=50, mean_pixels=50, stddev_pixels=0),
             selected_face_sizes=FaceSizeStatistics(count=1, min_pixels=50, max_pixels=50, mean_pixels=50, stddev_pixels=0),
         )
-        return InventoryResult(
+        inventory_result = InventoryResult(
             run_directory=root,
             started_at_utc=datetime.now(UTC),
             finished_at_utc=datetime.now(UTC),
@@ -240,6 +231,61 @@ class DocxReportGeneratorTests(unittest.TestCase):
                 track_vector_count=1,
                 cluster_vector_count=1,
             ),
+        )
+        query = FaceSearchQuery(
+            source_path=Path("consulta_valida.jpg"),
+            sha512="b" * 128,
+            detected_face_count=1,
+            selected_track_id="Q001_T000001",
+            selected_occurrence_id="Q001_O000001",
+            selected_keyframe_id="Q001_K000001",
+            crop_path=None,
+            context_image_path=None,
+            quality_score=0.77,
+            query_index=1,
+        )
+        query_events = [
+            FaceSearchQueryEvent(
+                query_index=1,
+                source_path=Path("consulta_valida.jpg"),
+                status="selected",
+                sha512="b" * 128,
+                detected_face_count=1,
+                selected_track_id="Q001_T000001",
+                selected_occurrence_id="Q001_O000001",
+                selected_keyframe_id="Q001_K000001",
+                quality_score=0.77,
+            ),
+            FaceSearchQueryEvent(
+                query_index=2,
+                source_path=Path("consulta_corrompida.jpg"),
+                status="rejected",
+                error_type="MediaDecodeError",
+                error_message="Nao foi possivel ler a imagem: consulta_corrompida.jpg",
+            ),
+        ]
+        return FaceSearchResult(
+            inventory_result=inventory_result,
+            query=query,
+            queries=[query],
+            query_events=query_events,
+            matches=[],
+            summary=FaceSearchSummary(
+                query_faces_detected=1,
+                compatible_clusters=0,
+                compatible_tracks=0,
+                compatible_occurrences=0,
+                compatibility_threshold=0.44,
+                query_image_count=2,
+                query_faces_selected=1,
+                query_images_rejected=1,
+            ),
+            report=ReportArtifacts(
+                tex_path=root / "report" / "relatorio_busca_por_face.tex",
+                pdf_path=None,
+                docx_path=root / "report" / "relatorio_busca_por_face.docx",
+            ),
+            export_path=root / "inventory" / "face_search.json",
         )
 
 

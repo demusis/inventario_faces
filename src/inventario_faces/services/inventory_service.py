@@ -15,7 +15,6 @@ from pathlib import Path
 from typing import Any, Callable
 
 import numpy as np
-from scipy.stats import gaussian_kde
 
 from inventario_faces.domain.config import AppConfig, LikelihoodRatioSettings
 from inventario_faces.domain.entities import (
@@ -30,6 +29,7 @@ from inventario_faces.domain.entities import (
     FaceSetComparisonSummary,
     FaceSearchMatch,
     FaceSearchQuery,
+    FaceSearchQueryEvent,
     FaceSearchResult,
     FaceSearchSummary,
     FaceOccurrence,
@@ -86,6 +86,11 @@ from inventario_faces.services.scanner_service import ScannerService
 from inventario_faces.services.search_service import SearchIndexService
 from inventario_faces.services.tracking_service import FaceTrackingService, TrackingResult
 from inventario_faces.services.video_service import VideoSamplingInfo, VideoService
+from inventario_faces.utils.density_utils import (
+    fit_score_density_model,
+    score_density_method_label,
+    stabilize_score_density,
+)
 from inventario_faces.utils.latex import format_seconds
 from inventario_faces.utils.math_utils import cosine_similarity
 from inventario_faces.utils.path_utils import ensure_directory, file_io_path, safe_stem
@@ -115,6 +120,12 @@ class LocalResumeContext:
     plan_entries: tuple[DistributedPlanEntry, ...]
     completed_items: tuple[dict[str, Any], ...]
     resumed: bool
+
+
+@dataclass(frozen=True)
+class PreparedFaceSearchQuery:
+    query: FaceSearchQuery
+    embedding: list[float]
 
 
 class InventoryService:
@@ -1020,16 +1031,14 @@ class InventoryService:
     def run_face_search(
         self,
         root_directory: Path,
-        query_image_path: Path,
+        query_image_paths: Path | Iterable[Path],
         work_directory: Path | None = None,
         progress_callback: ProgressCallback | None = None,
         log_callback: LogCallback | None = None,
     ) -> FaceSearchResult:
-        """Processa o acervo e pesquisa uma face de consulta contra as tracks indexadas."""
+        """Processa o acervo e pesquisa uma ou mais faces de consulta contra as tracks indexadas."""
 
-        query_path = Path(query_image_path).resolve()
-        if not query_path.exists():
-            raise FileNotFoundError(f"Imagem de consulta nao encontrada: {query_path}")
+        normalized_query_paths = self._normalize_face_search_query_paths(query_image_paths)
 
         def inventory_progress(current: int, total: int, message: str) -> None:
             if progress_callback is None:
@@ -1069,7 +1078,7 @@ class InventoryService:
             )
 
         if progress_callback is not None:
-            progress_callback(88, 100, "Analisando imagem de consulta")
+            progress_callback(88, 100, "Preparando consultas faciais")
 
         logger = build_file_logger(inventory_result.logs_directory, self._config.app.log_level)
         event_logger = StructuredEventLogger(inventory_result.logs_directory / "events.jsonl")
@@ -1080,16 +1089,205 @@ class InventoryService:
                 log_callback,
                 f"[Logs] Texto={inventory_result.logs_directory / 'run.log'} | eventos={inventory_result.logs_directory / 'events.jsonl'}",
             )
-            self._emit_log(logger, log_callback, f"[Busca por face] Imagem de consulta: {query_path}")
-            analyzer = self._face_analyzer_factory()
-            processing_query_path, query_sha512, query_cleanup_path = self._prepare_processing_input(
-                file_path=query_path,
-                media_type=MediaType.IMAGE,
-                file_prefix="[Busca por face]",
-                text_logger=logger,
-                log_callback=log_callback,
+            self._emit_log(
+                logger,
+                log_callback,
+                f"[Busca por faces] Imagens de consulta informadas: {len(normalized_query_paths)}",
             )
+            for index, query_path in enumerate(normalized_query_paths, start=1):
+                self._emit_log(
+                    logger,
+                    log_callback,
+                    f"[Busca por faces] Consulta {index}/{len(normalized_query_paths)}: {query_path}",
+                )
+            analyzer = self._face_analyzer_factory()
+            prepared_queries, detected_face_total, rejected_queries, query_events = self._prepare_face_search_queries(
+                query_paths=normalized_query_paths,
+                inventory_result=inventory_result,
+                analyzer=analyzer,
+                logger=logger,
+                log_callback=log_callback,
+                event_logger=event_logger,
+                progress_callback=progress_callback,
+            )
+
+            if progress_callback is not None:
+                progress_callback(
+                    94,
+                    100,
+                    "Executando busca vetorial das consultas"
+                    if prepared_queries
+                    else "Nenhuma consulta válida; gerando relatório auditável",
+                )
+
+            query_hit_sets = (
+                [
+                    (
+                        prepared.query,
+                        self._search_service.search(
+                            prepared.embedding,
+                            inventory_result.tracks,
+                            inventory_result.clusters,
+                            inventory_result.occurrences,
+                        ),
+                    )
+                    for prepared in prepared_queries
+                ]
+                if prepared_queries
+                else []
+            )
+            matches = self._resolve_face_search_matches(inventory_result, query_hit_sets)
+            summary = FaceSearchSummary(
+                query_faces_detected=detected_face_total,
+                compatible_clusters=len({item.cluster_id for item in matches if item.cluster_id is not None}),
+                compatible_tracks=len(matches),
+                compatible_occurrences=len([item for item in matches if item.occurrence_id is not None]),
+                compatibility_threshold=self._config.clustering.candidate_similarity,
+                query_image_count=len(normalized_query_paths),
+                query_faces_selected=len(prepared_queries),
+                query_images_rejected=rejected_queries,
+            )
+
+            if self._face_search_report_generator is None:
+                raise RuntimeError("Gerador de relatório de busca por faces nao configurado.")
+
+            preliminary = FaceSearchResult(
+                inventory_result=inventory_result,
+                query=prepared_queries[0].query if prepared_queries else None,
+                matches=matches,
+                summary=summary,
+                report=ReportArtifacts(
+                    tex_path=inventory_result.run_directory / "report" / "relatorio_busca_por_face.tex",
+                    pdf_path=None,
+                    docx_path=inventory_result.run_directory / "report" / "relatorio_busca_por_face.docx",
+                ),
+                export_path=export_service.inventory_directory / "face_search.json",
+                queries=[prepared.query for prepared in prepared_queries],
+                query_events=query_events,
+            )
+
+            if progress_callback is not None:
+                progress_callback(97, 100, "Gerando relatórios da busca por faces")
+
+            report_artifacts = self._face_search_report_generator.generate(preliminary)
+            final_result = replace(preliminary, report=report_artifacts)
+            export_service.write_face_search_json(final_result)
+            self._emit_log(
+                logger,
+                log_callback,
+                (
+                    f"[Busca por faces] Consultas válidas={len(prepared_queries)} | "
+                    f"consultas descartadas={rejected_queries} | faces_detectadas={detected_face_total}"
+                ),
+            )
+            self._emit_log(
+                logger,
+                log_callback,
+                (
+                    f"[Busca por faces] Compatibilidades encontradas | grupos={summary.compatible_clusters} | "
+                    f"tracks={summary.compatible_tracks} | ocorrencias={summary.compatible_occurrences}"
+                ),
+            )
+            if not prepared_queries:
+                self._emit_log(
+                    logger,
+                    log_callback,
+                    "[Busca por faces] Nenhuma consulta válida foi selecionada; a busca vetorial foi pulada e o relatório auditável foi gerado com os eventos das consultas.",
+                )
+            event_logger.write(
+                "face_search_finished",
+                query_count=len(normalized_query_paths),
+                selected_queries=len(prepared_queries),
+                rejected_queries=rejected_queries,
+                compatible_clusters=summary.compatible_clusters,
+                compatible_tracks=summary.compatible_tracks,
+                compatible_occurrences=summary.compatible_occurrences,
+                report_pdf=report_artifacts.pdf_path,
+                report_tex=report_artifacts.tex_path,
+                report_docx=report_artifacts.docx_path,
+                export_path=final_result.export_path,
+            )
+            if progress_callback is not None:
+                progress_callback(100, 100, "Busca por faces concluída")
+            return final_result
+        except Exception as exc:
+            error_summary, traceback_text = self._emit_exception(
+                logger,
+                log_callback,
+                "[Busca por faces] Falha fatal",
+                exc,
+                include_traceback_in_callback=True,
+            )
+            event_logger.write(
+                "face_search_failed",
+                query_count=len(normalized_query_paths),
+                error=error_summary,
+                error_type=type(exc).__name__,
+                traceback=traceback_text,
+            )
+            raise
+        finally:
+            close_file_logger(logger)
+
+    def _normalize_face_search_query_paths(
+        self,
+        query_image_paths: Path | Iterable[Path],
+    ) -> list[Path]:
+        if isinstance(query_image_paths, Path):
+            raw_paths = [query_image_paths]
+        else:
+            raw_paths = [Path(path) for path in query_image_paths]
+
+        if not raw_paths:
+            raise ValueError("Selecione ao menos uma imagem de consulta para a busca por faces.")
+
+        normalized: list[Path] = []
+        seen_paths: set[Path] = set()
+        for raw_path in raw_paths:
+            resolved = Path(raw_path).expanduser().resolve()
+            if resolved in seen_paths:
+                continue
+            seen_paths.add(resolved)
+            normalized.append(resolved)
+        return normalized
+
+    def _prepare_face_search_queries(
+        self,
+        *,
+        query_paths: list[Path],
+        inventory_result: InventoryResult,
+        analyzer: FaceAnalyzer,
+        logger: logging.Logger,
+        log_callback: LogCallback | None,
+        event_logger: StructuredEventLogger,
+        progress_callback: ProgressCallback | None,
+    ) -> tuple[list[PreparedFaceSearchQuery], int, int, list[FaceSearchQueryEvent]]:
+        prepared_queries: list[PreparedFaceSearchQuery] = []
+        query_events: list[FaceSearchQueryEvent] = []
+        detected_face_total = 0
+        rejected_queries = 0
+        total_queries = len(query_paths)
+
+        for index, query_path in enumerate(query_paths, start=1):
+            progress_value = 88 + int(((index - 1) / max(1, total_queries)) * 6)
+            self._emit_progress(
+                progress_callback,
+                progress_value,
+                100,
+                f"Analisando consultas faciais ({index}/{total_queries})",
+            )
+            processing_query_path: Path | None = None
+            query_cleanup_path: Path | None = None
+            query_sha512: str | None = None
+            detected_faces_in_query: int | None = None
             try:
+                processing_query_path, query_sha512, query_cleanup_path = self._prepare_processing_input(
+                    file_path=query_path,
+                    media_type=MediaType.IMAGE,
+                    file_prefix=f"[Busca por faces] Consulta {index}/{total_queries}",
+                    text_logger=logger,
+                    log_callback=log_callback,
+                )
                 query_tracking = self._tracking_service.process_media(
                     source_path=query_path,
                     sha512=query_sha512,
@@ -1099,51 +1297,21 @@ class InventoryService:
                         query_path,
                     ),
                     analyzer=analyzer,
-                    artifact_store=ArtifactStore(inventory_result.run_directory / "face_search_query"),
-                    id_namespace="Q",
-                    event_callback=lambda event, fields: event_logger.write(event, **fields),
-                    text_callback=lambda message: self._emit_log(logger, log_callback, message),
+                    artifact_store=ArtifactStore(
+                        inventory_result.run_directory / "face_search_queries" / f"query_{index:04d}"
+                    ),
+                    id_namespace=f"Q{index:03d}",
+                        event_callback=lambda event, fields: event_logger.write(event, **fields),
+                        text_callback=lambda message: self._emit_log(logger, log_callback, message),
+                    )
+                detected_faces_in_query = len(query_tracking.tracks)
+                detected_face_total += detected_faces_in_query
+                query_track, query_occurrence = self._select_query_face(query_tracking)
+                query_keyframe = next(
+                    (item for item in query_tracking.keyframes if item.track_id == query_track.track_id),
+                    None,
                 )
-            finally:
-                self._cleanup_processing_input(query_cleanup_path)
-            query_track, query_occurrence = self._select_query_face(query_tracking)
-            query_keyframe = next(
-                (item for item in query_tracking.keyframes if item.track_id == query_track.track_id),
-                None,
-            )
-            event_logger.write(
-                "face_search_query_selected",
-                query_path=query_path,
-                query_track_id=query_track.track_id,
-                query_occurrence_id=query_occurrence.occurrence_id,
-                query_keyframe_id=query_keyframe.keyframe_id if query_keyframe is not None else None,
-                detected_faces=len(query_tracking.tracks),
-            )
-
-            if progress_callback is not None:
-                progress_callback(94, 100, "Executando busca vetorial")
-
-            raw_hits = self._search_service.search(
-                query_track.average_embedding,
-                inventory_result.tracks,
-                inventory_result.clusters,
-                inventory_result.occurrences,
-            )
-            matches = self._resolve_face_search_matches(inventory_result, raw_hits)
-            summary = FaceSearchSummary(
-                query_faces_detected=len(query_tracking.tracks),
-                compatible_clusters=len({item.cluster_id for item in matches if item.cluster_id is not None}),
-                compatible_tracks=len(matches),
-                compatible_occurrences=len([item for item in matches if item.occurrence_id is not None]),
-                compatibility_threshold=self._config.clustering.candidate_similarity,
-            )
-
-            if self._face_search_report_generator is None:
-                raise RuntimeError("Gerador de relatório de busca por face nao configurado.")
-
-            preliminary = FaceSearchResult(
-                inventory_result=inventory_result,
-                query=FaceSearchQuery(
+                query = FaceSearchQuery(
                     source_path=query_path,
                     sha512=query_sha512,
                     detected_face_count=len(query_tracking.tracks),
@@ -1157,63 +1325,81 @@ class InventoryService:
                         if query_occurrence.quality_metrics is not None
                         else None
                     ),
-                ),
-                matches=matches,
-                summary=summary,
-                report=ReportArtifacts(
-                    tex_path=inventory_result.run_directory / "report" / "relatorio_busca_por_face.tex",
-                    pdf_path=None,
-                    docx_path=inventory_result.run_directory / "report" / "relatorio_busca_por_face.docx",
-                ),
-                export_path=export_service.inventory_directory / "face_search.json",
-            )
+                    query_index=index,
+                )
+                prepared_queries.append(
+                    PreparedFaceSearchQuery(
+                        query=query,
+                        embedding=list(query_track.average_embedding),
+                    )
+                )
+                query_events.append(
+                    FaceSearchQueryEvent(
+                        query_index=index,
+                        source_path=query_path,
+                        status="selected",
+                        sha512=query_sha512,
+                        detected_face_count=detected_faces_in_query,
+                        selected_track_id=query_track.track_id,
+                        selected_occurrence_id=query_occurrence.occurrence_id,
+                        selected_keyframe_id=query_keyframe.keyframe_id if query_keyframe is not None else None,
+                        crop_path=query_occurrence.crop_path,
+                        context_image_path=query_occurrence.context_image_path,
+                        quality_score=(
+                            query_occurrence.quality_metrics.score
+                            if query_occurrence.quality_metrics is not None
+                            else None
+                        ),
+                    )
+                )
+                event_logger.write(
+                    "face_search_query_selected",
+                    query_index=index,
+                    query_path=query_path,
+                    query_track_id=query_track.track_id,
+                    query_occurrence_id=query_occurrence.occurrence_id,
+                    query_keyframe_id=query_keyframe.keyframe_id if query_keyframe is not None else None,
+                    detected_faces=len(query_tracking.tracks),
+                )
+                self._emit_log(
+                    logger,
+                    log_callback,
+                    (
+                        f"[Busca por faces] Consulta {index}/{total_queries} selecionada | "
+                        f"track={query_track.track_id} | faces_elegiveis={detected_faces_in_query}"
+                    ),
+                )
+            except Exception as exc:
+                rejected_queries += 1
+                reason = summarize_exception(exc)
+                query_events.append(
+                    FaceSearchQueryEvent(
+                        query_index=index,
+                        source_path=query_path,
+                        status="rejected",
+                        sha512=query_sha512,
+                        detected_face_count=detected_faces_in_query,
+                        error_message=reason,
+                        error_type=type(exc).__name__,
+                    )
+                )
+                self._emit_log(
+                    logger,
+                    log_callback,
+                    f"[Busca por faces] Consulta {index}/{total_queries} descartada: {reason}",
+                )
+                event_logger.write(
+                    "face_search_query_rejected",
+                    query_index=index,
+                    query_path=query_path,
+                    error=reason,
+                    error_type=type(exc).__name__,
+                )
+            finally:
+                if query_cleanup_path is not None:
+                    self._cleanup_processing_input(query_cleanup_path)
 
-            if progress_callback is not None:
-                progress_callback(97, 100, "Gerando relatórios da busca")
-
-            report_artifacts = self._face_search_report_generator.generate(preliminary)
-            final_result = replace(preliminary, report=report_artifacts)
-            export_service.write_face_search_json(final_result)
-            self._emit_log(
-                logger,
-                log_callback,
-                (
-                    f"[Busca por face] Compatibilidades encontradas | grupos={summary.compatible_clusters} | "
-                    f"tracks={summary.compatible_tracks} | ocorrencias={summary.compatible_occurrences}"
-                ),
-            )
-            event_logger.write(
-                "face_search_finished",
-                query_path=query_path,
-                compatible_clusters=summary.compatible_clusters,
-                compatible_tracks=summary.compatible_tracks,
-                compatible_occurrences=summary.compatible_occurrences,
-                report_pdf=report_artifacts.pdf_path,
-                report_tex=report_artifacts.tex_path,
-                report_docx=report_artifacts.docx_path,
-                export_path=final_result.export_path,
-            )
-            if progress_callback is not None:
-                progress_callback(100, 100, "Busca por face concluída")
-            return final_result
-        except Exception as exc:
-            error_summary, traceback_text = self._emit_exception(
-                logger,
-                log_callback,
-                "[Busca por face] Falha fatal",
-                exc,
-                include_traceback_in_callback=True,
-            )
-            event_logger.write(
-                "face_search_failed",
-                query_path=query_path,
-                error=error_summary,
-                error_type=type(exc).__name__,
-                traceback=traceback_text,
-            )
-            raise
-        finally:
-            close_file_logger(logger)
+        return prepared_queries, detected_face_total, rejected_queries, query_events
 
     def compare_face_sets(
         self,
@@ -1731,10 +1917,13 @@ class InventoryService:
             support_note=_optional_text(summary_payload.get("support_note")),
             score_min=_optional_float(summary_payload.get("score_min")),
             score_max=_optional_float(summary_payload.get("score_max")),
-            density_method=str(summary_payload.get("density_method") or "gaussian_kde"),
+            density_method=str(summary_payload.get("density_method") or "bounded_logit_kde"),
             smoothing_note=_optional_text(summary_payload.get("smoothing_note")),
         )
-        settings_snapshot = self._deserialize_likelihood_ratio_settings(payload.get("settings_snapshot"))
+        settings_snapshot = self._deserialize_likelihood_ratio_settings(
+            payload.get("settings_snapshot"),
+            legacy_density_method=summary.density_method,
+        )
         return FaceSetComparisonCalibration(
             summary=summary,
             genuine_scores=_float_list("genuine_scores"),
@@ -1745,9 +1934,16 @@ class InventoryService:
             loaded_from_model=True,
         )
 
-    def _deserialize_likelihood_ratio_settings(self, payload: object) -> LikelihoodRatioSettings | None:
+    def _deserialize_likelihood_ratio_settings(
+        self,
+        payload: object,
+        *,
+        legacy_density_method: str | None = None,
+    ) -> LikelihoodRatioSettings | None:
         if payload in (None, ""):
-            return None
+            if legacy_density_method in (None, ""):
+                return None
+            return LikelihoodRatioSettings(density_estimator=str(legacy_density_method))
         if not isinstance(payload, dict):
             raise ValueError("Campo invalido no modelo de calibracao: settings_snapshot")
         return LikelihoodRatioSettings(
@@ -1758,10 +1954,77 @@ class InventoryService:
             minimum_unique_scores_per_distribution=int(
                 payload.get("minimum_unique_scores_per_distribution", 2)
             ),
+            density_estimator=str(
+                payload.get("density_estimator", legacy_density_method or "bounded_logit_kde")
+            ),
             kde_bandwidth_scale=float(payload.get("kde_bandwidth_scale", 1.0)),
             kde_uniform_floor_weight=float(payload.get("kde_uniform_floor_weight", 0.001)),
             kde_min_density=float(payload.get("kde_min_density", 1e-12)),
         )
+
+    def _likelihood_ratio_smoothing_note(self, settings: LikelihoodRatioSettings) -> str:
+        return (
+            f"{score_density_method_label(settings.density_estimator)} estabilizada com piso uniforme de "
+            f"{settings.kde_uniform_floor_weight:.4%} e densidade minima de "
+            f"{settings.kde_min_density:.1e}."
+        )
+
+    def _likelihood_ratio_density_procedure_detail(self, settings: LikelihoodRatioSettings) -> str:
+        return (
+            "[Calibracao LR] A densidade de cada score foi estimada com "
+            f"{score_density_method_label(settings.density_estimator)} "
+            f"(banda x{settings.kde_bandwidth_scale:.3f}) e piso uniforme para evitar densidades nulas."
+        )
+
+    def migrate_face_set_comparison_calibration_model(
+        self,
+        model_path: Path,
+        output_path: Path,
+        *,
+        target_settings: LikelihoodRatioSettings | None = None,
+    ) -> Path:
+        source_model = self.load_face_set_comparison_calibration_model(model_path)
+        source_path = self._normalize_calibration_model_path(model_path)
+        if source_path is None:
+            raise ValueError("O caminho do modelo de calibracao precisa ser informado.")
+        settings = target_settings or self._config.likelihood_ratio
+        source_settings = source_model.settings_snapshot
+        source_method = (
+            source_settings.density_estimator
+            if source_settings is not None
+            else source_model.summary.density_method
+        )
+        retained_details = [
+            line
+            for line in source_model.procedure_details
+            if "A densidade de cada score foi estimada com " not in line
+            and "Modelo migrado sem reprocessar imagens" not in line
+        ]
+        migrated_details = tuple(
+            [
+                *retained_details,
+                self._likelihood_ratio_density_procedure_detail(settings),
+                (
+                    "[Calibracao LR] Modelo migrado sem reprocessar imagens; "
+                    f"scores reaproveitados de {source_path} | "
+                    f"metodo_origem={source_method} | metodo_destino={settings.density_estimator}."
+                ),
+            ]
+        )
+        migrated_summary = replace(
+            source_model.summary,
+            density_method=settings.density_estimator,
+            smoothing_note=self._likelihood_ratio_smoothing_note(settings),
+        )
+        migrated_model = replace(
+            source_model,
+            summary=migrated_summary,
+            procedure_details=migrated_details,
+            settings_snapshot=settings,
+            model_path=source_path,
+            loaded_from_model=False,
+        )
+        return self.save_face_set_comparison_calibration_model(migrated_model, output_path)
 
     def _discover_likelihood_ratio_calibration_plan(
         self,
@@ -1847,7 +2110,8 @@ class InventoryService:
             lines.append(
                 (
                     f"[Calibracao LR] Base={calibration_root} | identidades={len(calibration_plan)} | "
-                    f"imagens={sum(len(paths) for _, paths in calibration_plan)} | metodo=gaussian_kde"
+                    f"imagens={sum(len(paths) for _, paths in calibration_plan)} | "
+                    f"metodo={self._config.likelihood_ratio.density_estimator}"
                 )
             )
             lines.extend(
@@ -1860,7 +2124,8 @@ class InventoryService:
             lines.append(
                 (
                     "[Calibracao LR] A razao de verossimilhanca e calculada como "
-                    "p(score|mesma_origem) / p(score|origem_diferente), com KDE estabilizada por piso uniforme."
+                    "p(score|mesma_origem) / p(score|origem_diferente), com estimador nao parametrico "
+                    "de densidade estabilizado por piso uniforme."
                 )
             )
         lines.extend(self._configuration_log_lines(providers))
@@ -2609,21 +2874,14 @@ class InventoryService:
             support_note=support_note,
             score_min=min(all_scores) if all_scores else None,
             score_max=max(all_scores) if all_scores else None,
-            density_method="gaussian_kde",
-            smoothing_note=(
-                "KDE estabilizada com piso uniforme de "
-                f"{lr_settings.kde_uniform_floor_weight:.4%} e densidade minima de "
-                f"{lr_settings.kde_min_density:.1e}."
-            ),
+            density_method=lr_settings.density_estimator,
+            smoothing_note=self._likelihood_ratio_smoothing_note(lr_settings),
         )
         procedure_details = (
             "[Calibracao LR] Cada subdiretorio imediato foi tratado como uma identidade rotulada.",
             "[Calibracao LR] Scores Padrão/Questionado de mesma origem: pares entre faces da mesma identidade.",
             "[Calibracao LR] Scores Padrão/Questionado de origem distinta: pares entre identidades diferentes.",
-            (
-                "[Calibracao LR] A densidade de cada score foi estimada com gaussian_kde "
-                f"(banda x{lr_settings.kde_bandwidth_scale:.3f}) e piso uniforme para evitar densidades nulas."
-            ),
+            self._likelihood_ratio_density_procedure_detail(lr_settings),
         )
         return FaceSetComparisonCalibration(
             summary=summary,
@@ -2875,9 +3133,10 @@ class InventoryService:
                 text_logger,
                 log_callback,
                 (
-                    f"[Calibracao LR] Ajustando densidades KDE | "
+                    f"[Calibracao LR] Ajustando densidades | "
                     f"mesma_origem={len(calibration.genuine_scores)} | "
                     f"origem_distinta={len(calibration.impostor_scores)} | "
+                    f"metodo={settings.density_estimator} | "
                     f"banda_x={settings.kde_bandwidth_scale:.3f}"
                 ),
             )
@@ -2890,7 +3149,7 @@ class InventoryService:
                 progress_callback,
                 progress_current,
                 progress_total,
-                "Calibracao LR: ajustando densidades KDE",
+                f"Calibracao LR: ajustando densidades ({settings.density_estimator})",
             )
         if event_logger is not None:
             event_logger.write(
@@ -2902,18 +3161,18 @@ class InventoryService:
 
         genuine_array = np.asarray(calibration.genuine_scores, dtype=np.float64)
         impostor_array = np.asarray(calibration.impostor_scores, dtype=np.float64)
-        same_source_kde = self._build_gaussian_kde(genuine_array, settings.kde_bandwidth_scale)
-        different_source_kde = self._build_gaussian_kde(impostor_array, settings.kde_bandwidth_scale)
+        same_source_density_model = self._build_score_density_model(genuine_array, settings=settings)
+        different_source_density_model = self._build_score_density_model(impostor_array, settings=settings)
 
         calibrated_matches: list[FaceSetComparisonMatch] = []
         for index, match in enumerate(matches, start=1):
-            same_source_density = self._stabilized_kde_density(
-                same_source_kde,
+            same_source_density = self._stabilized_score_density(
+                same_source_density_model,
                 match.similarity,
                 settings=settings,
             )
-            different_source_density = self._stabilized_kde_density(
-                different_source_kde,
+            different_source_density = self._stabilized_score_density(
+                different_source_density_model,
                 match.similarity,
                 settings=settings,
             )
@@ -2975,30 +3234,34 @@ class InventoryService:
             )
         return calibrated_matches
 
-    def _build_gaussian_kde(
+    def _build_score_density_model(
         self,
         values: np.ndarray,
-        bandwidth_scale: float,
-    ) -> gaussian_kde:
-        if math.isclose(bandwidth_scale, 1.0, rel_tol=1e-12, abs_tol=1e-12):
-            return gaussian_kde(values)
-        return gaussian_kde(values, bw_method=lambda kde: kde.scotts_factor() * bandwidth_scale)
+        *,
+        settings: LikelihoodRatioSettings,
+    ):
+        return fit_score_density_model(
+            values,
+            method=settings.density_estimator,
+            bandwidth_scale=settings.kde_bandwidth_scale,
+        )
 
-    def _stabilized_kde_density(
+    def _stabilized_score_density(
         self,
-        model: gaussian_kde,
+        model,
         score: float,
         *,
         settings: LikelihoodRatioSettings | None = None,
     ) -> float:
         lr_settings = settings or self._config.likelihood_ratio
         clipped_score = max(-1.0, min(1.0, score))
-        point = np.asarray([clipped_score], dtype=np.float64)
-        kde_density = float(model(point)[0])
-        uniform_density = 0.5
-        floor_weight = lr_settings.kde_uniform_floor_weight
-        mixed_density = ((1.0 - floor_weight) * max(0.0, kde_density)) + (floor_weight * uniform_density)
-        return max(lr_settings.kde_min_density, mixed_density)
+        raw_density = float(model.evaluate_raw([clipped_score])[0])
+        stabilized = stabilize_score_density(
+            raw_density,
+            uniform_floor_weight=lr_settings.kde_uniform_floor_weight,
+            min_density=lr_settings.kde_min_density,
+        )
+        return float(stabilized[0])
 
     def _likelihood_ratio_evidence_label(self, log10_likelihood_ratio: float) -> str:
         if log10_likelihood_ratio >= 3.0:
@@ -3943,26 +4206,27 @@ class InventoryService:
     def _resolve_face_search_matches(
         self,
         result: InventoryResult,
-        raw_hits: dict[str, list[object]],
+        query_hit_sets: list[tuple[FaceSearchQuery, dict[str, list[object]]]],
     ) -> list[FaceSearchMatch]:
         compatibility_threshold = self._config.clustering.candidate_similarity
-        track_hits = [
-            hit for hit in raw_hits.get("tracks", [])
-            if getattr(hit, "score", -1.0) >= compatibility_threshold
-        ]
-        if not track_hits:
+        best_track_hits: dict[str, tuple[float, FaceSearchQuery, dict[str, list[object]]]] = {}
+        for query, raw_hits in query_hit_sets:
+            for hit in raw_hits.get("tracks", []):
+                score = float(getattr(hit, "score", -1.0))
+                if score < compatibility_threshold:
+                    continue
+                current = best_track_hits.get(hit.entity_id)
+                if current is None or score > current[0]:
+                    best_track_hits[hit.entity_id] = (score, query, raw_hits)
+
+        if not best_track_hits:
             return []
 
-        cluster_scores = {
-            hit.entity_id: hit.score
-            for hit in raw_hits.get("clusters", [])
-            if getattr(hit, "score", -1.0) >= compatibility_threshold
-        }
-        occurrence_hits = {
-            hit.entity_id: hit
-            for hit in raw_hits.get("occurrences", [])
-            if getattr(hit, "score", -1.0) >= compatibility_threshold
-        }
+        ranked_track_hits = sorted(
+            best_track_hits.items(),
+            key=lambda item: item[1][0],
+            reverse=True,
+        )[: self._config.search.refine_top_k]
 
         tracks_by_id = {track.track_id: track for track in result.tracks}
         occurrences_by_id = {occurrence.occurrence_id: occurrence for occurrence in result.occurrences}
@@ -3971,10 +4235,20 @@ class InventoryService:
             keyframes_by_track.setdefault(keyframe.track_id, []).append(keyframe)
 
         resolved: list[FaceSearchMatch] = []
-        for rank, hit in enumerate(track_hits, start=1):
-            track = tracks_by_id.get(hit.entity_id)
+        for rank, (track_id, (track_score, query, raw_hits)) in enumerate(ranked_track_hits, start=1):
+            track = tracks_by_id.get(track_id)
             if track is None:
                 continue
+            cluster_scores = {
+                hit.entity_id: hit.score
+                for hit in raw_hits.get("clusters", [])
+                if getattr(hit, "score", -1.0) >= compatibility_threshold
+            }
+            occurrence_hits = {
+                hit.entity_id: hit
+                for hit in raw_hits.get("occurrences", [])
+                if getattr(hit, "score", -1.0) >= compatibility_threshold
+            }
             occurrence = self._best_match_occurrence(track, occurrences_by_id, occurrence_hits)
             keyframe = self._representative_keyframe(track, keyframes_by_track)
             crop_path = (
@@ -3995,7 +4269,7 @@ class InventoryService:
                     track_id=track.track_id,
                     occurrence_id=occurrence.occurrence_id if occurrence is not None else None,
                     cluster_score=cluster_scores.get(track.cluster_id or ""),
-                    track_score=hit.score,
+                    track_score=track_score,
                     occurrence_score=occurrence_hit.score if occurrence_hit is not None else None,
                     source_path=track.source_path,
                     frame_index=(
@@ -4012,6 +4286,9 @@ class InventoryService:
                     track_end_time=track.end_time,
                     crop_path=crop_path,
                     context_image_path=context_path,
+                    query_source_path=query.source_path,
+                    query_selected_track_id=query.selected_track_id,
+                    query_selected_occurrence_id=query.selected_occurrence_id,
                 )
             )
         return resolved

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from inventario_faces import __version__
 from inventario_faces.domain.config import AppConfig
-from inventario_faces.domain.entities import FaceCluster, KeyFrame, SearchArtifacts
+from inventario_faces.domain.entities import FaceCluster, FaceTrack, KeyFrame, SearchArtifacts
 from inventario_faces.utils.latex import format_seconds
 
 PROJECT_URL = "https://github.com/demusis/inventario_faces"
@@ -32,14 +32,52 @@ def keyframe_reason_labels(keyframe: KeyFrame) -> list[str]:
 
 
 def keyframe_reference_text(keyframe: KeyFrame) -> str:
-    parts = ["Quadro de referência do track"]
-    if keyframe.frame_index is not None:
-        parts[0] = f"Quadro de referência do track: {keyframe.frame_index:06d}"
-    parts.append(f"instante {format_seconds(keyframe.timestamp_seconds)}")
+    parts = keyframe_reference_lines(keyframe)
+    return "; ".join(parts) + "."
+
+
+def keyframe_reference_lines(keyframe: KeyFrame) -> list[str]:
+    parts = [
+        (
+            f"Quadro de referência selecionado para representar o track: {keyframe.frame_index:06d}"
+            if keyframe.frame_index is not None
+            else "Imagem de referência selecionada para representar o track no relatório"
+        )
+    ]
+    if keyframe.timestamp_seconds is not None:
+        parts.append(f"Instante da referência: {_format_report_timestamp(keyframe.timestamp_seconds)}")
     reasons = keyframe_reason_labels(keyframe)
     if reasons:
-        parts.append(f"critérios de seleção: {', '.join(reasons)}")
-    return "; ".join(parts) + "."
+        parts.append(f"Motivos da seleção da referência: {', '.join(reasons)}")
+    return parts
+
+
+def track_interval_text(track: FaceTrack) -> str:
+    if track.start_time is None and track.end_time is None:
+        return "não aplicável (imagem estática)"
+    if track.start_time is None:
+        return f"início não disponível - {_format_report_timestamp(track.end_time)}"
+    if track.end_time is None:
+        return f"{_format_report_timestamp(track.start_time)} - fim não disponível"
+    return f"{_format_report_timestamp(track.start_time)} - {_format_report_timestamp(track.end_time)}"
+
+
+def track_frame_interval_text(track: FaceTrack) -> str:
+    if track.start_frame is None and track.end_frame is None:
+        return "não aplicável (imagem estática)"
+    start = "início não disponível" if track.start_frame is None else f"{track.start_frame:06d}"
+    end = "fim não disponível" if track.end_frame is None else f"{track.end_frame:06d}"
+    return f"{start} - {end}"
+
+
+def _format_report_timestamp(value: float | None) -> str:
+    if value is None:
+        return format_seconds(value)
+    total_milliseconds = int(round(value * 1000))
+    hours, remainder = divmod(total_milliseconds, 3_600_000)
+    minutes, remainder = divmod(remainder, 60_000)
+    seconds, milliseconds = divmod(remainder, 1000)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}.{milliseconds:03d}"
 
 
 def media_track_type_label(track_type: str) -> str:
@@ -120,15 +158,39 @@ def inventory_methodology_items(config: AppConfig, search: SearchArtifacts | Non
     ]
 
 
-def face_search_methodology_items(selected_track_id: str) -> list[str]:
+def face_search_methodology_items(
+    query_count: int,
+    selected_track_ids: list[str],
+) -> list[str]:
+    selected_count = len(selected_track_ids)
+    if query_count <= 1:
+        selected_track_id = selected_track_ids[0] if selected_track_ids else "-"
+        return [
+            "O diretório-alvo é processado pelo mesmo pipeline orientado a tracks usado no inventário principal, preservando hashes, logs e artefatos derivativos auditáveis.",
+            "A imagem de consulta passa pelo mesmo fluxo de detecção e filtragem, mantendo apenas faces elegíveis segundo os limiares configurados.",
+            (
+                f"Quando há mais de uma face elegível na consulta, o sistema seleciona automaticamente a face de melhor qualidade, "
+                f"registrada como {selected_track_id}, para servir como referência da busca."
+            ),
+            "Todas as imagens de consulta informadas permanecem individualizadas no relatório, inclusive quando descartadas por erro de leitura, corrupção do arquivo, ausência de face elegível ou falta de embedding utilizável.",
+            "A pesquisa vetorial ocorre em duas etapas: recuperação coarse de grupos e tracks candidatos, seguida de refinamento nas ocorrências internas compatíveis.",
+        ]
+
+    selected_tracks_text = ", ".join(selected_track_ids[:6]) if selected_track_ids else "nenhum"
+    if selected_count > 6:
+        selected_tracks_text = f"{selected_tracks_text}, ..."
     return [
         "O diretório-alvo é processado pelo mesmo pipeline orientado a tracks usado no inventário principal, preservando hashes, logs e artefatos derivativos auditáveis.",
-        "A imagem de consulta passa pelo mesmo fluxo de detecção e filtragem, mantendo apenas faces elegíveis segundo os limiares configurados.",
+        "Cada imagem de consulta passa pelo mesmo fluxo de detecção e filtragem, mantendo apenas faces elegíveis segundo os limiares configurados.",
         (
-            f"Quando há mais de uma face elegível na consulta, o sistema seleciona automaticamente a face de melhor qualidade, "
-            f"registrada como {selected_track_id}, para servir como referência da busca."
+            f"Foram informadas {query_count} imagens de consulta, das quais {selected_count} geraram uma face de referência selecionada automaticamente "
+            f"(uma por imagem válida). Tracks de consulta selecionados: {selected_tracks_text}."
         ),
-        "A pesquisa vetorial ocorre em duas etapas: recuperação coarse de grupos e tracks candidatos, seguida de refinamento nas ocorrências internas compatíveis.",
+        "Todas as imagens de consulta informadas permanecem individualizadas no relatório, inclusive quando descartadas por erro de leitura, corrupção do arquivo, ausência de face elegível ou falta de embedding utilizável.",
+        (
+            "A pesquisa vetorial é executada separadamente para cada face de referência. Em seguida, os resultados são consolidados pelo maior score "
+            "obtido por entidade, preservando no relatório qual consulta sustentou cada compatibilidade."
+        ),
     ]
 
 

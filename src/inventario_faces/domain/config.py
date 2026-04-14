@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from inventario_faces.utils.density_utils import DEFAULT_SCORE_DENSITY_METHOD, normalize_score_density_method
+
 
 def _normalize_non_empty_text(value: str, field_name: str) -> str:
     cleaned = value.strip()
@@ -249,13 +251,14 @@ class SearchSettings:
 
 @dataclass(frozen=True)
 class LikelihoodRatioSettings:
-    """Parametros da calibracao LR baseada em KDE para comparacao entre conjuntos."""
+    """Parametros da calibracao LR baseada em estimadores nao parametricos de densidade."""
 
     max_scores_per_distribution: int = 20000
     minimum_identities_with_faces: int = 2
     minimum_same_source_scores: int = 5
     minimum_different_source_scores: int = 5
     minimum_unique_scores_per_distribution: int = 2
+    density_estimator: str = DEFAULT_SCORE_DENSITY_METHOD
     kde_bandwidth_scale: float = 1.0
     kde_uniform_floor_weight: float = 0.001
     kde_min_density: float = 1e-12
@@ -271,6 +274,7 @@ class LikelihoodRatioSettings:
             raise ValueError("Minimo de scores de origem distinta deve ser maior que zero.")
         if self.minimum_unique_scores_per_distribution < 2:
             raise ValueError("Minimo de scores unicos por distribuicao deve ser ao menos 2.")
+        normalize_score_density_method(self.density_estimator)
         _validate_positive_number(self.kde_bandwidth_scale, "Escala de banda da KDE")
         _validate_probability(self.kde_uniform_floor_weight, "Peso do piso uniforme da KDE")
         if self.kde_uniform_floor_weight >= 1.0:
