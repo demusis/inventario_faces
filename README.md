@@ -250,6 +250,29 @@ powershell -ExecutionPolicy Bypass -File .\build\build.ps1
 
 O instalador Windows gerado pelo script aponta para o repositório oficial do projeto como canal de publicação, suporte e atualização.
 
+## Versionamento automático
+
+O repositório publicado no GitHub agora pode atualizar a versão do aplicativo automaticamente.
+
+- a origem da versão continua em `src/inventario_faces/__init__.py`;
+- o fallback do instalador em `build/inventario_faces.iss` é mantido sincronizado;
+- todo `push` para `main` no GitHub dispara o workflow `.github/workflows/auto-bump-version.yml`;
+- esse workflow incrementa automaticamente o `patch` da versão, valida os arquivos de metadados e grava um commit automático de bump.
+
+Para atualizar manualmente a versão antes de publicar, use:
+
+```powershell
+python .\tools\bump_version.py --part patch --write
+```
+
+ou defina uma versão explícita:
+
+```powershell
+python .\tools\bump_version.py --set 0.3.0 --write
+```
+
+Se você fizer um bump manual e não quiser que o GitHub faça um segundo bump automático ao chegar no `main`, inclua `[skip version bump]` na mensagem do commit.
+
 ## Observação final
 
 O sistema foi desenhado para apoiar triagem e análise pericial, não para substituir juízo técnico humano.

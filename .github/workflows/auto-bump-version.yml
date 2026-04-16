@@ -1,0 +1,60 @@
+name: Auto Bump App Version
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+concurrency:
+  group: auto-bump-version-main
+  cancel-in-progress: true
+
+jobs:
+  bump-version:
+    if: github.actor != 'github-actions[bot]' && !contains(github.event.head_commit.message, '[skip version bump]')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Bump patch version
+        run: python tools/bump_version.py --write
+
+      - name: Validate versioning metadata
+        run: python -m unittest tests.test_versioning -v
+
+      - name: Read current app version
+        id: version
+        shell: bash
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import sys
+          from pathlib import Path
+          sys.path.insert(0, str(Path.cwd() / "src"))
+          from inventario_faces import __version__
+          print(f"version={__version__}")
+          PY
+
+      - name: Commit and push version bump
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/inventario_faces/__init__.py build/inventario_faces.iss
+          if git diff --cached --quiet; then
+            echo "Nenhuma alteracao de versao para publicar."
+            exit 0
+          fi
+          git commit -m "chore: bump version to ${{ steps.version.outputs.version }} [skip version bump]"
+          git push

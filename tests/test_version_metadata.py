@@ -7,6 +7,7 @@ from pathlib import Path
 from tests._bootstrap import PROJECT_ROOT  # noqa: F401
 from inventario_faces import __version__
 from inventario_faces.app import resolve_app_icon_path
+from inventario_faces.versioning import INSTALLER_VERSION_PATH
 
 
 class VersionMetadataTests(unittest.TestCase):
@@ -20,6 +21,13 @@ class VersionMetadataTests(unittest.TestCase):
             payload["tool"]["setuptools"]["dynamic"]["version"]["attr"],
         )
         self.assertRegex(__version__, r"^\d+\.\d+\.\d+$")
+
+    def test_installer_fallback_version_matches_package_version(self) -> None:
+        installer_path = Path(PROJECT_ROOT) / INSTALLER_VERSION_PATH
+        installer_text = installer_path.read_text(encoding="utf-8")
+
+        self.assertIn(f'#define MyAppVersion "{__version__}"', installer_text)
+        self.assertTrue((Path(PROJECT_ROOT) / "tools" / "bump_version.py").exists())
 
     def test_icon_assets_are_packaged_and_resolvable(self) -> None:
         pyproject_path = Path(PROJECT_ROOT) / "pyproject.toml"
