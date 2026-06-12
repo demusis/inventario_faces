@@ -148,6 +148,31 @@ def _try_preload_onnxruntime_gpu_dlls() -> None:
         return
 
 
+def available_execution_providers() -> list[str]:
+    ort = _get_onnxruntime_module()
+    return list(dict.fromkeys(str(provider) for provider in ort.get_available_providers()))
+
+
+def discover_execution_providers(available: list[str] | None = None) -> list[str]:
+    resolved_available = available if available is not None else available_execution_providers()
+    prioritized = [
+        provider
+        for provider in PREFERRED_EXECUTION_PROVIDERS
+        if provider in resolved_available
+    ]
+    return prioritized or ["CPUExecutionProvider"]
+
+
+def resolve_execution_providers(
+    configured: tuple[str, ...] | list[str],
+    available: list[str],
+) -> list[str]:
+    filtered = [provider for provider in configured if provider in available]
+    if filtered:
+        return filtered
+    return discover_execution_providers(available)
+
+
 def _resolve_insightface_root() -> Path:
     configured_root = os.getenv("INSIGHTFACE_HOME")
     if configured_root:
@@ -358,27 +383,13 @@ class InsightFaceAnalyzer:
         )
 
     def _available_execution_providers(self) -> list[str]:
-        ort = _get_onnxruntime_module()
-        return list(dict.fromkeys(str(provider) for provider in ort.get_available_providers()))
+        return available_execution_providers()
 
     def _resolve_providers(self, available_providers: list[str]) -> list[str]:
-        configured = [
-            provider
-            for provider in self.settings.providers
-            if provider in available_providers
-        ]
-        if configured:
-            return configured
-        return self._discover_providers(available_providers)
+        return resolve_execution_providers(self.settings.providers, available_providers)
 
     def _discover_providers(self, available_providers: list[str] | None = None) -> list[str]:
-        available = available_providers or self._available_execution_providers()
-        prioritized = [
-            provider
-            for provider in PREFERRED_EXECUTION_PROVIDERS
-            if provider in available
-        ]
-        return prioritized or ["CPUExecutionProvider"]
+        return discover_execution_providers(available_providers)
 
     @property
     def providers(self) -> list[str]:

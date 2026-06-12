@@ -517,6 +517,7 @@ class ExportService:
                     "same_source_density",
                     "different_source_density",
                     "evidence_label",
+                    "outside_calibration_support",
                 ]
             )
             for item in result.matches:
@@ -536,6 +537,7 @@ class ExportService:
                         f"{item.same_source_density:.12f}" if item.same_source_density is not None else "",
                         f"{item.different_source_density:.12f}" if item.different_source_density is not None else "",
                         item.evidence_label or "",
+                        "sim" if item.outside_calibration_support else "nao",
                     ]
                 )
         return output_path
@@ -607,6 +609,7 @@ class ExportService:
                     f"Mediana de log10(LR): {_fmt(summary.median_log10_likelihood_ratio)}",
                     f"Menor log10(LR): {_fmt(summary.min_log10_likelihood_ratio)}",
                     f"Maior log10(LR): {_fmt(summary.max_log10_likelihood_ratio)}",
+                    f"Pares com escore fora do intervalo de calibracao (LR extrapolado): {summary.extrapolated_matches}",
                 ]
             )
         calibration = result.calibration

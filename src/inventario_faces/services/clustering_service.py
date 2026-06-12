@@ -1,87 +1,165 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from pathlib import Path
+from dataclasses import dataclass
 from typing import Iterable
 
 from inventario_faces.domain.config import ClusteringSettings
 from inventario_faces.domain.entities import FaceCluster, FaceOccurrence, FaceTrack, MediaType
-from inventario_faces.utils.math_utils import average_embeddings, cosine_similarity
+from inventario_faces.utils.math_utils import (
+    average_embeddings,
+    cosine_similarity,
+    weighted_average_embeddings,
+)
 
 
-@dataclass
-class _WorkingCluster:
-    cluster_id: str
-    track_ids: list[str] = field(default_factory=list)
-    occurrence_ids: list[str] = field(default_factory=list)
-    embeddings: list[list[float]] = field(default_factory=list)
-    representative_crop_path: Path | None = None
-    representative_track_id: str | None = None
-    preview_paths: list[Path] = field(default_factory=list)
-
-    @property
-    def centroid(self) -> list[float]:
-        return average_embeddings(self.embeddings)
+@dataclass(frozen=True)
+class _EligibleTrack:
+    track: FaceTrack
+    embedding: list[float]
+    weight: float
 
 
 class ClusteringService:
+    # Limite de seguranca: o refinamento converge muito antes disso na pratica.
+    _MAX_REFINEMENT_ITERATIONS = 10
+
     def __init__(self, settings: ClusteringSettings) -> None:
         self._settings = settings
 
     def cluster(self, items: Iterable[FaceTrack | FaceOccurrence]) -> list[FaceCluster]:
         original_items = list(items)
         tracks = self._coerce_tracks(original_items)
-        working_clusters: list[_WorkingCluster] = []
+        eligible = self._eligible_tracks(tracks)
+        memberships = self._greedy_assign(eligible)
+        memberships = self._refine_memberships(eligible, memberships)
+        clusters = self._build_clusters(eligible, memberships)
+        self._attach_candidate_matches(clusters, tracks)
+        self._propagate_occurrence_assignments(original_items, tracks)
+        return clusters
 
+    def _eligible_tracks(self, tracks: list[FaceTrack]) -> list[_EligibleTrack]:
+        eligible: list[_EligibleTrack] = []
         for track in tracks:
             if len(track.occurrence_ids) < self._settings.min_track_size:
                 continue
             embedding = track.average_embedding or average_embeddings(track.representative_embeddings)
             if not embedding:
                 continue
-            best_cluster: _WorkingCluster | None = None
-            best_score = -1.0
-
-            for cluster in working_clusters:
-                similarity = cosine_similarity(embedding, cluster.centroid)
-                if similarity > best_score:
-                    best_cluster = cluster
-                    best_score = similarity
-
-            if best_cluster is not None and best_score >= self._settings.assignment_similarity:
-                assigned_cluster = best_cluster
-            else:
-                assigned_cluster = _WorkingCluster(cluster_id=f"I{len(working_clusters) + 1:03d}")
-                working_clusters.append(assigned_cluster)
-
-            assigned_cluster.track_ids.append(track.track_id)
-            assigned_cluster.occurrence_ids.extend(track.occurrence_ids)
-            assigned_cluster.embeddings.append(embedding)
-            if assigned_cluster.representative_crop_path is None and track.preview_path is not None:
-                assigned_cluster.representative_crop_path = track.preview_path
-                assigned_cluster.representative_track_id = track.track_id
-            if track.preview_path is not None:
-                assigned_cluster.preview_paths.append(track.preview_path)
-            track.cluster_id = assigned_cluster.cluster_id
-
-        clusters: list[FaceCluster] = []
-        for cluster in working_clusters:
-            if len(cluster.track_ids) < self._settings.min_cluster_size:
-                continue
-            clusters.append(
-                FaceCluster(
-                    cluster_id=cluster.cluster_id,
-                    track_ids=list(cluster.track_ids),
-                    occurrence_ids=list(cluster.occurrence_ids),
-                    centroid_embedding=cluster.centroid,
-                    representative_crop_path=cluster.representative_crop_path,
-                    representative_track_id=cluster.representative_track_id,
-                    preview_paths=list(cluster.preview_paths),
+            eligible.append(
+                _EligibleTrack(
+                    track=track,
+                    embedding=list(embedding),
+                    weight=float(max(1, len(track.occurrence_ids))),
                 )
             )
+        # Ordena por forca evidencial para que o passe guloso nao dependa da
+        # ordem de chegada dos arquivos; o desempate por track_id mantem o
+        # resultado deterministico entre execucoes.
+        eligible.sort(key=lambda item: (-item.weight, item.track.track_id))
+        return eligible
 
-        self._attach_candidate_matches(clusters, tracks)
-        self._propagate_occurrence_assignments(original_items, tracks)
+    def _greedy_assign(self, eligible: list[_EligibleTrack]) -> list[list[int]]:
+        memberships: list[list[int]] = []
+        centroids: list[list[float]] = []
+        for index, item in enumerate(eligible):
+            best_cluster = -1
+            best_score = -1.0
+            for cluster_index, centroid in enumerate(centroids):
+                similarity = cosine_similarity(item.embedding, centroid)
+                if similarity > best_score:
+                    best_cluster = cluster_index
+                    best_score = similarity
+            if best_cluster >= 0 and best_score >= self._settings.assignment_similarity:
+                memberships[best_cluster].append(index)
+                centroids[best_cluster] = self._centroid(eligible, memberships[best_cluster])
+            else:
+                memberships.append([index])
+                centroids.append(list(item.embedding))
+        return memberships
+
+    def _refine_memberships(
+        self,
+        eligible: list[_EligibleTrack],
+        memberships: list[list[int]],
+    ) -> list[list[int]]:
+        for _ in range(self._MAX_REFINEMENT_ITERATIONS):
+            centroids = [self._centroid(eligible, members) for members in memberships]
+            assignment_of = {
+                member: cluster_index
+                for cluster_index, members in enumerate(memberships)
+                for member in members
+            }
+            moved = False
+            for index in range(len(eligible)):
+                current = assignment_of[index]
+                current_score = cosine_similarity(eligible[index].embedding, centroids[current])
+                best_cluster = current
+                best_score = current_score
+                for cluster_index, centroid in enumerate(centroids):
+                    if cluster_index == current or not memberships[cluster_index]:
+                        continue
+                    similarity = cosine_similarity(eligible[index].embedding, centroid)
+                    if similarity >= self._settings.assignment_similarity and similarity > best_score + 1e-6:
+                        best_cluster = cluster_index
+                        best_score = similarity
+                if best_cluster != current:
+                    memberships[current].remove(index)
+                    memberships[best_cluster].append(index)
+                    assignment_of[index] = best_cluster
+                    moved = True
+            memberships = [sorted(members) for members in memberships if members]
+            if not moved:
+                break
+        return memberships
+
+    def _centroid(self, eligible: list[_EligibleTrack], members: list[int]) -> list[float]:
+        return weighted_average_embeddings(
+            [eligible[member].embedding for member in members],
+            [eligible[member].weight for member in members],
+        )
+
+    def _build_clusters(
+        self,
+        eligible: list[_EligibleTrack],
+        memberships: list[list[int]],
+    ) -> list[FaceCluster]:
+        # Numeracao por ordem do track mais forte de cada grupo, mantendo IDs
+        # estaveis e independentes da ordem interna do refinamento.
+        ordered_memberships = sorted(
+            (members for members in memberships if members),
+            key=lambda members: min(members),
+        )
+        clusters: list[FaceCluster] = []
+        for members in ordered_memberships:
+            if len(members) < self._settings.min_cluster_size:
+                continue
+            cluster_id = f"I{len(clusters) + 1:03d}"
+            track_ids: list[str] = []
+            occurrence_ids: list[str] = []
+            preview_paths = []
+            representative_crop_path = None
+            representative_track_id = None
+            for member in members:
+                track = eligible[member].track
+                track.cluster_id = cluster_id
+                track_ids.append(track.track_id)
+                occurrence_ids.extend(track.occurrence_ids)
+                if track.preview_path is not None:
+                    preview_paths.append(track.preview_path)
+                    if representative_crop_path is None:
+                        representative_crop_path = track.preview_path
+                        representative_track_id = track.track_id
+            clusters.append(
+                FaceCluster(
+                    cluster_id=cluster_id,
+                    track_ids=track_ids,
+                    occurrence_ids=occurrence_ids,
+                    centroid_embedding=self._centroid(eligible, members),
+                    representative_crop_path=representative_crop_path,
+                    representative_track_id=representative_track_id,
+                    preview_paths=preview_paths,
+                )
+            )
         return clusters
 
     def _attach_candidate_matches(

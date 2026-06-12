@@ -397,6 +397,7 @@ class FaceSetComparisonMatch:
     same_source_density: float | None = None
     different_source_density: float | None = None
     evidence_label: str | None = None
+    outside_calibration_support: bool = False
 
 
 @dataclass(frozen=True)
@@ -459,6 +460,7 @@ class FaceSetComparisonSummary:
     assignment_threshold: float = 0.0
     likelihood_ratio_calibrated: bool = False
     calibrated_matches: int = 0
+    extrapolated_matches: int = 0
     mean_log10_likelihood_ratio: float | None = None
     median_log10_likelihood_ratio: float | None = None
     min_log10_likelihood_ratio: float | None = None

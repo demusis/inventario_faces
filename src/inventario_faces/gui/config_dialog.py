@@ -353,9 +353,9 @@ class ConfigDialog(QDialog):
         det_size_layout.addWidget(self._original_resolution_checkbox)
 
         form.addRow("Mecanismo:", self._with_help(self._backend_input, "Mecanismo", self._help_html(
-            definition="Backend de análise facial responsável por detectar faces e extrair embeddings.",
-            operational_effect="Define compatibilidade com modelos, dependência de hardware e comportamento da inferência.",
-            recommendation="Mantenha insightface quando a estação estiver homologada para esse backend.",
+            definition="Backend de análise facial responsável por detectar faces e extrair embeddings. Valores aceitos: insightface (com fallback automático para onnx) ou onnx (ONNX Runtime direto, sem o pacote insightface).",
+            operational_effect="Define compatibilidade com modelos, dependência de hardware e comportamento da inferência. Ambos os backends usam os mesmos arquivos de modelo e produzem embeddings equivalentes.",
+            recommendation="Mantenha insightface quando a estação estiver homologada para esse backend; use onnx em estações sem o pacote insightface instalado.",
             references=[("InsightFace", INSIGHTFACE_URL)],
         )))
         form.addRow("Modelo:", self._with_help(self._model_name_input, "Modelo", self._help_html(

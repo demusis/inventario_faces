@@ -435,7 +435,6 @@ class DistributedCoordinator:
         )
 
     def inspect_partial_from_manifest_item(self, manifest_item: dict[str, Any]) -> DistributedPartialValidation:
-        relative_path = str(manifest_item.get("relative_path", ""))
         entry = self._entry_from_manifest_item(manifest_item)
         partial_path_raw = manifest_item.get("partial_path")
         partial_path = Path(str(partial_path_raw)) if partial_path_raw else None

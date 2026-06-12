@@ -139,11 +139,19 @@ O presente relat\'orio registra o processamento automatizado do diret\'orio \tex
         if not tracks:
             return r"\textit{Nenhum track consolidado para este grupo.}"
 
+        max_tracks = self._config.reporting.max_tracks_per_group
         rows = "\n".join(
             self._group_track_row(track, keyframes_map, tex_path)
-            for track in tracks[: self._config.reporting.max_tracks_per_group]
+            for track in tracks[:max_tracks]
         )
-        return rf"""
+        truncation_note = ""
+        if len(tracks) > max_tracks:
+            truncation_note = (
+                rf"\textit{{Exibindo {max_tracks} de {len(tracks)} tracks deste grupo; "
+                rf"os demais constam integralmente em \texttt{{inventory/tracks.csv}}.}}"
+                "\n"
+            )
+        return truncation_note + rf"""
 \begingroup
 \setlength{{\tabcolsep}}{{4pt}}
 \renewcommand{{\arraystretch}}{{1.18}}

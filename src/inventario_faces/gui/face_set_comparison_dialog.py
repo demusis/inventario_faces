@@ -1,13 +1,12 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
-from dataclasses import dataclass
 from datetime import datetime
 from html import escape
 from pathlib import Path
 import zipfile
 
-from PySide6.QtCore import QPointF, QRectF, QThread, QTimer, Qt, QUrl
-from PySide6.QtGui import QColor, QDesktopServices, QPainter, QPen, QPixmap, QPolygonF
+from PySide6.QtCore import QThread, QTimer, Qt, QUrl
+from PySide6.QtGui import QColor, QDesktopServices
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QDialog,
@@ -37,7 +36,6 @@ from PySide6.QtWidgets import (
 )
 
 import numpy as np
-from scipy.stats import mannwhitneyu
 
 from inventario_faces.domain.config import AppConfig
 from inventario_faces.domain.entities import (
@@ -46,578 +44,31 @@ from inventario_faces.domain.entities import (
     FaceSetComparisonMatch,
     FaceSetComparisonResult,
 )
+from inventario_faces.gui.comparison_statistics import (
+    _DistributionSeries,
+    _GroupComparisonTestResult,
+    _distribution_card_title,
+    _distribution_help_html,
+    _distribution_popup_html,
+    _distribution_series_label,
+    _distribution_zone_short_label,
+    _expanded_score_range,
+    _group_comparison_direction_text,
+    _group_comparison_significance_text,
+    _likelihood_ratio_selection_html,
+    _mann_whitney_group_comparison,
+    _summary_help_html,
+    _summary_popup_html,
+)
+from inventario_faces.gui.comparison_widgets import (
+    AdaptiveImageLabel,
+    LikelihoodRatioDensityWidget,
+    SimilarityDistributionWidget,
+)
 from inventario_faces.gui.face_set_comparison_help import build_face_set_comparison_help_html
 from inventario_faces.gui.icon_utils import apply_standard_icon
 from inventario_faces.gui.worker import FaceSetComparisonWorker
 from inventario_faces.utils.density_utils import fit_score_density_model, score_density_method_label
-
-
-class AdaptiveImageLabel(QLabel):
-    def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__("Sem imagem", parent)
-        self._pixmap = QPixmap()
-        self.setAlignment(Qt.AlignCenter)
-        self.setMinimumSize(320, 240)
-        self.setStyleSheet(
-            "background:#f8fafc; border:1px solid #d7e0ea; border-radius:10px; color:#64748b;"
-        )
-
-    def set_image_path(self, path: Path | None) -> None:
-        if path is None or not path.exists():
-            self._pixmap = QPixmap()
-            self.setPixmap(QPixmap())
-            self.setText("Sem imagem")
-            return
-        pixmap = QPixmap(str(path))
-        if pixmap.isNull():
-            self._pixmap = QPixmap()
-            self.setPixmap(QPixmap())
-            self.setText(f"Não foi possível abrir {path.name}")
-            return
-        self._pixmap = pixmap
-        self._refresh()
-
-    def resizeEvent(self, event) -> None:  # type: ignore[override]
-        super().resizeEvent(event)
-        self._refresh()
-
-    def _refresh(self) -> None:
-        if self._pixmap.isNull():
-            return
-        self.setText("")
-        self.setPixmap(
-            self._pixmap.scaled(
-                self.contentsRect().size(),
-                Qt.KeepAspectRatio,
-                Qt.SmoothTransformation,
-            )
-        )
-
-
-@dataclass(frozen=True)
-class _DistributionSeries:
-    label: str
-    classification: str
-    color: str
-    values: tuple[float, ...]
-    sufficient: bool
-    note: str | None = None
-    kde_x: tuple[float, ...] = ()
-    kde_y: tuple[float, ...] = ()
-    mean: float | None = None
-    median: float | None = None
-    q1: float | None = None
-    q3: float | None = None
-    ci_low: float | None = None
-    ci_high: float | None = None
-
-
-@dataclass(frozen=True)
-class _GroupComparisonTestResult:
-    metric_label: str
-    left_label: str
-    right_label: str
-    left_count: int
-    right_count: int
-    left_median: float | None = None
-    right_median: float | None = None
-    u_statistic: float | None = None
-    p_value: float | None = None
-    rank_biserial: float | None = None
-    common_language_effect: float | None = None
-    significant: bool | None = None
-    available: bool = False
-    note: str | None = None
-
-
-def _expanded_score_range(
-    values: list[float] | tuple[float, ...],
-    *,
-    observed_score: float | None = None,
-    minimum_span: float = 0.2,
-) -> tuple[float, float]:
-    numeric_values = [float(value) for value in values]
-    if observed_score is not None:
-        numeric_values.append(float(observed_score))
-    if not numeric_values:
-        return 0.0, 1.0
-
-    min_value = min(numeric_values)
-    max_value = max(numeric_values)
-    lower = min_value
-    upper = max_value
-    span = upper - lower
-    padding = max(span * 0.08, 0.02)
-    lower -= padding
-    upper += padding
-
-    if (upper - lower) < minimum_span:
-        center = (lower + upper) / 2.0
-        lower = center - (minimum_span / 2.0)
-        upper = center + (minimum_span / 2.0)
-
-    if min_value >= 0.0:
-        lower = max(0.0, lower)
-        upper = max(upper, min(1.0, lower + minimum_span))
-    if max_value <= 0.0:
-        upper = min(0.0, upper)
-        lower = min(lower, max(-1.0, upper - minimum_span))
-
-    lower = max(-1.0, lower)
-    upper = min(1.0, upper)
-
-    if upper <= lower:
-        if min_value >= 0.0:
-            lower = 0.0
-            upper = min(1.0, max(minimum_span, max_value + 0.02))
-        elif max_value <= 0.0:
-            upper = 0.0
-            lower = max(-1.0, min(-minimum_span, min_value - 0.02))
-        else:
-            lower = max(-1.0, min_value - 0.1)
-            upper = min(1.0, max_value + 0.1)
-
-    return float(lower), float(upper)
-
-
-def _histogram_density(
-    values: list[float] | tuple[float, ...],
-    *,
-    lower: float,
-    upper: float,
-    minimum_bins: int = 16,
-    maximum_bins: int = 48,
-) -> tuple[tuple[float, ...], tuple[float, ...]]:
-    if not values or upper <= lower:
-        return (), ()
-
-    array = np.asarray(values, dtype=np.float64)
-    sample_size = int(array.size)
-    if sample_size <= 1:
-        return (), ()
-
-    q1, q3 = np.quantile(array, [0.25, 0.75], method="linear")
-    iqr = float(q3 - q1)
-    if iqr > 1e-12:
-        bin_width = 2.0 * iqr * (sample_size ** (-1.0 / 3.0))
-        estimated_bins = int(np.ceil((upper - lower) / bin_width)) if bin_width > 1e-12 else minimum_bins
-    else:
-        estimated_bins = int(np.ceil(np.sqrt(sample_size)))
-    bin_count = max(minimum_bins, min(maximum_bins, estimated_bins))
-
-    histogram, edges = np.histogram(array, bins=bin_count, range=(lower, upper), density=True)
-    return (
-        tuple(float(value) for value in edges),
-        tuple(float(value) for value in histogram),
-    )
-
-
-def _mann_whitney_group_comparison(
-    left_values: list[float] | tuple[float, ...],
-    right_values: list[float] | tuple[float, ...],
-    *,
-    alpha: float,
-    metric_label: str,
-    left_label: str = "Padrão",
-    right_label: str = "Questionado",
-) -> _GroupComparisonTestResult:
-    left_sample = [float(value) for value in left_values]
-    right_sample = [float(value) for value in right_values]
-    left_count = len(left_sample)
-    right_count = len(right_sample)
-    if left_count < 2 or right_count < 2:
-        return _GroupComparisonTestResult(
-            metric_label=metric_label,
-            left_label=left_label,
-            right_label=right_label,
-            left_count=left_count,
-            right_count=right_count,
-            available=False,
-            note=(
-                "Teste U de Mann-Whitney indisponível: são necessárias ao menos 2 observações válidas "
-                f"em cada grupo de {metric_label.lower()}."
-            ),
-        )
-
-    left_array = np.asarray(left_sample, dtype=np.float64)
-    right_array = np.asarray(right_sample, dtype=np.float64)
-    try:
-        test_result = mannwhitneyu(left_array, right_array, alternative="two-sided", method="auto")
-    except TypeError:
-        test_result = mannwhitneyu(left_array, right_array, alternative="two-sided")
-    except ValueError as exc:
-        return _GroupComparisonTestResult(
-            metric_label=metric_label,
-            left_label=left_label,
-            right_label=right_label,
-            left_count=left_count,
-            right_count=right_count,
-            available=False,
-            note=f"Teste U de Mann-Whitney indisponível: {exc}",
-        )
-
-    pair_count = left_count * right_count
-    u_statistic = float(test_result.statistic)
-    p_value = float(test_result.pvalue)
-    common_language_effect = (u_statistic / pair_count) if pair_count > 0 else None
-    rank_biserial = (
-        (2.0 * common_language_effect) - 1.0 if common_language_effect is not None else None
-    )
-    return _GroupComparisonTestResult(
-        metric_label=metric_label,
-        left_label=left_label,
-        right_label=right_label,
-        left_count=left_count,
-        right_count=right_count,
-        left_median=float(np.median(left_array)),
-        right_median=float(np.median(right_array)),
-        u_statistic=u_statistic,
-        p_value=p_value,
-        rank_biserial=rank_biserial,
-        common_language_effect=common_language_effect,
-        significant=(p_value <= alpha),
-        available=True,
-    )
-
-
-def _format_density_value(value: float | None) -> str:
-    if value is None or not np.isfinite(value):
-        return "-"
-    absolute = abs(float(value))
-    if absolute == 0.0:
-        return "0"
-    if 1e-3 <= absolute < 1e3:
-        return f"{value:.6f}".rstrip("0").rstrip(".")
-    return f"{value:.3e}"
-
-
-def _likelihood_ratio_selection_html(
-    match: FaceSetComparisonMatch | None,
-    *,
-    left_name: str = "-",
-    right_name: str = "-",
-) -> str:
-    if match is None:
-        return "Linha tracejada azul: nenhum confronto selecionado."
-
-    left = escape(left_name)
-    right = escape(right_name)
-    score_text = f"{match.similarity:.4f}"
-    header = (
-        "Linha tracejada azul: confronto selecionado na tabela | "
-        f"rank {match.rank} | similaridade {score_text} | {left} x {right}"
-    )
-    if (
-        match.same_source_density is None
-        or match.different_source_density is None
-        or match.likelihood_ratio is None
-        or match.log10_likelihood_ratio is None
-    ):
-        return (
-            f"{header}<br>"
-            "<b>Leitura do gráfico</b>: o LR é obtido pela razão entre as alturas "
-            "das curvas H1 e H2 exatamente no ponto da linha tracejada."
-        )
-
-    h1_density = _format_density_value(match.same_source_density)
-    h2_density = _format_density_value(match.different_source_density)
-    lr_value = _format_density_value(match.likelihood_ratio)
-    log10_lr = f"{match.log10_likelihood_ratio:.4f}"
-    favored_hypothesis = "H1 (mesma origem)" if match.likelihood_ratio >= 1.0 else "H2 (origem distinta)"
-    return (
-        f"{header}<br>"
-        f"<b>Leitura do gráfico</b>: no score selecionado <code>x={score_text}</code>, "
-        f"a curva verde fornece <code>f(score|H1)={h1_density}</code> e a curva vermelha "
-        f"<code>f(score|H2)={h2_density}</code>.<br>"
-        f"<b>Cálculo</b>: <code>LR = f(score|H1) / f(score|H2) = {h1_density} / {h2_density} = {lr_value}</code><br>"
-        f"<b>Escala log</b>: <code>log10(LR) = {log10_lr}</code> | "
-        f"<b>Leitura</b>: neste ponto, a evidência favorece <b>{escape(favored_hypothesis)}</b>."
-    )
-
-
-class SimilarityDistributionWidget(QWidget):
-    def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self._series: list[_DistributionSeries] = []
-        self._candidate = 0.0
-        self._assignment = 0.0
-        self._observed_score: float | None = None
-        self._overall_ci_low: float | None = None
-        self._overall_ci_high: float | None = None
-        self._overall_mean: float | None = None
-        self._show_threshold_markers = True
-        self._show_mean_marker = True
-        self.setMinimumHeight(240)
-
-    def set_distribution(
-        self,
-        series: list[_DistributionSeries],
-        *,
-        candidate_threshold: float,
-        assignment_threshold: float,
-        observed_score: float | None,
-        mean_value: float | None,
-        ci_low: float | None,
-        ci_high: float | None,
-        show_threshold_markers: bool = True,
-        show_mean_marker: bool = True,
-    ) -> None:
-        self._series = list(series)
-        self._candidate = candidate_threshold
-        self._assignment = assignment_threshold
-        self._observed_score = observed_score
-        self._overall_mean = mean_value
-        self._overall_ci_low = ci_low
-        self._overall_ci_high = ci_high
-        self._show_threshold_markers = show_threshold_markers
-        self._show_mean_marker = show_mean_marker
-        self.update()
-
-    def paintEvent(self, event) -> None:  # type: ignore[override]
-        del event
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing, True)
-        painter.fillRect(self.rect(), QColor("#ffffff"))
-
-        outer = self.rect().adjusted(12, 12, -12, -12)
-        painter.setPen(QPen(QColor("#d7e0ea"), 1))
-        painter.drawRoundedRect(outer, 10, 10)
-
-        plot = outer.adjusted(42, 18, -16, -36)
-        if plot.width() <= 0 or plot.height() <= 0:
-            return
-
-        painter.setPen(QPen(QColor("#e7edf4"), 1))
-        for ratio in (0.25, 0.5, 0.75):
-            y = plot.bottom() - (plot.height() * ratio)
-            painter.drawLine(plot.left(), int(y), plot.right(), int(y))
-
-        drawable_series = [series for series in self._series if series.sufficient and series.kde_x and series.kde_y]
-        if not drawable_series:
-            painter.setPen(QPen(QColor("#64748b"), 1))
-            painter.drawText(plot, Qt.AlignCenter, "A distribuição não será exibida sem repetição suficiente e variabilidade.")
-            return
-
-        all_values = [value for series in drawable_series for value in series.values]
-        axis_values = [*all_values, self._candidate, self._assignment]
-        if self._overall_ci_low is not None:
-            axis_values.append(self._overall_ci_low)
-        if self._overall_ci_high is not None:
-            axis_values.append(self._overall_ci_high)
-        if self._observed_score is not None:
-            axis_values.append(self._observed_score)
-        lower, upper = _expanded_score_range(axis_values, minimum_span=0.2)
-
-        if self._overall_ci_low is not None and self._overall_ci_high is not None:
-            x1 = self._map_x(self._overall_ci_low, plot, lower, upper)
-            x2 = self._map_x(self._overall_ci_high, plot, lower, upper)
-            painter.fillRect(
-                int(min(x1, x2)),
-                plot.top(),
-                int(abs(x2 - x1)),
-                plot.height(),
-                QColor(15, 118, 110, 32),
-            )
-
-        max_density = max(max(series.kde_y) for series in drawable_series if series.kde_y) or 1.0
-        legend_x = plot.left() + 10
-        legend_y = plot.top() + 8
-
-        for series in drawable_series:
-            color = QColor(series.color)
-            points = [
-                QPointF(
-                    self._map_x(x, plot, lower, upper),
-                    plot.bottom() - ((y / max_density) * plot.height()),
-                )
-                for x, y in zip(series.kde_x, series.kde_y)
-            ]
-            fill_polygon = [QPointF(points[0].x(), plot.bottom()), *points, QPointF(points[-1].x(), plot.bottom())]
-            painter.setPen(Qt.NoPen)
-            painter.setBrush(QColor(color.red(), color.green(), color.blue(), 36))
-            painter.drawPolygon(QPolygonF(fill_polygon))
-            painter.setBrush(Qt.NoBrush)
-            painter.setPen(QPen(color, 2))
-            painter.drawPolyline(QPolygonF(points))
-            painter.fillRect(legend_x, legend_y, 12, 12, color)
-            painter.setPen(QPen(QColor("#334155"), 1))
-            painter.drawText(legend_x + 18, legend_y - 1, 180, 14, Qt.AlignLeft | Qt.AlignVCenter, series.label)
-            legend_y += 18
-
-        self._draw_marker(painter, plot, lower, upper, self._candidate, QColor("#f59e0b"), "cand.")
-        self._draw_marker(painter, plot, lower, upper, self._assignment, QColor("#0f766e"), "atrib.")
-        if self._overall_mean is not None:
-            self._draw_marker(painter, plot, lower, upper, self._overall_mean, QColor("#1e293b"), "média")
-        if self._observed_score is not None:
-            self._draw_marker(painter, plot, lower, upper, self._observed_score, QColor("#2563eb"), None)
-
-        painter.setPen(QPen(QColor("#475569"), 1))
-        painter.drawLine(plot.left(), plot.bottom(), plot.right(), plot.bottom())
-        for ratio in (0.0, 0.25, 0.5, 0.75, 1.0):
-            value = lower + ((upper - lower) * ratio)
-            x = self._map_x(value, plot, lower, upper)
-            painter.drawText(int(x - 20), outer.bottom() - 12, 44, 14, Qt.AlignCenter, f"{value:.2f}")
-
-    def _map_x(self, value: float, plot, lower: float, upper: float) -> float:
-        if upper <= lower:
-            return float(plot.left())
-        return plot.left() + (plot.width() * ((value - lower) / (upper - lower)))
-
-    def _draw_marker(
-        self,
-        painter: QPainter,
-        plot,
-        lower: float,
-        upper: float,
-        value: float,
-        color: QColor,
-        label: str | None,
-    ) -> None:
-        x = self._map_x(value, plot, lower, upper)
-        pen = QPen(color, 2)
-        pen.setStyle(Qt.DashLine)
-        painter.setPen(pen)
-        painter.drawLine(int(x), plot.top(), int(x), plot.bottom())
-        if label:
-            painter.setPen(QPen(color, 1))
-            painter.drawText(int(x - 26), plot.top() - 4, 52, 14, Qt.AlignCenter, label)
-
-
-class LikelihoodRatioDensityWidget(QWidget):
-    def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self._series: list[_DistributionSeries] = []
-        self._observed_score: float | None = None
-        self.setMinimumHeight(260)
-
-    def set_series(self, series: list[_DistributionSeries], *, observed_score: float | None = None) -> None:
-        self._series = list(series)
-        self._observed_score = observed_score
-        self.update()
-
-    def paintEvent(self, event) -> None:  # type: ignore[override]
-        del event
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing, True)
-        painter.fillRect(self.rect(), QColor("#ffffff"))
-
-        outer = self.rect().adjusted(12, 12, -12, -12)
-        painter.setPen(QPen(QColor("#d7e0ea"), 1))
-        painter.drawRoundedRect(outer, 10, 10)
-
-        plot = outer.adjusted(42, 18, -16, -36)
-        if plot.width() <= 0 or plot.height() <= 0:
-            return
-
-        drawable_series = [series for series in self._series if series.sufficient and series.kde_x and series.kde_y]
-        if not drawable_series:
-            painter.setPen(QPen(QColor("#64748b"), 1))
-            painter.drawText(plot, Qt.AlignCenter, "A densidade calibrada nao esta disponivel.")
-            return
-
-        all_values = [value for series in drawable_series for value in series.values]
-        lower, upper = _expanded_score_range(
-            all_values,
-            observed_score=self._observed_score,
-            minimum_span=0.2,
-        )
-
-        painter.setPen(QPen(QColor("#e7edf4"), 1))
-        for ratio in (0.25, 0.5, 0.75):
-            y = plot.bottom() - (plot.height() * ratio)
-            painter.drawLine(plot.left(), int(y), plot.right(), int(y))
-
-        histogram_series: list[tuple[_DistributionSeries, tuple[float, ...], tuple[float, ...]]] = []
-        histogram_max_density = 0.0
-        for series in drawable_series:
-            edges, histogram = _histogram_density(series.values, lower=lower, upper=upper)
-            histogram_series.append((series, edges, histogram))
-            if histogram:
-                histogram_max_density = max(histogram_max_density, max(histogram))
-
-        curve_max_density = max(max(series.kde_y) for series in drawable_series if series.kde_y) or 1.0
-        max_density = max(curve_max_density, histogram_max_density, 1.0)
-        legend_x = plot.left() + 10
-        legend_y = plot.top() + 8
-
-        for series, edges, histogram in histogram_series:
-            if not edges or not histogram:
-                continue
-            color = QColor(series.color)
-            painter.setPen(Qt.NoPen)
-            painter.setBrush(QColor(color.red(), color.green(), color.blue(), 26))
-            for left_edge, right_edge, density in zip(edges[:-1], edges[1:], histogram):
-                if density <= 0.0:
-                    continue
-                x1 = self._map_x(left_edge, plot, lower, upper)
-                x2 = self._map_x(right_edge, plot, lower, upper)
-                top = plot.bottom() - ((density / max_density) * plot.height())
-                rect = QRectF(min(x1, x2), top, max(1.0, abs(x2 - x1)), plot.bottom() - top)
-                painter.drawRect(rect)
-
-        for series in drawable_series:
-            color = QColor(series.color)
-            points = [
-                QPointF(
-                    self._map_x(x, plot, lower, upper),
-                    plot.bottom() - ((y / max_density) * plot.height()),
-                )
-                for x, y in zip(series.kde_x, series.kde_y)
-            ]
-            fill_polygon = [QPointF(points[0].x(), plot.bottom()), *points, QPointF(points[-1].x(), plot.bottom())]
-            painter.setPen(Qt.NoPen)
-            painter.setBrush(QColor(color.red(), color.green(), color.blue(), 32))
-            painter.drawPolygon(QPolygonF(fill_polygon))
-            painter.setBrush(Qt.NoBrush)
-            painter.setPen(QPen(color, 2))
-            painter.drawPolyline(QPolygonF(points))
-            painter.fillRect(legend_x, legend_y, 12, 12, color)
-            painter.setPen(QPen(QColor("#334155"), 1))
-            painter.drawText(legend_x + 18, legend_y - 1, 240, 14, Qt.AlignLeft | Qt.AlignVCenter, series.label)
-            legend_y += 18
-
-        painter.setBrush(QColor(148, 163, 184, 38))
-        painter.setPen(QPen(QColor("#94a3b8"), 1))
-        painter.drawRect(QRectF(legend_x, legend_y, 12, 12))
-        painter.setPen(QPen(QColor("#334155"), 1))
-        painter.drawText(
-            legend_x + 18,
-            legend_y - 1,
-            240,
-            14,
-            Qt.AlignLeft | Qt.AlignVCenter,
-            "barras: histograma bruto",
-        )
-
-        if self._observed_score is not None:
-            self._draw_marker(painter, plot, lower, upper, self._observed_score, QColor("#2563eb"))
-
-        painter.setPen(QPen(QColor("#475569"), 1))
-        painter.drawLine(plot.left(), plot.bottom(), plot.right(), plot.bottom())
-        for ratio in (0.0, 0.25, 0.5, 0.75, 1.0):
-            value = lower + ((upper - lower) * ratio)
-            x = self._map_x(value, plot, lower, upper)
-            painter.drawText(int(x - 20), outer.bottom() - 12, 44, 14, Qt.AlignCenter, f"{value:.2f}")
-
-    def _map_x(self, value: float, plot, lower: float, upper: float) -> float:
-        if upper <= lower:
-            return float(plot.left())
-        return plot.left() + (plot.width() * ((value - lower) / (upper - lower)))
-
-    def _draw_marker(
-        self,
-        painter: QPainter,
-        plot,
-        lower: float,
-        upper: float,
-        value: float,
-        color: QColor,
-    ) -> None:
-        x = self._map_x(value, plot, lower, upper)
-        pen = QPen(color, 2)
-        pen.setStyle(Qt.DashLine)
-        painter.setPen(pen)
-        painter.drawLine(int(x), plot.top(), int(x), plot.bottom())
 
 
 class FaceSetComparisonDialog(QDialog):
@@ -695,10 +146,11 @@ class FaceSetComparisonDialog(QDialog):
                 background:#f9fbfe; border:1px solid #d7e0ea; border-radius:12px;
             }
             QFrame#MetricCard {
-                background:#ffffff; border:1px solid #d9e3ee; border-radius:10px;
+                background:#ffffff; border:1px solid #d9e3ee; border-radius:12px;
             }
-            QLabel#MetricTitle { color:#64748b; font-size:11px; }
-            QLabel#MetricValue { color:#0f172a; font-size:18px; font-weight:700; }
+            QLabel#MetricTitle { color:#64748b; font-size:11px; font-weight:600; }
+            QLabel#MetricValue { color:#0f172a; font-size:20px; font-weight:700; }
+            QLabel#MetricDetail { color:#475569; font-size:11px; }
             QLabel#SectionHint { color:#64748b; }
             QLabel#ActivityBadge {
                 color:#0f172a; font-weight:700; background:#e2e8f0;
@@ -919,7 +371,7 @@ class FaceSetComparisonDialog(QDialog):
     def _add_images(self, set_label: str) -> None:
         selected_paths, _ = QFileDialog.getOpenFileNames(
             self,
-            f"Selecionar imagens do grupo {self._group_label(set_label)}",
+            f"Selecionar imagens para {self._group_label(set_label)}",
             str(self._initial_input_directory),
             self._image_file_filter(),
         )
@@ -983,10 +435,10 @@ class FaceSetComparisonDialog(QDialog):
         set_a_paths = self._selected_paths("A")
         set_b_paths = self._selected_paths("B")
         if not set_a_paths:
-            QMessageBox.warning(self, "Padrão vazio", "Selecione ao menos uma imagem no grupo Padrão.")
+            QMessageBox.warning(self, "Padrão vazio", "Selecione ao menos uma imagem em Padrão.")
             return
         if not set_b_paths:
-            QMessageBox.warning(self, "Questionado vazio", "Selecione ao menos uma imagem no grupo Questionado.")
+            QMessageBox.warning(self, "Questionado vazio", "Selecione ao menos uma imagem em Questionado.")
             return
 
         work_directory_text = self._work_directory_input.text().strip()
@@ -1130,17 +582,26 @@ class FaceSetComparisonDialog(QDialog):
         dialog.setStyleSheet(self.styleSheet())
         return dialog
 
-    def _create_metric_card(self, title: str, value: str) -> QFrame:
+    def _create_metric_card(self, title: str, value: str, detail: str | None = None) -> QFrame:
         card = QFrame(self)
         card.setObjectName("MetricCard")
         layout = QVBoxLayout(card)
-        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(4)
+        card.setMinimumHeight(82 if detail else 74)
         title_label = QLabel(title)
         title_label.setObjectName("MetricTitle")
+        title_label.setWordWrap(True)
         value_label = QLabel(value)
         value_label.setObjectName("MetricValue")
+        value_label.setWordWrap(True)
         layout.addWidget(title_label)
         layout.addWidget(value_label)
+        if detail:
+            detail_label = QLabel(detail)
+            detail_label.setObjectName("MetricDetail")
+            detail_label.setWordWrap(True)
+            layout.addWidget(detail_label)
         return card
 
     def _bootstrap_alpha(self) -> float:
@@ -1177,24 +638,17 @@ class FaceSetComparisonDialog(QDialog):
     ) -> list[str]:
         if not test_result.available:
             return [
-                "Teste não paramétrico entre grupos:",
+                "Teste não paramétrico entre Padrão e Questionado:",
                 test_result.note or "Teste U de Mann-Whitney indisponível.",
             ]
 
-        direction = "sem tendência direcional relevante entre os grupos"
-        if test_result.rank_biserial is not None:
-            if test_result.rank_biserial > 0.05:
-                direction = f"{test_result.left_label} tende a apresentar {test_result.metric_label} maior"
-            elif test_result.rank_biserial < -0.05:
-                direction = f"{test_result.right_label} tende a apresentar {test_result.metric_label} maior"
-
-        significance_label = (
-            f"diferença estatisticamente significativa ao nível de {significance_percent:.2f}%"
-            if test_result.significant
-            else f"diferença não significativa ao nível de {significance_percent:.2f}%"
+        direction = _group_comparison_direction_text(test_result)
+        significance_label = _group_comparison_significance_text(
+            test_result,
+            significance_percent=significance_percent,
         )
         return [
-            "Teste não paramétrico entre grupos:",
+            "Teste não paramétrico entre Padrão e Questionado:",
             (
                 "U de Mann-Whitney bilateral sobre a distribuição de qualidade facial "
                 "das faces selecionadas em Padrão e Questionado."
@@ -1312,9 +766,9 @@ class FaceSetComparisonDialog(QDialog):
             overall_stats["ci_high"] = ci_high
 
         palettes = {
-            "assignment": ("Atribuição", "#0f766e"),
-            "candidate": ("Candidata", "#b45309"),
-            "below_threshold": ("Abaixo do limiar", "#7c3aed"),
+            "assignment": (_distribution_series_label("assignment"), "#0f766e"),
+            "candidate": (_distribution_series_label("candidate"), "#b45309"),
+            "below_threshold": (_distribution_series_label("below_threshold"), "#7c3aed"),
         }
         series_list: list[_DistributionSeries] = []
         for classification, values in groups.items():
@@ -1371,106 +825,141 @@ class FaceSetComparisonDialog(QDialog):
         significance = self._significance_input.value()
         confidence_level = max(0.0, 100.0 - significance)
         group_test = self._quality_group_comparison_test(result)
-        dialog = self._create_popup("Resumo estatístico", 980, 760)
+        below_threshold_count = max(
+            0,
+            summary.total_pair_comparisons - summary.assignment_matches - summary.candidate_matches,
+        )
+        dialog = self._create_popup("Resumo estatístico", 1080, 860)
         layout = QVBoxLayout(dialog)
-        if support:
-            metrics = QGridLayout()
-            cards = [
-                ("Comparações", str(summary.total_pair_comparisons)),
-                (
-                    "Faces selecionadas",
-                    f"Padrão {summary.set_a_selected_faces} | Questionado {summary.set_b_selected_faces}",
-                ),
-                ("Atribuições", str(summary.assignment_matches)),
-                ("Candidatas", str(summary.candidate_matches)),
-                ("Significância", f"{significance:.2f}%"),
-                ("Média", self._format_optional_float(overall_stats["mean"])),
-                ("Mediana", self._format_optional_float(overall_stats["median"])),
-                ("Q1 / Q3", f"{self._format_optional_float(overall_stats['q1'])} / {self._format_optional_float(overall_stats['q3'])}"),
-                (
-                    f"IC bootstrap ({confidence_level:.2f}%)",
-                    f"{self._format_optional_float(overall_stats['ci_low'])} .. {self._format_optional_float(overall_stats['ci_high'])}",
-                ),
-            ]
-            for index, (title, value) in enumerate(cards):
-                metrics.addWidget(self._create_metric_card(title, value), index // 4, index % 4)
-            layout.addLayout(metrics)
-        else:
-            info = QTextBrowser(dialog)
-            info.setPlainText(
-                "\n".join(
-                    [
-                        "A análise estatística inferencial não será apresentada para esta comparação.",
-                        note or "Amostra insuficiente.",
-                        f"Comparações disponíveis: {summary.total_pair_comparisons}",
-                        (
-                            f"Faces selecionadas: Padrão {summary.set_a_selected_faces} | "
-                            f"Questionado {summary.set_b_selected_faces}"
-                        ),
-                        f"Significância configurada para o IC bootstrap: {significance:.2f}%",
-                    ]
-                )
-            )
-            info.setMaximumHeight(180)
-            layout.addWidget(info)
-        group_test_browser = QTextBrowser(dialog)
-        group_test_browser.setPlainText(
-            "\n".join(
-                self._group_comparison_summary_lines(
-                    group_test,
-                    significance_percent=significance,
-                )
-            )
+        layout.setSpacing(10)
+
+        metrics = QGridLayout()
+        metrics.setHorizontalSpacing(12)
+        metrics.setVerticalSpacing(12)
+        best_zone = _distribution_zone_short_label(
+            summary.best_similarity,
+            candidate_threshold=summary.candidate_threshold,
+            assignment_threshold=summary.assignment_threshold,
         )
-        group_test_browser.setMaximumHeight(210)
-        layout.addWidget(group_test_browser)
-        class_notes = QTextBrowser(dialog)
-        class_notes.setPlainText(
-            "\n".join(
-                [
-                    f"{series.label}: n={len(series.values)} | {'OK' if series.sufficient else series.note}"
-                    for series in series_list
-                ]
-            )
+        cards = [
+            (
+                "Pares comparados",
+                str(summary.total_pair_comparisons),
+                "combinações Padrão x Questionado efetivamente avaliadas",
+            ),
+            (
+                "Faces aproveitadas",
+                f"Padrão {summary.set_a_selected_faces} | Questionado {summary.set_b_selected_faces}",
+                "selecionadas para gerar os pares e sustentar o teste de qualidade",
+            ),
+            (
+                "Maior similaridade observada",
+                self._format_optional_float(summary.best_similarity),
+                best_zone,
+            ),
+            (
+                "Pares por faixa decisória",
+                (
+                    f"atribuição {summary.assignment_matches} | "
+                    f"candidata {summary.candidate_matches} | "
+                    f"abaixo do limiar {below_threshold_count}"
+                ),
+                "classificação dos pares pelos limiares adotados",
+            ),
+            (
+                "Limiar candidata / atribuição",
+                f"{summary.candidate_threshold:.4f} / {summary.assignment_threshold:.4f}",
+                "limiares decisórios desta execução",
+            ),
+            (
+                "Média dos escores",
+                self._format_optional_float(overall_stats["mean"]),
+                "todos os pares Padrão x Questionado",
+            ),
+            (
+                "Mediana dos escores",
+                self._format_optional_float(overall_stats["median"]),
+                "valor central da distribuição observada",
+            ),
+            (
+                "Faixa interquartil (Q1-Q3)",
+                f"{self._format_optional_float(overall_stats['q1'])} / {self._format_optional_float(overall_stats['q3'])}",
+                "metade central dos escores observados",
+            ),
+            (
+                f"IC bootstrap da média ({confidence_level:.2f}%)",
+                f"{self._format_optional_float(overall_stats['ci_low'])} .. {self._format_optional_float(overall_stats['ci_high'])}",
+                "intervalo de confiança da média geral",
+            ),
+        ]
+        for index, (title, value, detail) in enumerate(cards):
+            metrics.addWidget(self._create_metric_card(title, value, detail), index // 3, index % 3)
+        layout.addLayout(metrics)
+
+        subtitle = QLabel(
+            (
+                "Este painel resume os escores globais dos pares Padrão x Questionado e, em separado, "
+                "a comparação da qualidade facial das faces selecionadas em Padrão e Questionado. "
+                f"O nível de significância adotado ({significance:.2f}%) é explicado no texto técnico abaixo."
+            ),
+            dialog,
         )
-        class_notes.setMaximumHeight(140)
-        layout.addWidget(class_notes)
-        layout.addWidget(QLabel("Procedimento e configuração usada"))
+        subtitle.setWordWrap(True)
+        subtitle.setObjectName("SectionHint")
+        layout.addWidget(subtitle)
+
         browser = QTextBrowser(dialog)
-        browser.setPlainText(
-            "\n".join(
-                [
-                    *result.procedure_details,
-                    (
-                        f"[Resumo estatístico] IC bootstrap da média com "
-                        f"{self._bootstrap_resamples()} reamostragens e significância de {significance:.2f}% "
-                        f"(confiança nominal aproximada de {confidence_level:.2f}%)."
-                    ),
-                    (
-                        "[Resumo estatístico] O IC é obtido por bootstrap percentílico não paramétrico, "
-                        "reamostrando com reposição os scores observados."
-                    ),
-                    (
-                        "[Resumo estatístico] Comparação não paramétrica entre grupos por U de Mann-Whitney "
-                        "bilateral sobre a qualidade facial das faces selecionadas."
-                    ),
-                    (
-                        "[Resumo estatístico] Resultado do teste: "
-                        f"U={self._format_optional_float(group_test.u_statistic)} | "
-                        f"p={self._format_p_value(group_test.p_value)} | "
-                        f"rb={self._format_optional_float(group_test.rank_biserial)} | "
-                        f"{'significativo' if group_test.significant else 'não significativo'} "
-                        f"ao nível de {significance:.2f}%."
-                        if group_test.available
-                        else (
-                            "[Resumo estatístico] "
-                            f"{group_test.note or 'Teste U de Mann-Whitney indisponível.'}"
-                        )
-                    ),
-                ]
+        browser.setOpenExternalLinks(True)
+        browser.setHtml(
+            _summary_popup_html(
+                summary,
+                overall_stats,
+                group_test,
+                series_list,
+                significance_percent=significance,
+                bootstrap_resamples=self._bootstrap_resamples(),
+                procedure_details=result.procedure_details,
+                support_note=None if support else note,
             )
         )
+        browser.setMinimumHeight(320)
         layout.addWidget(browser, stretch=1)
+        actions = QHBoxLayout()
+        actions.addStretch(1)
+        help_button = QPushButton("Ajuda", dialog)
+        apply_standard_icon(self, help_button, QStyle.SP_DialogHelpButton)
+        help_button.clicked.connect(self._open_summary_help_popup)
+        actions.addWidget(help_button)
+        close_button = QPushButton("Fechar", dialog)
+        apply_standard_icon(self, close_button, QStyle.SP_DialogCloseButton)
+        close_button.clicked.connect(dialog.accept)
+        actions.addWidget(close_button)
+        layout.addLayout(actions)
+        dialog.exec()
+
+    def _open_summary_help_popup(self) -> None:
+        dialog = self._create_popup("Ajuda do resumo estatístico", 1020, 780)
+        layout = QVBoxLayout(dialog)
+        intro = QLabel(
+            (
+                "Este painel explica como interpretar os cards numéricos, o IC bootstrap da média "
+                "e o teste de comparação da qualidade facial entre Padrão e Questionado."
+            ),
+            dialog,
+        )
+        intro.setWordWrap(True)
+        intro.setObjectName("SectionHint")
+        layout.addWidget(intro)
+        browser = QTextBrowser(dialog)
+        browser.setHtml(_summary_help_html())
+        layout.addWidget(browser, stretch=1)
+        actions = QHBoxLayout()
+        actions.addStretch(1)
+        close_button = QPushButton("Fechar", dialog)
+        apply_standard_icon(self, close_button, QStyle.SP_DialogCloseButton)
+        close_button.clicked.connect(dialog.accept)
+        actions.addWidget(close_button)
+        layout.addLayout(actions)
         dialog.exec()
 
     def _open_help_popup(self) -> None:
@@ -1495,14 +984,96 @@ class FaceSetComparisonDialog(QDialog):
     def _comparison_help_html(self) -> str:
         return build_face_set_comparison_help_html(self._config)
 
+    def _open_distribution_help_popup(self) -> None:
+        dialog = self._create_popup('Ajuda da distribuição de similaridades', 1020, 780)
+        layout = QVBoxLayout(dialog)
+        intro = QLabel(
+            (
+                'Este painel explica como ler as curvas, as linhas médias, os limiares de decisão '
+                'e o posicionamento do melhor escore observado.'
+            ),
+            dialog,
+        )
+        intro.setWordWrap(True)
+        intro.setObjectName('SectionHint')
+        layout.addWidget(intro)
+        browser = QTextBrowser(dialog)
+        browser.setHtml(_distribution_help_html())
+        layout.addWidget(browser, stretch=1)
+        actions = QHBoxLayout()
+        actions.addStretch(1)
+        close_button = QPushButton('Fechar', dialog)
+        apply_standard_icon(self, close_button, QStyle.SP_DialogCloseButton)
+        close_button.clicked.connect(dialog.accept)
+        actions.addWidget(close_button)
+        layout.addLayout(actions)
+        dialog.exec()
+
     def _open_distribution_popup(self) -> None:
-        result = self._require_result("Distribuição de similaridades")
+        result = self._require_result('Distribuição de similaridades')
         if result is None:
             return
         summary = result.summary
         series_list, (support, note), overall_stats = self._distribution_analysis(result)
-        dialog = self._create_popup("Distribuição de similaridades", 1040, 760)
+        significance = self._significance_input.value()
+        confidence_level = max(0.0, 100.0 - significance)
+        dialog = self._create_popup('Distribuição de similaridades', 1180, 880)
         layout = QVBoxLayout(dialog)
+        layout.setSpacing(10)
+
+        def _series_by_classification(classification: str) -> _DistributionSeries | None:
+            return next((series for series in series_list if series.classification == classification), None)
+
+        assignment_series = _series_by_classification('assignment')
+        candidate_series = _series_by_classification('candidate')
+        below_series = _series_by_classification('below_threshold')
+        best_zone_short = _distribution_zone_short_label(
+            summary.best_similarity,
+            candidate_threshold=summary.candidate_threshold,
+            assignment_threshold=summary.assignment_threshold,
+        )
+
+        metrics = QGridLayout()
+        metrics.setHorizontalSpacing(12)
+        metrics.setVerticalSpacing(12)
+        cards = [
+            ('Comparações', str(summary.total_pair_comparisons), 'pares Padrão x Questionado comparados'),
+            ('Melhor escore', self._format_optional_float(summary.best_similarity), best_zone_short),
+            ('Média geral', self._format_optional_float(overall_stats['mean']), 'todos os pares Padrão x Questionado'),
+            (
+                f'IC bootstrap ({confidence_level:.2f}%)',
+                f"{self._format_optional_float(overall_stats['ci_low'])} .. {self._format_optional_float(overall_stats['ci_high'])}",
+                'intervalo de confiança da média geral',
+            ),
+            (
+                _distribution_card_title('assignment'),
+                self._format_optional_float(assignment_series.mean if assignment_series is not None else None),
+                'pares classificados na faixa de atribuição',
+            ),
+            (
+                _distribution_card_title('candidate'),
+                self._format_optional_float(candidate_series.mean if candidate_series is not None else None),
+                'pares classificados na faixa candidata',
+            ),
+            (
+                _distribution_card_title('below_threshold'),
+                self._format_optional_float(below_series.mean if below_series is not None else None),
+                'pares abaixo do limiar candidato',
+            ),
+            ('Limiar cand./atrib.', f'{summary.candidate_threshold:.4f} / {summary.assignment_threshold:.4f}', 'faixa candidata / faixa de atribuição'),
+        ]
+        for index, (title, value, detail) in enumerate(cards):
+            metrics.addWidget(self._create_metric_card(title, value, detail), index // 4, index % 4)
+        layout.addLayout(metrics)
+
+        subtitle = QLabel(
+            "Todas as curvas abaixo representam pares Padrão x Questionado; as cores separam apenas as faixas decisórias.",
+            dialog,
+        )
+        subtitle.setWordWrap(True)
+        subtitle.setObjectName('SectionHint')
+        layout.addWidget(subtitle)
+
         if support:
             widget = SimilarityDistributionWidget(dialog)
             widget.set_distribution(
@@ -1510,60 +1081,46 @@ class FaceSetComparisonDialog(QDialog):
                 candidate_threshold=summary.candidate_threshold,
                 assignment_threshold=summary.assignment_threshold,
                 observed_score=summary.best_similarity,
-                mean_value=overall_stats["mean"],
-                ci_low=overall_stats["ci_low"],
-                ci_high=overall_stats["ci_high"],
+                mean_value=overall_stats['mean'],
+                ci_low=overall_stats['ci_low'],
+                ci_high=overall_stats['ci_high'],
             )
-            layout.addWidget(widget, stretch=1)
+            layout.addWidget(widget, stretch=2)
         else:
             info = QTextBrowser(dialog)
-            info.setPlainText(
-                "\n".join(
-                    [
-                        "A curva de densidade não será exibida para esta comparação.",
-                        note or "Amostra insuficiente.",
-                        f"Comparações disponíveis: {summary.total_pair_comparisons}",
-                    ]
-                )
+            info.setHtml(
+                '<p><b>A curva de densidade não será exibida para esta comparação.</b></p>'
+                f'<p>{escape(note or "Amostra insuficiente.")}</p>'
+                f'<p>Comparações disponíveis: <b>{summary.total_pair_comparisons}</b></p>'
             )
+            info.setMaximumHeight(160)
             layout.addWidget(info)
+
         caption = QTextBrowser(dialog)
-        caption.setPlainText(
-            "\n".join(
-                [
-                    "Curvas de densidade não paramétricas separadas por classe de decisão.",
-                    (
-                        "Linha tracejada azul: melhor escore observado no ranking atual "
-                        f"({self._format_optional_float(summary.best_similarity)})."
-                    ),
-                    (
-                        f"As estatísticas desta janela resumem todos os {summary.total_pair_comparisons} "
-                        "pares comparados entre Padrão e Questionado."
-                    ),
-                    f"Reamostragens bootstrap: {self._bootstrap_resamples()}",
-                    f"Nível de significância: {self._significance_input.value():.2f}%",
-                    f"Média: {self._format_optional_float(overall_stats['mean'])}",
-                    f"Mediana: {self._format_optional_float(overall_stats['median'])}",
-                    f"Q1: {self._format_optional_float(overall_stats['q1'])}",
-                    f"Q3: {self._format_optional_float(overall_stats['q3'])}",
-                    (
-                        "IC bootstrap da média: "
-                        f"{self._format_optional_float(overall_stats['ci_low'])} .. "
-                        f"{self._format_optional_float(overall_stats['ci_high'])}"
-                    ),
-                    f"Limiar candidato: {summary.candidate_threshold:.4f}",
-                    f"Limiar de atribuição: {summary.assignment_threshold:.4f}",
-                    "",
-                    *[
-                        f"{series.label}: n={len(series.values)} | "
-                        f"{'curva exibida' if series.sufficient else series.note}"
-                        for series in series_list
-                    ],
-                ]
+        caption.setOpenExternalLinks(True)
+        caption.setHtml(
+            _distribution_popup_html(
+                summary,
+                series_list,
+                overall_stats,
+                significance_percent=significance,
+                bootstrap_resamples=self._bootstrap_resamples(),
             )
         )
-        caption.setMaximumHeight(240)
-        layout.addWidget(caption)
+        caption.setMinimumHeight(240)
+        layout.addWidget(caption, stretch=1)
+
+        actions = QHBoxLayout()
+        actions.addStretch(1)
+        help_button = QPushButton('Ajuda', dialog)
+        apply_standard_icon(self, help_button, QStyle.SP_DialogHelpButton)
+        help_button.clicked.connect(self._open_distribution_help_popup)
+        actions.addWidget(help_button)
+        close_button = QPushButton('Fechar', dialog)
+        apply_standard_icon(self, close_button, QStyle.SP_DialogCloseButton)
+        close_button.clicked.connect(dialog.accept)
+        actions.addWidget(close_button)
+        layout.addLayout(actions)
         dialog.exec()
 
     def _likelihood_ratio_series(
@@ -1814,18 +1371,48 @@ class FaceSetComparisonDialog(QDialog):
             if row < 0 or row >= len(result.matches):
                 left_label.set_image_path(None)
                 right_label.set_image_path(None)
-                left_info.setText("Selecione uma correspondência para visualizar a imagem do grupo Padrão.")
-                right_info.setText("Selecione uma correspondência para visualizar a imagem do grupo Questionado.")
+                left_info.setText("Selecione uma correspondência para visualizar a imagem de Padrão.")
+                right_info.setText("Selecione uma correspondência para visualizar a imagem de Questionado.")
                 return
             match = result.matches[row]
             left_entry = self._entry_by_id.get(match.left_entry_id)
             right_entry = self._entry_by_id.get(match.right_entry_id)
-            left_label.set_image_path(
-                left_entry.mesh_context_path if left_entry and left_entry.mesh_context_path else left_entry.mesh_crop_path if left_entry else None
-            )
-            right_label.set_image_path(
-                right_entry.mesh_context_path if right_entry and right_entry.mesh_context_path else right_entry.mesh_crop_path if right_entry else None
-            )
+            if left_entry is not None:
+                if self._supports_live_mesh_preview(left_entry.source_path):
+                    left_label.set_mesh_image(
+                        left_entry.source_path,
+                        landmarks=left_entry.biometric_landmarks,
+                        bbox=left_entry.bbox,
+                    )
+                elif self._supports_live_mesh_preview(left_entry.crop_path):
+                    left_label.set_mesh_image(
+                        left_entry.crop_path,
+                        landmarks=left_entry.biometric_landmarks,
+                        bbox=left_entry.bbox,
+                        translate=(-left_entry.bbox.x1, -left_entry.bbox.y1),
+                    )
+                else:
+                    left_label.set_image_path(left_entry.mesh_context_path or left_entry.mesh_crop_path)
+            else:
+                left_label.set_image_path(None)
+            if right_entry is not None:
+                if self._supports_live_mesh_preview(right_entry.source_path):
+                    right_label.set_mesh_image(
+                        right_entry.source_path,
+                        landmarks=right_entry.biometric_landmarks,
+                        bbox=right_entry.bbox,
+                    )
+                elif self._supports_live_mesh_preview(right_entry.crop_path):
+                    right_label.set_mesh_image(
+                        right_entry.crop_path,
+                        landmarks=right_entry.biometric_landmarks,
+                        bbox=right_entry.bbox,
+                        translate=(-right_entry.bbox.x1, -right_entry.bbox.y1),
+                    )
+                else:
+                    right_label.set_image_path(right_entry.mesh_context_path or right_entry.mesh_crop_path)
+            else:
+                right_label.set_image_path(None)
             left_info.setText(self._preview_text(left_entry, match, "A"))
             right_info.setText(self._preview_text(right_entry, match, "B"))
 
@@ -1953,6 +1540,11 @@ class FaceSetComparisonDialog(QDialog):
         layout.addWidget(info)
         return card, image, info
 
+    def _supports_live_mesh_preview(self, path: Path | None) -> bool:
+        if path is None or not path.exists():
+            return False
+        return path.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
+
     def _preview_text(
         self,
         entry: FaceSetComparisonEntry | None,
@@ -1960,7 +1552,7 @@ class FaceSetComparisonDialog(QDialog):
         set_label: str,
     ) -> str:
         if entry is None:
-            return f"Selecione uma correspondência para visualizar a imagem do grupo {self._group_label(set_label)}."
+            return f"Selecione uma correspondência para visualizar a imagem de {self._group_label(set_label)}."
         similarity = self._format_optional_float(match.similarity) if match is not None else "-"
         classification = self._classification_label(match.classification) if match is not None else "-"
         return (
@@ -2239,3 +1831,5 @@ class FaceSetComparisonDialog(QDialog):
             event.ignore()
             return
         super().closeEvent(event)
+
+

@@ -33,6 +33,11 @@ class VideoSamplingInfo:
 class VideoService:
     """Decodifica imagens e produz amostras de vídeo sem alterar os originais."""
 
+    # Tetos de espera do backend FFMPEG: evitam que um arquivo corrompido ou um
+    # filesystem de rede lento travem o worker indefinidamente.
+    _OPEN_TIMEOUT_MS = 30_000
+    _READ_TIMEOUT_MS = 30_000
+
     def __init__(self, settings: VideoSettings) -> None:
         self._settings = settings
         os.environ.setdefault("OPENCV_FFMPEG_READ_ATTEMPTS", "16384")
@@ -155,6 +160,19 @@ class VideoService:
         return max(1, int(round(fps * self._settings.sampling_interval_seconds)))
 
     def _open_capture(self, path: Path) -> cv2.VideoCapture:
+        timeout_params = [
+            cv2.CAP_PROP_OPEN_TIMEOUT_MSEC,
+            self._OPEN_TIMEOUT_MS,
+            cv2.CAP_PROP_READ_TIMEOUT_MSEC,
+            self._READ_TIMEOUT_MS,
+        ]
+        for candidate_path in (str(path), file_io_path(path)):
+            capture = cv2.VideoCapture(candidate_path, cv2.CAP_FFMPEG, timeout_params)
+            if capture.isOpened():
+                return capture
+            capture.release()
+        # Fallback sem timeout: deixa o OpenCV escolher outro backend (ex.: MSMF)
+        # para codecs que o FFMPEG embarcado nao decodifica.
         capture = cv2.VideoCapture(str(path))
         if capture.isOpened():
             return capture

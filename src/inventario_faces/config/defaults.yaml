@@ -36,6 +36,9 @@ video:
   significant_change_threshold: 0.15
 
 face_model:
+  # Backends aceitos: "insightface" (com fallback automatico para onnx) ou
+  # "onnx" (ONNX Runtime direto, sem o pacote insightface; mesmos modelos e
+  # embeddings equivalentes).
   backend: "insightface"
   model_name: "buffalo_l"
   # Padrao pericial: preferir aceleracao por GPU quando disponivel, com fallback automatico para CPU.

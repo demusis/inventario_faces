@@ -32,12 +32,25 @@ Issues e atualizações: [https://github.com/demusis/inventario_faces/issues](ht
 
 O pipeline foi reorganizado em módulos coesos:
 
+- `services/inventory_service.py`: orquestração do inventário (local e distribuído).
+- `services/face_search_service.py`: operação completa de `Busca por faces`.
+- `services/face_set_comparison_service.py`: comparação `Padrão` vs `Questionado`.
+- `services/lr_calibration.py`: calibração e aplicação da razão de verossimilhança (LR).
 - `services/tracking_service.py`: associação temporal, encerramento de tracks e seleção de keyframes.
 - `services/enhancement_service.py`: pré-processamento auditável para baixa iluminação e ruído.
 - `services/quality_service.py`: métricas de nitidez, iluminação e frontalidade.
-- `services/clustering_service.py`: agrupamento em nível de track.
+- `services/clustering_service.py`: agrupamento em nível de track, com ordem determinística, centroide ponderado pelo tamanho do track e passe de refinamento.
 - `services/search_service.py`: indexação vetorial com preferência por FAISS e fallback em NumPy.
+- `services/pipeline_support.py` e `services/partial_payloads.py`: helpers compartilhados de log/progresso/IO atômico e desserialização dos parciais distribuídos.
+- `infrastructure/sync_drive.py`: detecção de drives de sincronização (Google Drive/OneDrive/Dropbox) para alertar no modo distribuído.
+- `gui/comparison_statistics.py` e `gui/comparison_widgets.py`: estatística explicativa e widgets de visualização da comparação.
 - `reporting/`: geração dos relatórios LaTeX e DOCX.
+
+Comportamentos de auditoria relevantes:
+
+- no modo distribuído, se o diretório de evidências ou de execução compartilhada estiver em um drive de sincronização, o aplicativo emite alerta no log e na trilha de eventos (a execução não é bloqueada; prefira compartilhamento SMB/UNC);
+- na calibração LR, pares com escore fora do intervalo de scores usado na calibração são sinalizados (`outside_calibration_support`) no JSON, no CSV, no resumo e no rótulo de evidência, pois o LR desses pares é extrapolado;
+- nos relatórios, quando um grupo tem mais tracks do que o teto configurado, o truncamento é declarado explicitamente com referência ao `inventory/tracks.csv`.
 
 ## Entidades principais
 
@@ -129,7 +142,12 @@ pip install -e .
 
 No Windows, `requirements.txt` já instala `onnxruntime-gpu[cuda,cudnn]`. O aplicativo tenta usar GPU automaticamente quando houver provider compatível e faz fallback para CPU quando necessário.
 
-Para análise facial real:
+Para análise facial, o aplicativo embute dois backends equivalentes:
+
+- `insightface` (padrão): usa o pacote InsightFace quando instalado;
+- `onnx`: executa os mesmos modelos (`buffalo_l`) diretamente no ONNX Runtime, sem o pacote `insightface` — útil em estações com Python mais novo ou sem as dependências do InsightFace. Quando o pacote `insightface` está ausente ou quebrado, o aplicativo cai automaticamente nesse backend.
+
+Os dois produzem embeddings numericamente equivalentes (mesmos arquivos de modelo). Para instalar o pacote InsightFace (opcional):
 
 ```powershell
 pip install "insightface>=0.7.3"

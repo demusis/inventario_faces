@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from docx import Document
 from docx.enum.table import WD_ALIGN_VERTICAL, WD_TABLE_ALIGNMENT
 from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -151,6 +153,16 @@ class DocxReportGenerator:
         if not tracks:
             self._add_paragraph(document, "Nenhum track consolidado para este grupo.")
             return
+
+        max_tracks = self._config.reporting.max_tracks_per_group
+        if len(tracks) > max_tracks:
+            self._add_paragraph(
+                document,
+                (
+                    f"Exibindo {max_tracks} de {len(tracks)} tracks deste grupo; "
+                    "os demais constam integralmente em inventory/tracks.csv."
+                ),
+            )
 
         table = document.add_table(rows=1, cols=4)
         table.style = "Table Grid"

@@ -2,36 +2,21 @@ from __future__ import annotations
 
 import json
 import logging
-import math
-import shutil
-import statistics
-import tempfile
 import time
 from collections import Counter
 from collections.abc import Iterable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
-
-import numpy as np
 
 from inventario_faces.domain.config import AppConfig, LikelihoodRatioSettings
 from inventario_faces.domain.entities import (
     BoundingBox,
     EnhancementMetadata,
     FaceSetComparisonCalibration,
-    FaceSetComparisonCalibrationSummary,
-    FaceSetComparisonEntry,
-    FaceSetComparisonInput,
-    FaceSetComparisonMatch,
     FaceSetComparisonResult,
-    FaceSetComparisonSummary,
-    FaceSearchMatch,
-    FaceSearchQuery,
-    FaceSearchQueryEvent,
     FaceSearchResult,
-    FaceSearchSummary,
     FaceOccurrence,
     FaceQualityMetrics,
     FaceSizeStatistics,
@@ -39,7 +24,6 @@ from inventario_faces.domain.entities import (
     FileRecord,
     InventoryResult,
     KeyFrame,
-    MediaInfoAttribute,
     MediaInfoTrack,
     MediaType,
     ProcessingSummary,
@@ -57,7 +41,6 @@ from inventario_faces.domain.protocols import (
 )
 from inventario_faces.infrastructure.artifact_store import ArtifactStore
 from inventario_faces.infrastructure.distributed_coordination import (
-    DistributedClaim,
     DistributedCoordinator,
     DistributedExecutionSnapshot,
     DistributedHealthSnapshot,
@@ -65,35 +48,54 @@ from inventario_faces.infrastructure.distributed_coordination import (
     DistributedPartialValidation,
     DistributedPlanEntry,
 )
-from inventario_faces.infrastructure.face_mesh_renderer import (
-    draw_face_mesh,
-    load_bgr_image,
-    save_bgr_image,
-)
 from inventario_faces.infrastructure.logging_setup import (
     StructuredEventLogger,
     build_file_logger,
     close_file_logger,
-    format_exception_traceback,
-    summarize_exception,
+)
+from inventario_faces.infrastructure.sync_drive import (
+    detect_sync_provider,
+    sync_drive_warning_lines,
 )
 from inventario_faces.services.clustering_service import ClusteringService
 from inventario_faces.services.enhancement_service import EnhancementService
 from inventario_faces.services.export_service import ExportService
+from inventario_faces.services.face_search_service import FaceSearchService
+from inventario_faces.services.face_set_comparison_service import FaceSetComparisonService
 from inventario_faces.services.hashing_service import HashingService
+from inventario_faces.services.lr_calibration import LikelihoodRatioCalibrator
+from inventario_faces.services.partial_payloads import (
+    deserialize_bbox,
+    deserialize_enhancement_optional,
+    deserialize_file_record,
+    deserialize_keyframe,
+    deserialize_media_info_track,
+    deserialize_occurrence,
+    deserialize_partial_payload,
+    deserialize_quality_metrics_optional,
+    deserialize_track,
+    deserialize_track_quality_statistics,
+    parse_datetime,
+    parse_datetime_optional,
+)
+from inventario_faces.services.pipeline_support import (
+    cleanup_processing_input,
+    configuration_log_lines,
+    copy_file_with_sha512,
+    emit_exception,
+    emit_log,
+    emit_progress,
+    frames_with_original_source,
+    prepare_processing_input,
+    write_json_atomic,
+)
 from inventario_faces.services.quality_service import FaceQualityService
 from inventario_faces.services.scanner_service import ScannerService
 from inventario_faces.services.search_service import SearchIndexService
 from inventario_faces.services.tracking_service import FaceTrackingService, TrackingResult
 from inventario_faces.services.video_service import VideoSamplingInfo, VideoService
-from inventario_faces.utils.density_utils import (
-    fit_score_density_model,
-    score_density_method_label,
-    stabilize_score_density,
-)
 from inventario_faces.utils.latex import format_seconds
-from inventario_faces.utils.math_utils import cosine_similarity
-from inventario_faces.utils.path_utils import ensure_directory, file_io_path, safe_stem
+from inventario_faces.utils.path_utils import ensure_directory, safe_stem
 from inventario_faces.utils.serialization import to_serializable
 from inventario_faces.utils.time_utils import as_utc, utc_now
 
@@ -120,12 +122,6 @@ class LocalResumeContext:
     plan_entries: tuple[DistributedPlanEntry, ...]
     completed_items: tuple[dict[str, Any], ...]
     resumed: bool
-
-
-@dataclass(frozen=True)
-class PreparedFaceSearchQuery:
-    query: FaceSearchQuery
-    embedding: list[float]
 
 
 class InventoryService:
@@ -160,6 +156,30 @@ class InventoryService:
         )
         self._search_service = search_service or SearchIndexService(config.search)
         self._face_search_report_generator = face_search_report_generator
+        self._face_search = FaceSearchService(
+            config=config,
+            scanner_service=scanner_service,
+            hashing_service=hashing_service,
+            media_service=media_service,
+            clustering_service=clustering_service,
+            tracking_service=self._tracking_service,
+            search_service=self._search_service,
+            face_analyzer_factory=face_analyzer_factory,
+            report_generator=report_generator,
+            face_search_report_generator=face_search_report_generator,
+            media_info_extractor=media_info_extractor,
+        )
+        self._lr_calibrator = LikelihoodRatioCalibrator(config)
+        self._face_set_comparison = FaceSetComparisonService(
+            config=config,
+            scanner_service=scanner_service,
+            hashing_service=hashing_service,
+            media_service=media_service,
+            tracking_service=self._tracking_service,
+            face_analyzer_factory=face_analyzer_factory,
+            lr_calibrator=self._lr_calibrator,
+            media_info_extractor=media_info_extractor,
+        )
 
     def run(
         self,
@@ -227,7 +247,9 @@ class InventoryService:
                     "No primeiro uso, o bundle local pode ser preparado automaticamente."
                 ),
             )
+            analyzer_started_at = time.perf_counter()
             analyzer = self._face_analyzer_factory()
+            analyzer_elapsed = time.perf_counter() - analyzer_started_at
             providers = list(getattr(analyzer, "providers", []))
             available_providers = list(getattr(analyzer, "available_providers", []))
             using_gpu = bool(getattr(analyzer, "using_gpu", False))
@@ -240,7 +262,8 @@ class InventoryService:
                     f"providers={', '.join(providers) if providers else 'desconhecido'} | "
                     f"disponiveis={', '.join(available_providers) if available_providers else 'desconhecido'} | "
                     f"gpu={'sim' if using_gpu else 'nao'} | "
-                    f"ctx_id={self._config.face_model.ctx_id}"
+                    f"ctx_id={self._config.face_model.ctx_id} | "
+                    f"tempo={analyzer_elapsed:.2f}s"
                 ),
             )
             for line in self._configuration_log_lines(providers):
@@ -511,8 +534,33 @@ class InventoryService:
                     f"no={coordinator.hostname}:{coordinator.pid}"
                 ),
             )
+            self._warn_if_sync_drive(
+                {
+                    "Diretorio de evidencias": root_directory,
+                    "Diretorio compartilhado de execucao": run_directory,
+                },
+                text_logger,
+                log_callback,
+                event_logger,
+            )
+            self._emit_log(
+                text_logger,
+                log_callback,
+                f"[Backend facial] Inicializando modelo {self._config.face_model.model_name} para processamento distribuido.",
+            )
+            analyzer_started_at = time.perf_counter()
             analyzer = self._face_analyzer_factory()
+            analyzer_elapsed = time.perf_counter() - analyzer_started_at
             providers = list(getattr(analyzer, "providers", []))
+            self._emit_log(
+                text_logger,
+                log_callback,
+                (
+                    f"[Backend facial] Modelo pronto | "
+                    f"providers={', '.join(providers) if providers else 'desconhecido'} | "
+                    f"tempo={analyzer_elapsed:.2f}s"
+                ),
+            )
             for line in self._configuration_log_lines(providers):
                 self._emit_log(text_logger, log_callback, line)
             for line in self._planned_file_log_lines(planned_files):
@@ -967,19 +1015,7 @@ class InventoryService:
         self._write_json_atomic(path, payload)
 
     def _write_json_atomic(self, path: Path, payload: object) -> None:
-        ensure_directory(path.parent)
-        serialized = json.dumps(to_serializable(payload), indent=2, ensure_ascii=False)
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            dir=path.parent,
-            prefix=f"{path.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as stream:
-            stream.write(serialized)
-            temporary_path = Path(stream.name)
-        temporary_path.replace(path)
+        write_json_atomic(path, payload)
 
     def inspect_distributed_health(
         self,
@@ -1038,368 +1074,13 @@ class InventoryService:
     ) -> FaceSearchResult:
         """Processa o acervo e pesquisa uma ou mais faces de consulta contra as tracks indexadas."""
 
-        normalized_query_paths = self._normalize_face_search_query_paths(query_image_paths)
-
-        def inventory_progress(current: int, total: int, message: str) -> None:
-            if progress_callback is None:
-                return
-            scaled = 0 if total == 0 else int((current / total) * 85)
-            progress_callback(scaled, 100, message)
-
-        if self._config.distributed.enabled:
-            local_service = InventoryService(
-                config=replace(
-                    self._config,
-                    distributed=replace(self._config.distributed, enabled=False),
-                ),
-                scanner_service=self._scanner_service,
-                hashing_service=self._hashing_service,
-                media_service=self._media_service,
-                clustering_service=self._clustering_service,
-                report_generator=self._report_generator,
-                face_analyzer_factory=self._face_analyzer_factory,
-                media_info_extractor=self._media_info_extractor,
-                tracking_service=self._tracking_service,
-                search_service=self._search_service,
-                face_search_report_generator=self._face_search_report_generator,
-            )
-            inventory_result = local_service.run(
-                root_directory,
-                work_directory=work_directory,
-                progress_callback=inventory_progress,
-                log_callback=log_callback,
-            )
-        else:
-            inventory_result = self.run(
-                root_directory,
-                work_directory=work_directory,
-                progress_callback=inventory_progress,
-                log_callback=log_callback,
-            )
-
-        if progress_callback is not None:
-            progress_callback(88, 100, "Preparando consultas faciais")
-
-        logger = build_file_logger(inventory_result.logs_directory, self._config.app.log_level)
-        event_logger = StructuredEventLogger(inventory_result.logs_directory / "events.jsonl")
-        export_service = ExportService(inventory_result.run_directory)
-        try:
-            self._emit_log(
-                logger,
-                log_callback,
-                f"[Logs] Texto={inventory_result.logs_directory / 'run.log'} | eventos={inventory_result.logs_directory / 'events.jsonl'}",
-            )
-            self._emit_log(
-                logger,
-                log_callback,
-                f"[Busca por faces] Imagens de consulta informadas: {len(normalized_query_paths)}",
-            )
-            for index, query_path in enumerate(normalized_query_paths, start=1):
-                self._emit_log(
-                    logger,
-                    log_callback,
-                    f"[Busca por faces] Consulta {index}/{len(normalized_query_paths)}: {query_path}",
-                )
-            analyzer = self._face_analyzer_factory()
-            prepared_queries, detected_face_total, rejected_queries, query_events = self._prepare_face_search_queries(
-                query_paths=normalized_query_paths,
-                inventory_result=inventory_result,
-                analyzer=analyzer,
-                logger=logger,
-                log_callback=log_callback,
-                event_logger=event_logger,
-                progress_callback=progress_callback,
-            )
-
-            if progress_callback is not None:
-                progress_callback(
-                    94,
-                    100,
-                    "Executando busca vetorial das consultas"
-                    if prepared_queries
-                    else "Nenhuma consulta válida; gerando relatório auditável",
-                )
-
-            query_hit_sets = (
-                [
-                    (
-                        prepared.query,
-                        self._search_service.search(
-                            prepared.embedding,
-                            inventory_result.tracks,
-                            inventory_result.clusters,
-                            inventory_result.occurrences,
-                        ),
-                    )
-                    for prepared in prepared_queries
-                ]
-                if prepared_queries
-                else []
-            )
-            matches = self._resolve_face_search_matches(inventory_result, query_hit_sets)
-            summary = FaceSearchSummary(
-                query_faces_detected=detected_face_total,
-                compatible_clusters=len({item.cluster_id for item in matches if item.cluster_id is not None}),
-                compatible_tracks=len(matches),
-                compatible_occurrences=len([item for item in matches if item.occurrence_id is not None]),
-                compatibility_threshold=self._config.clustering.candidate_similarity,
-                query_image_count=len(normalized_query_paths),
-                query_faces_selected=len(prepared_queries),
-                query_images_rejected=rejected_queries,
-            )
-
-            if self._face_search_report_generator is None:
-                raise RuntimeError("Gerador de relatório de busca por faces nao configurado.")
-
-            preliminary = FaceSearchResult(
-                inventory_result=inventory_result,
-                query=prepared_queries[0].query if prepared_queries else None,
-                matches=matches,
-                summary=summary,
-                report=ReportArtifacts(
-                    tex_path=inventory_result.run_directory / "report" / "relatorio_busca_por_face.tex",
-                    pdf_path=None,
-                    docx_path=inventory_result.run_directory / "report" / "relatorio_busca_por_face.docx",
-                ),
-                export_path=export_service.inventory_directory / "face_search.json",
-                queries=[prepared.query for prepared in prepared_queries],
-                query_events=query_events,
-            )
-
-            if progress_callback is not None:
-                progress_callback(97, 100, "Gerando relatórios da busca por faces")
-
-            report_artifacts = self._face_search_report_generator.generate(preliminary)
-            final_result = replace(preliminary, report=report_artifacts)
-            export_service.write_face_search_json(final_result)
-            self._emit_log(
-                logger,
-                log_callback,
-                (
-                    f"[Busca por faces] Consultas válidas={len(prepared_queries)} | "
-                    f"consultas descartadas={rejected_queries} | faces_detectadas={detected_face_total}"
-                ),
-            )
-            self._emit_log(
-                logger,
-                log_callback,
-                (
-                    f"[Busca por faces] Compatibilidades encontradas | grupos={summary.compatible_clusters} | "
-                    f"tracks={summary.compatible_tracks} | ocorrencias={summary.compatible_occurrences}"
-                ),
-            )
-            if not prepared_queries:
-                self._emit_log(
-                    logger,
-                    log_callback,
-                    "[Busca por faces] Nenhuma consulta válida foi selecionada; a busca vetorial foi pulada e o relatório auditável foi gerado com os eventos das consultas.",
-                )
-            event_logger.write(
-                "face_search_finished",
-                query_count=len(normalized_query_paths),
-                selected_queries=len(prepared_queries),
-                rejected_queries=rejected_queries,
-                compatible_clusters=summary.compatible_clusters,
-                compatible_tracks=summary.compatible_tracks,
-                compatible_occurrences=summary.compatible_occurrences,
-                report_pdf=report_artifacts.pdf_path,
-                report_tex=report_artifacts.tex_path,
-                report_docx=report_artifacts.docx_path,
-                export_path=final_result.export_path,
-            )
-            if progress_callback is not None:
-                progress_callback(100, 100, "Busca por faces concluída")
-            return final_result
-        except Exception as exc:
-            error_summary, traceback_text = self._emit_exception(
-                logger,
-                log_callback,
-                "[Busca por faces] Falha fatal",
-                exc,
-                include_traceback_in_callback=True,
-            )
-            event_logger.write(
-                "face_search_failed",
-                query_count=len(normalized_query_paths),
-                error=error_summary,
-                error_type=type(exc).__name__,
-                traceback=traceback_text,
-            )
-            raise
-        finally:
-            close_file_logger(logger)
-
-    def _normalize_face_search_query_paths(
-        self,
-        query_image_paths: Path | Iterable[Path],
-    ) -> list[Path]:
-        if isinstance(query_image_paths, Path):
-            raw_paths = [query_image_paths]
-        else:
-            raw_paths = [Path(path) for path in query_image_paths]
-
-        if not raw_paths:
-            raise ValueError("Selecione ao menos uma imagem de consulta para a busca por faces.")
-
-        normalized: list[Path] = []
-        seen_paths: set[Path] = set()
-        for raw_path in raw_paths:
-            resolved = Path(raw_path).expanduser().resolve()
-            if resolved in seen_paths:
-                continue
-            seen_paths.add(resolved)
-            normalized.append(resolved)
-        return normalized
-
-    def _prepare_face_search_queries(
-        self,
-        *,
-        query_paths: list[Path],
-        inventory_result: InventoryResult,
-        analyzer: FaceAnalyzer,
-        logger: logging.Logger,
-        log_callback: LogCallback | None,
-        event_logger: StructuredEventLogger,
-        progress_callback: ProgressCallback | None,
-    ) -> tuple[list[PreparedFaceSearchQuery], int, int, list[FaceSearchQueryEvent]]:
-        prepared_queries: list[PreparedFaceSearchQuery] = []
-        query_events: list[FaceSearchQueryEvent] = []
-        detected_face_total = 0
-        rejected_queries = 0
-        total_queries = len(query_paths)
-
-        for index, query_path in enumerate(query_paths, start=1):
-            progress_value = 88 + int(((index - 1) / max(1, total_queries)) * 6)
-            self._emit_progress(
-                progress_callback,
-                progress_value,
-                100,
-                f"Analisando consultas faciais ({index}/{total_queries})",
-            )
-            processing_query_path: Path | None = None
-            query_cleanup_path: Path | None = None
-            query_sha512: str | None = None
-            detected_faces_in_query: int | None = None
-            try:
-                processing_query_path, query_sha512, query_cleanup_path = self._prepare_processing_input(
-                    file_path=query_path,
-                    media_type=MediaType.IMAGE,
-                    file_prefix=f"[Busca por faces] Consulta {index}/{total_queries}",
-                    text_logger=logger,
-                    log_callback=log_callback,
-                )
-                query_tracking = self._tracking_service.process_media(
-                    source_path=query_path,
-                    sha512=query_sha512,
-                    media_type=MediaType.IMAGE,
-                    frames=self._frames_with_original_source(
-                        [self._media_service.load_image(processing_query_path)],
-                        query_path,
-                    ),
-                    analyzer=analyzer,
-                    artifact_store=ArtifactStore(
-                        inventory_result.run_directory / "face_search_queries" / f"query_{index:04d}"
-                    ),
-                    id_namespace=f"Q{index:03d}",
-                        event_callback=lambda event, fields: event_logger.write(event, **fields),
-                        text_callback=lambda message: self._emit_log(logger, log_callback, message),
-                    )
-                detected_faces_in_query = len(query_tracking.tracks)
-                detected_face_total += detected_faces_in_query
-                query_track, query_occurrence = self._select_query_face(query_tracking)
-                query_keyframe = next(
-                    (item for item in query_tracking.keyframes if item.track_id == query_track.track_id),
-                    None,
-                )
-                query = FaceSearchQuery(
-                    source_path=query_path,
-                    sha512=query_sha512,
-                    detected_face_count=len(query_tracking.tracks),
-                    selected_track_id=query_track.track_id,
-                    selected_occurrence_id=query_occurrence.occurrence_id,
-                    selected_keyframe_id=query_keyframe.keyframe_id if query_keyframe is not None else None,
-                    crop_path=query_occurrence.crop_path,
-                    context_image_path=query_occurrence.context_image_path,
-                    quality_score=(
-                        query_occurrence.quality_metrics.score
-                        if query_occurrence.quality_metrics is not None
-                        else None
-                    ),
-                    query_index=index,
-                )
-                prepared_queries.append(
-                    PreparedFaceSearchQuery(
-                        query=query,
-                        embedding=list(query_track.average_embedding),
-                    )
-                )
-                query_events.append(
-                    FaceSearchQueryEvent(
-                        query_index=index,
-                        source_path=query_path,
-                        status="selected",
-                        sha512=query_sha512,
-                        detected_face_count=detected_faces_in_query,
-                        selected_track_id=query_track.track_id,
-                        selected_occurrence_id=query_occurrence.occurrence_id,
-                        selected_keyframe_id=query_keyframe.keyframe_id if query_keyframe is not None else None,
-                        crop_path=query_occurrence.crop_path,
-                        context_image_path=query_occurrence.context_image_path,
-                        quality_score=(
-                            query_occurrence.quality_metrics.score
-                            if query_occurrence.quality_metrics is not None
-                            else None
-                        ),
-                    )
-                )
-                event_logger.write(
-                    "face_search_query_selected",
-                    query_index=index,
-                    query_path=query_path,
-                    query_track_id=query_track.track_id,
-                    query_occurrence_id=query_occurrence.occurrence_id,
-                    query_keyframe_id=query_keyframe.keyframe_id if query_keyframe is not None else None,
-                    detected_faces=len(query_tracking.tracks),
-                )
-                self._emit_log(
-                    logger,
-                    log_callback,
-                    (
-                        f"[Busca por faces] Consulta {index}/{total_queries} selecionada | "
-                        f"track={query_track.track_id} | faces_elegiveis={detected_faces_in_query}"
-                    ),
-                )
-            except Exception as exc:
-                rejected_queries += 1
-                reason = summarize_exception(exc)
-                query_events.append(
-                    FaceSearchQueryEvent(
-                        query_index=index,
-                        source_path=query_path,
-                        status="rejected",
-                        sha512=query_sha512,
-                        detected_face_count=detected_faces_in_query,
-                        error_message=reason,
-                        error_type=type(exc).__name__,
-                    )
-                )
-                self._emit_log(
-                    logger,
-                    log_callback,
-                    f"[Busca por faces] Consulta {index}/{total_queries} descartada: {reason}",
-                )
-                event_logger.write(
-                    "face_search_query_rejected",
-                    query_index=index,
-                    query_path=query_path,
-                    error=reason,
-                    error_type=type(exc).__name__,
-                )
-            finally:
-                if query_cleanup_path is not None:
-                    self._cleanup_processing_input(query_cleanup_path)
-
-        return prepared_queries, detected_face_total, rejected_queries, query_events
+        return self._face_search.run_face_search(
+            root_directory,
+            query_image_paths,
+            work_directory=work_directory,
+            progress_callback=progress_callback,
+            log_callback=log_callback,
+        )
 
     def compare_face_sets(
         self,
@@ -1412,569 +1093,28 @@ class InventoryService:
         log_callback: LogCallback | None = None,
     ) -> FaceSetComparisonResult:
         """Compara dois conjuntos de imagens faciais usando o mesmo pipeline de selecao e embedding."""
-
-        normalized_a = self._normalize_face_set_paths(set_a_paths, "Padrão")
-        normalized_b = self._normalize_face_set_paths(set_b_paths, "Questionado")
-        normalized_calibration_root = self._normalize_calibration_root(calibration_root)
-        normalized_calibration_model_path = self._normalize_calibration_model_path(calibration_model_path)
-        calibration_plan = (
-            self._discover_likelihood_ratio_calibration_plan(normalized_calibration_root)
-            if normalized_calibration_root is not None and normalized_calibration_model_path is None
-            else []
+        return self._face_set_comparison.compare_face_sets(
+            set_a_paths,
+            set_b_paths,
+            work_directory=work_directory,
+            calibration_root=calibration_root,
+            calibration_model_path=calibration_model_path,
+            progress_callback=progress_callback,
+            log_callback=log_callback,
         )
-        started_at_utc = utc_now()
-        work_root = self._resolve_comparison_work_directory(normalized_a, normalized_b, work_directory)
-        output_root = ensure_directory(work_root / self._config.app.output_directory_name)
-        run_directory = ensure_directory(output_root / f"comparison_{started_at_utc.strftime('%Y%m%d_%H%M%S')}")
-        logs_directory = ensure_directory(run_directory / "logs")
-        text_logger = build_file_logger(logs_directory, self._config.app.log_level)
-        event_logger = StructuredEventLogger(logs_directory / "events.jsonl")
-        export_service = ExportService(run_directory)
-        total_inputs = len(normalized_a) + len(normalized_b)
-        total_calibration_inputs = sum(len(paths) for _, paths in calibration_plan)
-        total_steps = max(
-            1,
-            total_inputs
-            + total_calibration_inputs
-            + 2
-            + (1 if calibration_plan or normalized_calibration_model_path is not None else 0),
-        )
-
-        try:
-            self._emit_progress(progress_callback, 0, total_steps, "Inicializando comparacao entre conjuntos")
-            self._emit_log(text_logger, log_callback, f"Diretorio de trabalho: {work_root}")
-            self._emit_log(text_logger, log_callback, f"Diretorio de execucao: {run_directory}")
-            self._emit_log(
-                text_logger,
-                log_callback,
-                f"[Logs] Texto={logs_directory / 'run.log'} | eventos={logs_directory / 'events.jsonl'}",
-            )
-            self._emit_log(
-                text_logger,
-                log_callback,
-                (
-                    f"[Comparacao] Padrão={len(normalized_a)} imagem(ns) | "
-                    f"Questionado={len(normalized_b)} imagem(ns)"
-                ),
-            )
-            loaded_calibration: FaceSetComparisonCalibration | None = None
-            if normalized_calibration_model_path is not None:
-                loaded_calibration = self.load_face_set_comparison_calibration_model(
-                    normalized_calibration_model_path
-                )
-                self._emit_log(
-                    text_logger,
-                    log_callback,
-                    (
-                        f"[Calibracao LR] Modelo salvo={normalized_calibration_model_path} | "
-                        f"mesma_origem={len(loaded_calibration.genuine_scores)} | "
-                        f"origem_distinta={len(loaded_calibration.impostor_scores)}"
-                    ),
-                )
-                if normalized_calibration_root is not None:
-                    self._emit_log(
-                        text_logger,
-                        log_callback,
-                        "[Calibracao LR] A base rotulada foi ignorada porque um modelo salvo foi informado.",
-                    )
-            elif normalized_calibration_root is not None:
-                self._emit_log(
-                    text_logger,
-                    log_callback,
-                    (
-                        f"[Calibracao LR] Base rotulada={normalized_calibration_root} | "
-                        f"identidades={len(calibration_plan)} | imagens={total_calibration_inputs}"
-                    ),
-                )
-            self._emit_log(
-                text_logger,
-                log_callback,
-                (
-                    f"[Backend facial] Inicializando modelo {self._config.face_model.model_name} "
-                    "para comparacao direta entre conjuntos."
-                ),
-            )
-            analyzer = self._face_analyzer_factory()
-            providers = list(getattr(analyzer, "providers", []))
-            available_providers = list(getattr(analyzer, "available_providers", []))
-            using_gpu = bool(getattr(analyzer, "using_gpu", False))
-            self._emit_log(
-                text_logger,
-                log_callback,
-                (
-                    f"[Backend facial] Modelo pronto | "
-                    f"diretorio={getattr(analyzer, '_model_dir', '-')} | "
-                    f"providers={', '.join(providers) if providers else 'desconhecido'} | "
-                    f"disponiveis={', '.join(available_providers) if available_providers else 'desconhecido'} | "
-                    f"gpu={'sim' if using_gpu else 'nao'} | "
-                    f"ctx_id={self._config.face_model.ctx_id}"
-                ),
-            )
-
-            procedure_details = tuple(
-                self._comparison_procedure_lines(
-                    providers=providers,
-                    set_a_paths=normalized_a,
-                    set_b_paths=normalized_b,
-                    calibration_root=normalized_calibration_root,
-                    calibration_plan=calibration_plan,
-                    calibration_model_path=normalized_calibration_model_path,
-                )
-            )
-            for line in procedure_details:
-                self._emit_log(text_logger, log_callback, line)
-
-            event_logger.write(
-                "face_set_comparison_started",
-                run_directory=run_directory,
-                work_directory=work_root,
-                set_a_paths=normalized_a,
-                set_b_paths=normalized_b,
-                calibration_root=normalized_calibration_root,
-                calibration_model_path=normalized_calibration_model_path,
-                configuration=self._config,
-                providers=providers,
-            )
-
-            set_a_inputs: list[FaceSetComparisonInput] = []
-            set_b_inputs: list[FaceSetComparisonInput] = []
-            set_a_faces: list[FaceSetComparisonEntry] = []
-            set_b_faces: list[FaceSetComparisonEntry] = []
-            calibration_inputs: list[FaceSetComparisonInput] = []
-            calibration_entries: list[FaceSetComparisonEntry] = []
-            entry_sequence = [0]
-            completed_inputs = 0
-
-            for index, image_path in enumerate(normalized_a, start=1):
-                input_record, entries = self._process_comparison_input(
-                    set_label="A",
-                    image_path=image_path,
-                    index=index,
-                    total_images=len(normalized_a),
-                    analyzer=analyzer,
-                    run_directory=run_directory,
-                    export_directory=export_service.comparison_directory,
-                    entry_sequence=entry_sequence,
-                    event_logger=event_logger,
-                    text_logger=text_logger,
-                    log_callback=log_callback,
-                )
-                set_a_inputs.append(input_record)
-                set_a_faces.extend(entries)
-                completed_inputs += 1
-                self._emit_progress(
-                    progress_callback,
-                    completed_inputs,
-                    total_steps,
-                    f"Padrão processado ({index}/{len(normalized_a)})",
-                )
-
-            for index, image_path in enumerate(normalized_b, start=1):
-                input_record, entries = self._process_comparison_input(
-                    set_label="B",
-                    image_path=image_path,
-                    index=index,
-                    total_images=len(normalized_b),
-                    analyzer=analyzer,
-                    run_directory=run_directory,
-                    export_directory=export_service.comparison_directory,
-                    entry_sequence=entry_sequence,
-                    event_logger=event_logger,
-                    text_logger=text_logger,
-                    log_callback=log_callback,
-                )
-                set_b_inputs.append(input_record)
-                set_b_faces.extend(entries)
-                completed_inputs += 1
-                self._emit_progress(
-                    progress_callback,
-                    completed_inputs,
-                    total_steps,
-                    f"Questionado processado ({index}/{len(normalized_b)})",
-                )
-
-            if not set_a_faces:
-                raise RuntimeError("Nenhuma face valida foi selecionada no grupo Padrão.")
-            if not set_b_faces:
-                raise RuntimeError("Nenhuma face valida foi selecionada no grupo Questionado.")
-
-            calibration: FaceSetComparisonCalibration | None = loaded_calibration
-            if calibration_plan:
-                calibration_entry_sequence = [0]
-                for identity_index, (identity_label, identity_paths) in enumerate(calibration_plan, start=1):
-                    for image_index, image_path in enumerate(identity_paths, start=1):
-                        input_record, entries = self._process_calibration_input(
-                            identity_label=identity_label,
-                            image_path=image_path,
-                            identity_index=identity_index,
-                            image_index=image_index,
-                            total_images=len(identity_paths),
-                            analyzer=analyzer,
-                            run_directory=run_directory,
-                            export_directory=export_service.comparison_directory,
-                            entry_sequence=calibration_entry_sequence,
-                            event_logger=event_logger,
-                            text_logger=text_logger,
-                            log_callback=log_callback,
-                        )
-                        calibration_inputs.append(input_record)
-                        calibration_entries.extend(entries)
-                        completed_inputs += 1
-                        self._emit_progress(
-                            progress_callback,
-                            completed_inputs,
-                            total_steps,
-                            (
-                                f"Calibracao LR: {identity_label} "
-                                f"({image_index}/{len(identity_paths)})"
-                            ),
-                        )
-
-            self._emit_progress(progress_callback, completed_inputs + 1, total_steps, "Calculando similaridades")
-            matches = self._build_face_set_comparison_matches(
-                set_a_faces,
-                set_b_faces,
-                progress_callback=progress_callback,
-                progress_current=completed_inputs + 1,
-                progress_total=total_steps,
-                text_logger=text_logger,
-                log_callback=log_callback,
-                event_logger=event_logger,
-            )
-            if calibration_plan:
-                self._emit_progress(
-                    progress_callback,
-                    completed_inputs + 2,
-                    total_steps,
-                    "Calibrando razao de verossimilhanca",
-                )
-                calibration = self._build_face_set_comparison_calibration(
-                    dataset_root=normalized_calibration_root,
-                    calibration_plan=calibration_plan,
-                    inputs=calibration_inputs,
-                    entries=calibration_entries,
-                    progress_callback=progress_callback,
-                    progress_current=completed_inputs + 2,
-                    progress_total=total_steps,
-                    text_logger=text_logger,
-                    log_callback=log_callback,
-                    event_logger=event_logger,
-                )
-                for line in self._calibration_summary_log_lines(calibration.summary):
-                    self._emit_log(text_logger, log_callback, line)
-                if calibration.summary.support_ready:
-                    matches = self._apply_face_set_likelihood_ratio_calibration(
-                        matches,
-                        calibration,
-                        progress_callback=progress_callback,
-                        progress_current=completed_inputs + 2,
-                        progress_total=total_steps,
-                        text_logger=text_logger,
-                        log_callback=log_callback,
-                        event_logger=event_logger,
-                    )
-            elif calibration is not None:
-                self._emit_progress(
-                    progress_callback,
-                    completed_inputs + 2,
-                    total_steps,
-                    "Aplicando modelo de calibracao LR salvo",
-                )
-                for line in self._calibration_summary_log_lines(calibration.summary):
-                    self._emit_log(text_logger, log_callback, line)
-                if calibration.summary.support_ready:
-                    matches = self._apply_face_set_likelihood_ratio_calibration(
-                        matches,
-                        calibration,
-                        progress_callback=progress_callback,
-                        progress_current=completed_inputs + 2,
-                        progress_total=total_steps,
-                        text_logger=text_logger,
-                        log_callback=log_callback,
-                        event_logger=event_logger,
-                    )
-            calibration_model_export_path = export_service.comparison_directory / "face_set_comparison_calibration_model.json"
-            if calibration is not None and not calibration.loaded_from_model:
-                calibration = replace(calibration, model_path=calibration_model_export_path)
-            summary = self._build_face_set_comparison_summary(
-                set_a_inputs=set_a_inputs,
-                set_b_inputs=set_b_inputs,
-                matches=matches,
-            )
-            finished_at_utc = utc_now()
-            manifest_path = export_service.comparison_directory / "face_set_comparison.json"
-            result = FaceSetComparisonResult(
-                run_directory=run_directory,
-                started_at_utc=started_at_utc,
-                finished_at_utc=finished_at_utc,
-                logs_directory=logs_directory,
-                export_directory=export_service.comparison_directory,
-                manifest_path=manifest_path,
-                set_a_inputs=set_a_inputs,
-                set_b_inputs=set_b_inputs,
-                set_a_faces=set_a_faces,
-                set_b_faces=set_b_faces,
-                matches=matches,
-                summary=summary,
-                calibration=calibration,
-                procedure_details=procedure_details,
-            )
-
-            export_service.write_face_set_comparison_inputs_csv("face_set_comparison_inputs_a.csv", set_a_inputs)
-            export_service.write_face_set_comparison_inputs_csv("face_set_comparison_inputs_b.csv", set_b_inputs)
-            export_service.write_face_set_comparison_entries_csv("face_set_comparison_entries_a.csv", set_a_faces)
-            export_service.write_face_set_comparison_entries_csv("face_set_comparison_entries_b.csv", set_b_faces)
-            if calibration is not None:
-                if calibration.inputs:
-                    export_service.write_face_set_comparison_inputs_csv(
-                        "face_set_comparison_calibration_inputs.csv",
-                        calibration.inputs,
-                    )
-                if calibration.entries:
-                    export_service.write_face_set_comparison_entries_csv(
-                        "face_set_comparison_calibration_entries.csv",
-                        calibration.entries,
-                    )
-                export_service.write_face_set_comparison_calibration_scores_csv(calibration)
-                self.save_face_set_comparison_calibration_model(calibration, calibration_model_export_path)
-            export_service.write_face_set_comparison_matches_csv(result)
-            export_service.write_face_set_comparison_summary_text(result)
-            export_service.write_face_set_comparison_json(result)
-
-            for line in self._comparison_summary_log_lines(summary):
-                self._emit_log(text_logger, log_callback, line)
-
-            event_logger.write(
-                "face_set_comparison_finished",
-                run_directory=run_directory,
-                set_a_faces=len(set_a_faces),
-                set_b_faces=len(set_b_faces),
-                total_pair_comparisons=summary.total_pair_comparisons,
-                assignment_matches=summary.assignment_matches,
-                candidate_matches=summary.candidate_matches,
-                likelihood_ratio_calibrated=summary.likelihood_ratio_calibrated,
-                export_directory=export_service.comparison_directory,
-                manifest_path=manifest_path,
-            )
-            self._emit_progress(progress_callback, total_steps, total_steps, "Comparacao concluida")
-            return result
-        except Exception as exc:
-            error_summary, traceback_text = self._emit_exception(
-                text_logger,
-                log_callback,
-                "[Comparacao] Falha fatal",
-                exc,
-                include_traceback_in_callback=True,
-            )
-            event_logger.write(
-                "face_set_comparison_failed",
-                error=error_summary,
-                error_type=type(exc).__name__,
-                traceback=traceback_text,
-                set_a_paths=normalized_a,
-                set_b_paths=normalized_b,
-            )
-            raise
-        finally:
-            close_file_logger(text_logger)
-
-    def _normalize_face_set_paths(self, paths: list[Path], set_name: str) -> list[Path]:
-        normalized: list[Path] = []
-        seen: set[Path] = set()
-        if not paths:
-            raise ValueError(f"{set_name} precisa conter ao menos uma imagem.")
-        for raw_path in paths:
-            candidate = Path(raw_path).resolve()
-            if not candidate.exists():
-                raise FileNotFoundError(f"Imagem nao encontrada em {set_name}: {candidate}")
-            if candidate in seen:
-                continue
-            seen.add(candidate)
-            normalized.append(candidate)
-        if not normalized:
-            raise ValueError(f"{set_name} precisa conter ao menos uma imagem valida.")
-        return normalized
-
-    def _resolve_comparison_work_directory(
-        self,
-        set_a_paths: list[Path],
-        set_b_paths: list[Path],
-        work_directory: Path | None,
-    ) -> Path:
-        if work_directory is not None:
-            return Path(work_directory).resolve()
-        return set_a_paths[0].parent.resolve() if set_a_paths else set_b_paths[0].parent.resolve()
-
-    def _comparison_group_label(self, set_label: str) -> str:
-        if set_label == "A":
-            return "Padrão"
-        if set_label == "B":
-            return "Questionado"
-        if set_label == "CAL":
-            return "Calibração LR"
-        return set_label
-
-    def _normalize_calibration_root(self, calibration_root: Path | None) -> Path | None:
-        if calibration_root is None:
-            return None
-        candidate = Path(calibration_root).resolve()
-        if not candidate.exists():
-            raise FileNotFoundError(f"Base de calibracao nao encontrada: {candidate}")
-        if not candidate.is_dir():
-            raise NotADirectoryError(f"Base de calibracao invalida: {candidate}")
-        return candidate
-
-    def _normalize_calibration_model_path(self, calibration_model_path: Path | None) -> Path | None:
-        if calibration_model_path is None:
-            return None
-        candidate = Path(calibration_model_path).resolve()
-        if not candidate.exists():
-            raise FileNotFoundError(f"Modelo de calibracao nao encontrado: {candidate}")
-        if not candidate.is_file():
-            raise IsADirectoryError(f"Modelo de calibracao invalido: {candidate}")
-        return candidate
 
     def save_face_set_comparison_calibration_model(
         self,
         calibration: FaceSetComparisonCalibration,
         output_path: Path,
     ) -> Path:
-        candidate = Path(output_path).resolve()
-        if candidate.exists() and candidate.is_dir():
-            raise IsADirectoryError(f"O destino do modelo de calibracao precisa ser um arquivo: {candidate}")
-        payload = {
-            "schema": "face_set_comparison_calibration_model",
-            "version": 1,
-            "saved_at_utc": utc_now(),
-            "summary": calibration.summary,
-            "genuine_scores": calibration.genuine_scores,
-            "impostor_scores": calibration.impostor_scores,
-            "procedure_details": calibration.procedure_details,
-            "settings_snapshot": calibration.settings_snapshot,
-            "loaded_from_model": calibration.loaded_from_model,
-            "source_model_path": calibration.model_path,
-        }
-        self._write_json_atomic(candidate, payload)
-        return candidate
+        return self._lr_calibrator.save_face_set_comparison_calibration_model(calibration, output_path)
 
     def load_face_set_comparison_calibration_model(
         self,
         model_path: Path,
     ) -> FaceSetComparisonCalibration:
-        candidate = self._normalize_calibration_model_path(model_path)
-        if candidate is None:
-            raise ValueError("O caminho do modelo de calibracao precisa ser informado.")
-        try:
-            payload = json.loads(candidate.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"Modelo de calibracao invalido: {candidate}") from exc
-        if not isinstance(payload, dict):
-            raise ValueError(f"Modelo de calibracao invalido: {candidate}")
-        if payload.get("schema") != "face_set_comparison_calibration_model":
-            raise ValueError(f"Arquivo nao reconhecido como modelo de calibracao LR: {candidate}")
-
-        summary_payload = payload.get("summary")
-        if not isinstance(summary_payload, dict):
-            raise ValueError(f"Resumo ausente no modelo de calibracao: {candidate}")
-
-        def _optional_float(value: object) -> float | None:
-            if value in (None, ""):
-                return None
-            return float(value)
-
-        def _optional_text(value: object) -> str | None:
-            if value in (None, ""):
-                return None
-            return str(value)
-
-        def _float_list(field_name: str) -> list[float]:
-            values = payload.get(field_name, [])
-            if not isinstance(values, list):
-                raise ValueError(f"Campo invalido no modelo de calibracao: {field_name}")
-            return [float(item) for item in values]
-
-        procedure_payload = payload.get("procedure_details", [])
-        if not isinstance(procedure_payload, list):
-            raise ValueError("Campo invalido no modelo de calibracao: procedure_details")
-
-        dataset_root_value = summary_payload.get("dataset_root")
-        if dataset_root_value in (None, ""):
-            raise ValueError(f"Modelo de calibracao sem dataset_root: {candidate}")
-
-        summary = FaceSetComparisonCalibrationSummary(
-            dataset_root=Path(str(dataset_root_value)),
-            identity_count=int(summary_payload.get("identity_count", 0)),
-            processed_identities=int(summary_payload.get("processed_identities", 0)),
-            input_images=int(summary_payload.get("input_images", 0)),
-            processed_images=int(summary_payload.get("processed_images", 0)),
-            selected_faces=int(summary_payload.get("selected_faces", 0)),
-            identities_with_selected_faces=int(summary_payload.get("identities_with_selected_faces", 0)),
-            genuine_pair_total=int(summary_payload.get("genuine_pair_total", 0)),
-            impostor_pair_total=int(summary_payload.get("impostor_pair_total", 0)),
-            genuine_score_count=int(summary_payload.get("genuine_score_count", 0)),
-            impostor_score_count=int(summary_payload.get("impostor_score_count", 0)),
-            support_ready=bool(summary_payload.get("support_ready", False)),
-            support_note=_optional_text(summary_payload.get("support_note")),
-            score_min=_optional_float(summary_payload.get("score_min")),
-            score_max=_optional_float(summary_payload.get("score_max")),
-            density_method=str(summary_payload.get("density_method") or "bounded_logit_kde"),
-            smoothing_note=_optional_text(summary_payload.get("smoothing_note")),
-        )
-        settings_snapshot = self._deserialize_likelihood_ratio_settings(
-            payload.get("settings_snapshot"),
-            legacy_density_method=summary.density_method,
-        )
-        return FaceSetComparisonCalibration(
-            summary=summary,
-            genuine_scores=_float_list("genuine_scores"),
-            impostor_scores=_float_list("impostor_scores"),
-            procedure_details=tuple(str(item) for item in procedure_payload),
-            settings_snapshot=settings_snapshot,
-            model_path=candidate,
-            loaded_from_model=True,
-        )
-
-    def _deserialize_likelihood_ratio_settings(
-        self,
-        payload: object,
-        *,
-        legacy_density_method: str | None = None,
-    ) -> LikelihoodRatioSettings | None:
-        if payload in (None, ""):
-            if legacy_density_method in (None, ""):
-                return None
-            return LikelihoodRatioSettings(density_estimator=str(legacy_density_method))
-        if not isinstance(payload, dict):
-            raise ValueError("Campo invalido no modelo de calibracao: settings_snapshot")
-        return LikelihoodRatioSettings(
-            max_scores_per_distribution=int(payload.get("max_scores_per_distribution", 20000)),
-            minimum_identities_with_faces=int(payload.get("minimum_identities_with_faces", 2)),
-            minimum_same_source_scores=int(payload.get("minimum_same_source_scores", 5)),
-            minimum_different_source_scores=int(payload.get("minimum_different_source_scores", 5)),
-            minimum_unique_scores_per_distribution=int(
-                payload.get("minimum_unique_scores_per_distribution", 2)
-            ),
-            density_estimator=str(
-                payload.get("density_estimator", legacy_density_method or "bounded_logit_kde")
-            ),
-            kde_bandwidth_scale=float(payload.get("kde_bandwidth_scale", 1.0)),
-            kde_uniform_floor_weight=float(payload.get("kde_uniform_floor_weight", 0.001)),
-            kde_min_density=float(payload.get("kde_min_density", 1e-12)),
-        )
-
-    def _likelihood_ratio_smoothing_note(self, settings: LikelihoodRatioSettings) -> str:
-        return (
-            f"{score_density_method_label(settings.density_estimator)} estabilizada com piso uniforme de "
-            f"{settings.kde_uniform_floor_weight:.4%} e densidade minima de "
-            f"{settings.kde_min_density:.1e}."
-        )
-
-    def _likelihood_ratio_density_procedure_detail(self, settings: LikelihoodRatioSettings) -> str:
-        return (
-            "[Calibracao LR] A densidade de cada score foi estimada com "
-            f"{score_density_method_label(settings.density_estimator)} "
-            f"(banda x{settings.kde_bandwidth_scale:.3f}) e piso uniforme para evitar densidades nulas."
-        )
+        return self._lr_calibrator.load_face_set_comparison_calibration_model(model_path)
 
     def migrate_face_set_comparison_calibration_model(
         self,
@@ -1983,1302 +1123,11 @@ class InventoryService:
         *,
         target_settings: LikelihoodRatioSettings | None = None,
     ) -> Path:
-        source_model = self.load_face_set_comparison_calibration_model(model_path)
-        source_path = self._normalize_calibration_model_path(model_path)
-        if source_path is None:
-            raise ValueError("O caminho do modelo de calibracao precisa ser informado.")
-        settings = target_settings or self._config.likelihood_ratio
-        source_settings = source_model.settings_snapshot
-        source_method = (
-            source_settings.density_estimator
-            if source_settings is not None
-            else source_model.summary.density_method
+        return self._lr_calibrator.migrate_face_set_comparison_calibration_model(
+            model_path,
+            output_path,
+            target_settings=target_settings,
         )
-        retained_details = [
-            line
-            for line in source_model.procedure_details
-            if "A densidade de cada score foi estimada com " not in line
-            and "Modelo migrado sem reprocessar imagens" not in line
-        ]
-        migrated_details = tuple(
-            [
-                *retained_details,
-                self._likelihood_ratio_density_procedure_detail(settings),
-                (
-                    "[Calibracao LR] Modelo migrado sem reprocessar imagens; "
-                    f"scores reaproveitados de {source_path} | "
-                    f"metodo_origem={source_method} | metodo_destino={settings.density_estimator}."
-                ),
-            ]
-        )
-        migrated_summary = replace(
-            source_model.summary,
-            density_method=settings.density_estimator,
-            smoothing_note=self._likelihood_ratio_smoothing_note(settings),
-        )
-        migrated_model = replace(
-            source_model,
-            summary=migrated_summary,
-            procedure_details=migrated_details,
-            settings_snapshot=settings,
-            model_path=source_path,
-            loaded_from_model=False,
-        )
-        return self.save_face_set_comparison_calibration_model(migrated_model, output_path)
-
-    def _discover_likelihood_ratio_calibration_plan(
-        self,
-        calibration_root: Path,
-    ) -> list[tuple[str, list[Path]]]:
-        identity_directories = sorted(
-            path
-            for path in calibration_root.iterdir()
-            if path.is_dir()
-        )
-        if not identity_directories:
-            raise ValueError(
-                "A base de calibracao precisa conter subdiretorios imediatos, um por identidade rotulada."
-            )
-
-        plan: list[tuple[str, list[Path]]] = []
-        for directory in identity_directories:
-            image_paths = [
-                path.resolve()
-                for path in self._scanner_service.scan(directory)
-                if self._scanner_service.classify(path) == MediaType.IMAGE
-            ]
-            if image_paths:
-                plan.append((directory.name, image_paths))
-
-        if len(plan) < 2:
-            raise ValueError(
-                "A base de calibracao precisa conter ao menos duas identidades com imagens faciais."
-            )
-        return plan
-
-    def _comparison_procedure_lines(
-        self,
-        *,
-        providers: list[str],
-        set_a_paths: list[Path],
-        set_b_paths: list[Path],
-        calibration_root: Path | None = None,
-        calibration_plan: list[tuple[str, list[Path]]] | None = None,
-        calibration_model_path: Path | None = None,
-    ) -> list[str]:
-        lines = [
-            "[Procedimento] Cada imagem e submetida ao mesmo fluxo do inventario: preparo de entrada, deteccao, filtros, tracking e embeddings.",
-            (
-                "[Procedimento] A comparacao final e par-a-par entre as faces selecionadas dos grupos Padrão e Questionado, "
-                "usando similaridade cosseno dos embeddings."
-            ),
-            (
-                "[Procedimento] As classificacoes usam os limiares do agrupamento atual: "
-                f"candidato>={self._config.clustering.candidate_similarity:.2f} e "
-                f"atribuicao>={self._config.clustering.assignment_similarity:.2f}."
-            ),
-            f"[Planejamento] Padrão possui {len(set_a_paths)} imagem(ns).",
-            f"[Planejamento] Questionado possui {len(set_b_paths)} imagem(ns).",
-        ]
-        lines.extend(
-            f"[Planejamento Padrão {index}/{len(set_a_paths)}] caminho={path}"
-            for index, path in enumerate(set_a_paths, start=1)
-        )
-        lines.extend(
-            f"[Planejamento Questionado {index}/{len(set_b_paths)}] caminho={path}"
-            for index, path in enumerate(set_b_paths, start=1)
-        )
-        if calibration_model_path is not None:
-            lines.append(
-                (
-                    "[Calibracao LR] Um modelo salvo foi carregado e reutilizado sem reprocessar a base rotulada. "
-                    "A LR reaproveita os scores de mesma origem e de origem distinta ja estimados."
-                )
-            )
-            lines.append(f"[Calibracao LR] Modelo salvo={calibration_model_path}")
-            if calibration_root is not None:
-                lines.append(
-                    "[Calibracao LR] A base rotulada informada foi ignorada porque o modelo salvo tem prioridade."
-                )
-        elif calibration_root is not None and calibration_plan:
-            lines.append(
-                (
-                    "[Calibracao LR] A base rotulada e processada com o mesmo pipeline. "
-                    "Cada subdiretorio imediato representa uma identidade para gerar scores Padrão/Questionado de mesma origem e de origem distinta."
-                )
-            )
-            lines.append(
-                (
-                    f"[Calibracao LR] Base={calibration_root} | identidades={len(calibration_plan)} | "
-                    f"imagens={sum(len(paths) for _, paths in calibration_plan)} | "
-                    f"metodo={self._config.likelihood_ratio.density_estimator}"
-                )
-            )
-            lines.extend(
-                (
-                    f"[Calibracao LR {index}/{len(calibration_plan)}] identidade={identity_label} | "
-                    f"imagens={len(identity_paths)}"
-                )
-                for index, (identity_label, identity_paths) in enumerate(calibration_plan, start=1)
-            )
-            lines.append(
-                (
-                    "[Calibracao LR] A razao de verossimilhanca e calculada como "
-                    "p(score|mesma_origem) / p(score|origem_diferente), com estimador nao parametrico "
-                    "de densidade estabilizado por piso uniforme."
-                )
-            )
-        lines.extend(self._configuration_log_lines(providers))
-        return lines
-
-    def _process_comparison_input(
-        self,
-        *,
-        set_label: str,
-        image_path: Path,
-        index: int,
-        total_images: int,
-        analyzer: FaceAnalyzer,
-        run_directory: Path,
-        export_directory: Path,
-        entry_sequence: list[int],
-        event_logger: StructuredEventLogger,
-        text_logger: logging.Logger,
-        log_callback: LogCallback | None,
-    ) -> tuple[FaceSetComparisonInput, list[FaceSetComparisonEntry]]:
-        file_prefix = f"[Comparacao {self._comparison_group_label(set_label)} {index}/{total_images}]"
-        self._emit_log(text_logger, log_callback, f"{file_prefix} Iniciando imagem {image_path}")
-        source_copy_path: Path | None = None
-        sha512 = ""
-        current_stage = "preparacao de entrada"
-        processing_error: str | None = None
-        entries: list[FaceSetComparisonEntry] = []
-
-        try:
-            current_stage = "copia de exportacao"
-            source_copy_path = self._copy_comparison_input(export_directory, set_label, index, image_path)
-            current_stage = "preparacao de entrada"
-            processing_path, sha512, cleanup_path = self._prepare_processing_input(
-                file_path=image_path,
-                media_type=MediaType.IMAGE,
-                file_prefix=file_prefix,
-                text_logger=text_logger,
-                log_callback=log_callback,
-            )
-            try:
-                current_stage = "carregamento da imagem"
-                frame = self._media_service.load_image(processing_path)
-                current_stage = "deteccao, tracking e embeddings"
-                tracking_result = self._tracking_service.process_media(
-                    source_path=image_path,
-                    sha512=sha512,
-                    media_type=MediaType.IMAGE,
-                    frames=self._frames_with_original_source([frame], image_path),
-                    analyzer=analyzer,
-                    artifact_store=ArtifactStore(
-                        run_directory
-                        / "comparison_artifacts"
-                        / f"set_{set_label.lower()}"
-                        / f"{index:04d}_{safe_stem(image_path.stem)}"
-                    ),
-                    id_namespace=f"C{set_label}{index:04d}",
-                    event_callback=lambda event, fields: event_logger.write(event, **fields),
-                    text_callback=lambda message: self._emit_log(text_logger, log_callback, message),
-                )
-            finally:
-                self._cleanup_processing_input(cleanup_path)
-
-            input_record = FaceSetComparisonInput(
-                set_label=set_label,
-                source_path=image_path,
-                sha512=sha512,
-                detected_faces=tracking_result.raw_detection_count,
-                selected_faces=tracking_result.selected_detection_count,
-                tracks=len(tracking_result.tracks),
-                keyframes=len(tracking_result.keyframes),
-                export_source_copy=source_copy_path,
-            )
-            self._emit_log(
-                text_logger,
-                log_callback,
-                (
-                    f"{file_prefix} Resultado | deteccoes={tracking_result.raw_detection_count} | "
-                    f"selecionadas={tracking_result.selected_detection_count} | "
-                    f"tracks={len(tracking_result.tracks)} | keyframes={len(tracking_result.keyframes)}"
-                ),
-            )
-
-            for track in tracking_result.tracks:
-                occurrence = self._best_track_occurrence(track, tracking_result.occurrences)
-                if occurrence is None:
-                    continue
-                keyframe = next((item for item in tracking_result.keyframes if item.track_id == track.track_id), None)
-                entry_sequence[0] += 1
-                entry_id = f"C{set_label}_{entry_sequence[0]:06d}"
-                mesh_crop_path, mesh_context_path = self._render_comparison_mesh_artifacts(
-                    export_directory=export_directory,
-                    set_label=set_label,
-                    entry_id=entry_id,
-                    occurrence=occurrence,
-                )
-                entries.append(
-                    self._create_face_set_comparison_entry(
-                        entry_id=entry_id,
-                        set_label=set_label,
-                        track=track,
-                        occurrence=occurrence,
-                        keyframe=keyframe,
-                        mesh_crop_path=mesh_crop_path,
-                        mesh_context_path=mesh_context_path,
-                    )
-                )
-
-            event_logger.write(
-                "comparison_input_processed",
-                set_label=set_label,
-                source_path=image_path,
-                sha512=sha512,
-                detected_faces=input_record.detected_faces,
-                selected_faces=input_record.selected_faces,
-                tracks=input_record.tracks,
-                keyframes=input_record.keyframes,
-                exported_source_copy=source_copy_path,
-            )
-            return input_record, entries
-        except Exception as exc:
-            processing_error, traceback_text = self._emit_exception(
-                text_logger,
-                log_callback,
-                f"{file_prefix} Erro de processamento | etapa={current_stage} | arquivo={image_path}",
-                exc,
-            )
-            event_logger.write(
-                "comparison_input_failed",
-                set_label=set_label,
-                source_path=image_path,
-                sha512=sha512,
-                error=processing_error,
-                error_type=type(exc).__name__,
-                error_stage=current_stage,
-                traceback=traceback_text,
-            )
-            return (
-                FaceSetComparisonInput(
-                    set_label=set_label,
-                    source_path=image_path,
-                    sha512=sha512,
-                    detected_faces=0,
-                    selected_faces=0,
-                    tracks=0,
-                    keyframes=0,
-                    processing_error=processing_error,
-                    export_source_copy=source_copy_path,
-                ),
-                [],
-            )
-
-    def _copy_comparison_input(
-        self,
-        export_directory: Path,
-        set_label: str,
-        index: int,
-        source_path: Path,
-    ) -> Path:
-        target_directory = ensure_directory(export_directory / "inputs" / f"set_{set_label.lower()}")
-        target_path = target_directory / f"{index:04d}_{safe_stem(source_path.stem)}{source_path.suffix.lower()}"
-        shutil.copy2(file_io_path(source_path), file_io_path(target_path))
-        return target_path
-
-    def _process_calibration_input(
-        self,
-        *,
-        identity_label: str,
-        image_path: Path,
-        identity_index: int,
-        image_index: int,
-        total_images: int,
-        analyzer: FaceAnalyzer,
-        run_directory: Path,
-        export_directory: Path,
-        entry_sequence: list[int],
-        event_logger: StructuredEventLogger,
-        text_logger: logging.Logger,
-        log_callback: LogCallback | None,
-    ) -> tuple[FaceSetComparisonInput, list[FaceSetComparisonEntry]]:
-        file_prefix = f"[Calibracao LR {identity_label} {image_index}/{total_images}]"
-        self._emit_log(text_logger, log_callback, f"{file_prefix} Iniciando imagem {image_path}")
-        source_copy_path: Path | None = None
-        sha512 = ""
-        current_stage = "preparacao de entrada"
-        processing_error: str | None = None
-        entries: list[FaceSetComparisonEntry] = []
-
-        try:
-            current_stage = "copia de exportacao"
-            source_copy_path = self._copy_calibration_input(
-                export_directory=export_directory,
-                identity_label=identity_label,
-                identity_index=identity_index,
-                image_index=image_index,
-                source_path=image_path,
-            )
-            current_stage = "preparacao de entrada"
-            processing_path, sha512, cleanup_path = self._prepare_processing_input(
-                file_path=image_path,
-                media_type=MediaType.IMAGE,
-                file_prefix=file_prefix,
-                text_logger=text_logger,
-                log_callback=log_callback,
-            )
-            try:
-                current_stage = "carregamento da imagem"
-                frame = self._media_service.load_image(processing_path)
-                current_stage = "deteccao, tracking e embeddings"
-                tracking_result = self._tracking_service.process_media(
-                    source_path=image_path,
-                    sha512=sha512,
-                    media_type=MediaType.IMAGE,
-                    frames=self._frames_with_original_source([frame], image_path),
-                    analyzer=analyzer,
-                    artifact_store=ArtifactStore(
-                        run_directory
-                        / "comparison_artifacts"
-                        / "calibration"
-                        / f"{identity_index:03d}_{safe_stem(identity_label)}"
-                        / f"{image_index:04d}_{safe_stem(image_path.stem)}"
-                    ),
-                    id_namespace=f"CLR{identity_index:03d}_{image_index:04d}",
-                    event_callback=lambda event, fields: event_logger.write(event, **fields),
-                    text_callback=lambda message: self._emit_log(text_logger, log_callback, message),
-                )
-            finally:
-                self._cleanup_processing_input(cleanup_path)
-
-            input_record = FaceSetComparisonInput(
-                set_label="CAL",
-                source_path=image_path,
-                sha512=sha512,
-                detected_faces=tracking_result.raw_detection_count,
-                selected_faces=tracking_result.selected_detection_count,
-                tracks=len(tracking_result.tracks),
-                keyframes=len(tracking_result.keyframes),
-                identity_label=identity_label,
-                export_source_copy=source_copy_path,
-            )
-            self._emit_log(
-                text_logger,
-                log_callback,
-                (
-                    f"{file_prefix} Resultado | deteccoes={tracking_result.raw_detection_count} | "
-                    f"selecionadas={tracking_result.selected_detection_count} | "
-                    f"tracks={len(tracking_result.tracks)} | keyframes={len(tracking_result.keyframes)}"
-                ),
-            )
-
-            for track in tracking_result.tracks:
-                occurrence = self._best_track_occurrence(track, tracking_result.occurrences)
-                if occurrence is None:
-                    continue
-                keyframe = next((item for item in tracking_result.keyframes if item.track_id == track.track_id), None)
-                entry_sequence[0] += 1
-                entry_id = f"CLR_{entry_sequence[0]:06d}"
-                entries.append(
-                    self._create_face_set_comparison_entry(
-                        entry_id=entry_id,
-                        set_label="CAL",
-                        track=track,
-                        occurrence=occurrence,
-                        keyframe=keyframe,
-                        mesh_crop_path=None,
-                        mesh_context_path=None,
-                        identity_label=identity_label,
-                    )
-                )
-
-            event_logger.write(
-                "comparison_calibration_input_processed",
-                identity_label=identity_label,
-                source_path=image_path,
-                sha512=sha512,
-                detected_faces=input_record.detected_faces,
-                selected_faces=input_record.selected_faces,
-                tracks=input_record.tracks,
-                keyframes=input_record.keyframes,
-                exported_source_copy=source_copy_path,
-            )
-            return input_record, entries
-        except Exception as exc:
-            processing_error, traceback_text = self._emit_exception(
-                text_logger,
-                log_callback,
-                f"{file_prefix} Erro de processamento | etapa={current_stage} | arquivo={image_path}",
-                exc,
-            )
-            event_logger.write(
-                "comparison_calibration_input_failed",
-                identity_label=identity_label,
-                source_path=image_path,
-                sha512=sha512,
-                error=processing_error,
-                error_type=type(exc).__name__,
-                error_stage=current_stage,
-                traceback=traceback_text,
-            )
-            return (
-                FaceSetComparisonInput(
-                    set_label="CAL",
-                    source_path=image_path,
-                    sha512=sha512,
-                    detected_faces=0,
-                    selected_faces=0,
-                    tracks=0,
-                    keyframes=0,
-                    identity_label=identity_label,
-                    processing_error=processing_error,
-                    export_source_copy=source_copy_path,
-                ),
-                [],
-            )
-
-    def _copy_calibration_input(
-        self,
-        *,
-        export_directory: Path,
-        identity_label: str,
-        identity_index: int,
-        image_index: int,
-        source_path: Path,
-    ) -> Path:
-        target_directory = ensure_directory(
-            export_directory
-            / "calibration"
-            / "inputs"
-            / f"{identity_index:03d}_{safe_stem(identity_label)}"
-        )
-        target_path = (
-            target_directory
-            / f"{image_index:04d}_{safe_stem(source_path.stem)}{source_path.suffix.lower()}"
-        )
-        shutil.copy2(file_io_path(source_path), file_io_path(target_path))
-        return target_path
-
-    def _best_track_occurrence(
-        self,
-        track: FaceTrack,
-        occurrences: list[FaceOccurrence],
-    ) -> FaceOccurrence | None:
-        occurrences_by_id = {item.occurrence_id: item for item in occurrences}
-        if track.best_occurrence_id is not None and track.best_occurrence_id in occurrences_by_id:
-            return occurrences_by_id[track.best_occurrence_id]
-        for occurrence_id in track.occurrence_ids:
-            if occurrence_id in occurrences_by_id:
-                return occurrences_by_id[occurrence_id]
-        return None
-
-    def _render_comparison_mesh_artifacts(
-        self,
-        *,
-        export_directory: Path,
-        set_label: str,
-        entry_id: str,
-        occurrence: FaceOccurrence,
-    ) -> tuple[Path | None, Path | None]:
-        mesh_directory = ensure_directory(export_directory / "mesh" / f"set_{set_label.lower()}")
-        mesh_crop_path: Path | None = None
-        mesh_context_path: Path | None = None
-
-        if occurrence.crop_path is not None:
-            crop_mesh = draw_face_mesh(
-                load_bgr_image(occurrence.crop_path),
-                occurrence.biometric_landmarks,
-                bbox=occurrence.bbox,
-                translate=(-occurrence.bbox.x1, -occurrence.bbox.y1),
-                draw_bbox=False,
-            )
-            mesh_crop_path = mesh_directory / f"{entry_id}_crop_mesh.jpg"
-            save_bgr_image(mesh_crop_path, crop_mesh)
-
-        if occurrence.context_image_path is not None:
-            context_mesh = draw_face_mesh(
-                load_bgr_image(occurrence.source_path),
-                occurrence.biometric_landmarks,
-                bbox=occurrence.bbox,
-                draw_bbox=False,
-            )
-            mesh_context_path = mesh_directory / f"{entry_id}_context_mesh.jpg"
-            save_bgr_image(mesh_context_path, context_mesh)
-
-        return mesh_crop_path, mesh_context_path
-
-    def _create_face_set_comparison_entry(
-        self,
-        *,
-        entry_id: str,
-        set_label: str,
-        track: FaceTrack,
-        occurrence: FaceOccurrence,
-        keyframe: KeyFrame | None,
-        mesh_crop_path: Path | None,
-        mesh_context_path: Path | None,
-        identity_label: str | None = None,
-    ) -> FaceSetComparisonEntry:
-        quality = occurrence.quality_metrics
-        return FaceSetComparisonEntry(
-            entry_id=entry_id,
-            set_label=set_label,
-            source_path=occurrence.source_path,
-            sha512=occurrence.sha512,
-            track_id=track.track_id,
-            occurrence_id=occurrence.occurrence_id,
-            keyframe_id=keyframe.keyframe_id if keyframe is not None else None,
-            bbox=occurrence.bbox,
-            detection_score=occurrence.detection_score,
-            quality_score=quality.score if quality is not None else None,
-            sharpness=quality.sharpness if quality is not None else None,
-            brightness=quality.brightness if quality is not None else None,
-            illumination=quality.illumination if quality is not None else None,
-            frontality=quality.frontality if quality is not None else None,
-            identity_label=identity_label,
-            embedding=list(occurrence.embedding),
-            embedding_dimension=len(occurrence.embedding),
-            embedding_source=occurrence.embedding_source,
-            crop_path=occurrence.crop_path,
-            context_image_path=occurrence.context_image_path,
-            mesh_crop_path=mesh_crop_path,
-            mesh_context_path=mesh_context_path,
-            selection_reasons=keyframe.selection_reasons if keyframe is not None else (),
-            biometric_landmarks=occurrence.biometric_landmarks,
-        )
-
-    def _build_face_set_comparison_matches(
-        self,
-        set_a_faces: list[FaceSetComparisonEntry],
-        set_b_faces: list[FaceSetComparisonEntry],
-        *,
-        progress_callback: ProgressCallback | None = None,
-        progress_current: int | None = None,
-        progress_total: int | None = None,
-        text_logger: logging.Logger | None = None,
-        log_callback: LogCallback | None = None,
-        event_logger: StructuredEventLogger | None = None,
-    ) -> list[FaceSetComparisonMatch]:
-        ranked_pairs: list[FaceSetComparisonMatch] = []
-        expected_pairs = len(set_a_faces) * len(set_b_faces)
-        heartbeat_interval_pairs = 5000
-        heartbeat_interval_seconds = 5.0
-        last_heartbeat = time.monotonic()
-        if text_logger is not None:
-            self._emit_log(
-                text_logger,
-                log_callback,
-                (
-                    f"[Comparacao] Similaridades | faces_padrao={len(set_a_faces)} | "
-                    f"faces_questionado={len(set_b_faces)} | pares_previstos={expected_pairs}"
-                ),
-            )
-        if event_logger is not None:
-            event_logger.write(
-                "face_set_comparison_matching_started",
-                set_a_faces=len(set_a_faces),
-                set_b_faces=len(set_b_faces),
-                expected_pairs=expected_pairs,
-            )
-
-        compared_pairs = 0
-        for left in set_a_faces:
-            for right in set_b_faces:
-                similarity = cosine_similarity(left.embedding, right.embedding)
-                ranked_pairs.append(
-                    FaceSetComparisonMatch(
-                        rank=0,
-                        left_entry_id=left.entry_id,
-                        right_entry_id=right.entry_id,
-                        left_track_id=left.track_id,
-                        right_track_id=right.track_id,
-                        similarity=similarity,
-                        classification=self._classify_comparison_similarity(similarity),
-                        left_quality_score=left.quality_score,
-                        right_quality_score=right.quality_score,
-                    )
-                )
-                compared_pairs += 1
-                should_emit_heartbeat = (
-                    compared_pairs < expected_pairs
-                    and (
-                        compared_pairs % heartbeat_interval_pairs == 0
-                        or (time.monotonic() - last_heartbeat) >= heartbeat_interval_seconds
-                    )
-                )
-                if should_emit_heartbeat:
-                    if (
-                        progress_callback is not None
-                        and progress_current is not None
-                        and progress_total is not None
-                    ):
-                        self._emit_progress(
-                            progress_callback,
-                            progress_current,
-                            progress_total,
-                            f"Calculando similaridades ({compared_pairs}/{expected_pairs} pares)",
-                        )
-                    if text_logger is not None:
-                        self._emit_log(
-                            text_logger,
-                            log_callback,
-                            f"[Comparacao] Similaridades em andamento | pares={compared_pairs}/{expected_pairs}",
-                        )
-                    if event_logger is not None:
-                        event_logger.write(
-                            "face_set_comparison_matching_progress",
-                            processed_pairs=compared_pairs,
-                            expected_pairs=expected_pairs,
-                        )
-                    last_heartbeat = time.monotonic()
-        ranked_pairs.sort(key=lambda item: item.similarity, reverse=True)
-        if text_logger is not None:
-            self._emit_log(
-                text_logger,
-                log_callback,
-                f"[Comparacao] Similaridades concluidas | pares={expected_pairs} | ranking={len(ranked_pairs)}",
-            )
-        if event_logger is not None:
-            event_logger.write(
-                "face_set_comparison_matching_completed",
-                processed_pairs=expected_pairs,
-                ranked_pairs=len(ranked_pairs),
-            )
-        return [
-            replace(item, rank=index)
-            for index, item in enumerate(ranked_pairs, start=1)
-        ]
-
-    def _classify_comparison_similarity(self, similarity: float) -> str:
-        if similarity >= self._config.clustering.assignment_similarity:
-            return "assignment"
-        if similarity >= self._config.clustering.candidate_similarity:
-            return "candidate"
-        return "below_threshold"
-
-    def _build_face_set_comparison_summary(
-        self,
-        *,
-        set_a_inputs: list[FaceSetComparisonInput],
-        set_b_inputs: list[FaceSetComparisonInput],
-        matches: list[FaceSetComparisonMatch],
-    ) -> FaceSetComparisonSummary:
-        similarity_values = [item.similarity for item in matches]
-        calibrated_values = [item.log10_likelihood_ratio for item in matches if item.log10_likelihood_ratio is not None]
-        q1_similarity: float | None = None
-        q3_similarity: float | None = None
-        mean_confidence_low: float | None = None
-        mean_confidence_high: float | None = None
-        mean_similarity = statistics.fmean(similarity_values) if similarity_values else None
-        median_similarity = statistics.median(similarity_values) if similarity_values else None
-        stddev_similarity = (
-            statistics.pstdev(similarity_values)
-            if len(similarity_values) > 1
-            else 0.0 if similarity_values else None
-        )
-        if similarity_values:
-            if len(similarity_values) == 1:
-                q1_similarity = similarity_values[0]
-                q3_similarity = similarity_values[0]
-                mean_confidence_low = similarity_values[0]
-                mean_confidence_high = similarity_values[0]
-            else:
-                quartiles = statistics.quantiles(similarity_values, n=4, method="inclusive")
-                q1_similarity = quartiles[0]
-                q3_similarity = quartiles[2]
-                sample_stddev = statistics.stdev(similarity_values)
-                confidence_margin = 1.96 * sample_stddev / math.sqrt(len(similarity_values))
-                mean_confidence_low = max(-1.0, min(1.0, mean_similarity - confidence_margin))
-                mean_confidence_high = max(-1.0, min(1.0, mean_similarity + confidence_margin))
-        return FaceSetComparisonSummary(
-            set_a_images=len(set_a_inputs),
-            set_b_images=len(set_b_inputs),
-            set_a_detected_faces=sum(item.detected_faces for item in set_a_inputs),
-            set_b_detected_faces=sum(item.detected_faces for item in set_b_inputs),
-            set_a_selected_faces=sum(item.selected_faces for item in set_a_inputs),
-            set_b_selected_faces=sum(item.selected_faces for item in set_b_inputs),
-            set_a_images_without_faces=len([item for item in set_a_inputs if item.selected_faces == 0]),
-            set_b_images_without_faces=len([item for item in set_b_inputs if item.selected_faces == 0]),
-            total_pair_comparisons=len(matches),
-            assignment_matches=len([item for item in matches if item.classification == "assignment"]),
-            candidate_matches=len([item for item in matches if item.classification == "candidate"]),
-            best_similarity=max(similarity_values) if similarity_values else None,
-            worst_similarity=min(similarity_values) if similarity_values else None,
-            mean_similarity=mean_similarity,
-            median_similarity=median_similarity,
-            stddev_similarity=stddev_similarity,
-            q1_similarity=q1_similarity,
-            q3_similarity=q3_similarity,
-            mean_confidence_low=mean_confidence_low,
-            mean_confidence_high=mean_confidence_high,
-            candidate_threshold=self._config.clustering.candidate_similarity,
-            assignment_threshold=self._config.clustering.assignment_similarity,
-            likelihood_ratio_calibrated=bool(calibrated_values),
-            calibrated_matches=len(calibrated_values),
-            mean_log10_likelihood_ratio=(
-                statistics.fmean(calibrated_values) if calibrated_values else None
-            ),
-            median_log10_likelihood_ratio=(
-                statistics.median(calibrated_values) if calibrated_values else None
-            ),
-            min_log10_likelihood_ratio=min(calibrated_values) if calibrated_values else None,
-            max_log10_likelihood_ratio=max(calibrated_values) if calibrated_values else None,
-        )
-
-    def _comparison_summary_log_lines(self, summary: FaceSetComparisonSummary) -> list[str]:
-        lines = [
-            (
-                f"[Comparacao] Faces selecionadas | padrao={summary.set_a_selected_faces} | "
-                f"questionado={summary.set_b_selected_faces}"
-            ),
-            (
-                f"[Comparacao] Estatisticas | pares={summary.total_pair_comparisons} | "
-                f"atribuicao={summary.assignment_matches} | candidatos={summary.candidate_matches}"
-            ),
-            (
-                f"[Comparacao] Similaridade | melhor={summary.best_similarity if summary.best_similarity is not None else '-'} | "
-                f"media={summary.mean_similarity if summary.mean_similarity is not None else '-'} | "
-                f"mediana={summary.median_similarity if summary.median_similarity is not None else '-'} | "
-                f"desvio={summary.stddev_similarity if summary.stddev_similarity is not None else '-'} | "
-                f"ic95%=[{summary.mean_confidence_low if summary.mean_confidence_low is not None else '-'}, "
-                f"{summary.mean_confidence_high if summary.mean_confidence_high is not None else '-'}]"
-            ),
-        ]
-        if summary.likelihood_ratio_calibrated:
-            lines.append(
-                (
-                    f"[Comparacao] LR calibrada | pares={summary.calibrated_matches} | "
-                    f"media_log10lr={summary.mean_log10_likelihood_ratio if summary.mean_log10_likelihood_ratio is not None else '-'} | "
-                    f"mediana_log10lr={summary.median_log10_likelihood_ratio if summary.median_log10_likelihood_ratio is not None else '-'} | "
-                    f"intervalo=[{summary.min_log10_likelihood_ratio if summary.min_log10_likelihood_ratio is not None else '-'}, "
-                    f"{summary.max_log10_likelihood_ratio if summary.max_log10_likelihood_ratio is not None else '-'}]"
-                )
-            )
-        return lines
-
-    def _build_face_set_comparison_calibration(
-        self,
-        *,
-        dataset_root: Path | None,
-        calibration_plan: list[tuple[str, list[Path]]],
-        inputs: list[FaceSetComparisonInput],
-        entries: list[FaceSetComparisonEntry],
-        progress_callback: ProgressCallback | None = None,
-        progress_current: int | None = None,
-        progress_total: int | None = None,
-        text_logger: logging.Logger | None = None,
-        log_callback: LogCallback | None = None,
-        event_logger: StructuredEventLogger | None = None,
-    ) -> FaceSetComparisonCalibration:
-        if dataset_root is None:
-            raise ValueError("A raiz da base de calibracao precisa ser informada para construir a LR.")
-
-        lr_settings = self._config.likelihood_ratio
-        entries_by_identity: dict[str, list[FaceSetComparisonEntry]] = {}
-        for entry in entries:
-            if entry.identity_label:
-                entries_by_identity.setdefault(entry.identity_label, []).append(entry)
-
-        genuine_pair_total, impostor_pair_total = self._estimate_calibration_pair_totals(entries_by_identity)
-        if text_logger is not None:
-            self._emit_log(
-                text_logger,
-                log_callback,
-                (
-                    f"[Calibracao LR] Consolidando distribuicoes | "
-                    f"identidades_com_faces={len(entries_by_identity)} | faces={len(entries)}"
-                ),
-            )
-            self._emit_log(
-                text_logger,
-                log_callback,
-                (
-                    f"[Calibracao LR] Pares previstos | "
-                    f"mesma_origem={genuine_pair_total} | origem_distinta={impostor_pair_total} | "
-                    f"limite_amostra={lr_settings.max_scores_per_distribution}"
-                ),
-            )
-        if (
-            progress_callback is not None
-            and progress_current is not None
-            and progress_total is not None
-        ):
-            self._emit_progress(
-                progress_callback,
-                progress_current,
-                progress_total,
-                (
-                    "Calibracao LR: preparando pares estatisticos "
-                    f"({len(entries_by_identity)} identidades com faces)"
-                ),
-            )
-        if event_logger is not None:
-            event_logger.write(
-                "comparison_calibration_pair_plan",
-                identities_with_faces=len(entries_by_identity),
-                selected_faces=len(entries),
-                genuine_pair_total=genuine_pair_total,
-                impostor_pair_total=impostor_pair_total,
-                sample_limit=lr_settings.max_scores_per_distribution,
-            )
-
-        genuine_scores, genuine_pair_total = self._sample_calibration_scores(
-            self._iter_same_source_scores(entries_by_identity),
-            max_scores=lr_settings.max_scores_per_distribution,
-            phase_label="Mesma origem",
-            distribution_key="same_source",
-            expected_total_pairs=genuine_pair_total,
-            progress_callback=progress_callback,
-            progress_current=progress_current,
-            progress_total=progress_total,
-            text_logger=text_logger,
-            log_callback=log_callback,
-            event_logger=event_logger,
-        )
-        impostor_scores, impostor_pair_total = self._sample_calibration_scores(
-            self._iter_different_source_scores(entries_by_identity),
-            max_scores=lr_settings.max_scores_per_distribution,
-            phase_label="Origem distinta",
-            distribution_key="different_source",
-            expected_total_pairs=impostor_pair_total,
-            progress_callback=progress_callback,
-            progress_current=progress_current,
-            progress_total=progress_total,
-            text_logger=text_logger,
-            log_callback=log_callback,
-            event_logger=event_logger,
-        )
-
-        support_ready, support_note = self._has_likelihood_ratio_support(
-            genuine_scores=genuine_scores,
-            impostor_scores=impostor_scores,
-            identities_with_faces=len(entries_by_identity),
-        )
-        all_scores = [*genuine_scores, *impostor_scores]
-        summary = FaceSetComparisonCalibrationSummary(
-            dataset_root=dataset_root,
-            identity_count=len(calibration_plan),
-            processed_identities=len([1 for _, paths in calibration_plan if paths]),
-            input_images=len(inputs),
-            processed_images=len([item for item in inputs if not item.processing_error]),
-            selected_faces=len(entries),
-            identities_with_selected_faces=len(entries_by_identity),
-            genuine_pair_total=genuine_pair_total,
-            impostor_pair_total=impostor_pair_total,
-            genuine_score_count=len(genuine_scores),
-            impostor_score_count=len(impostor_scores),
-            support_ready=support_ready,
-            support_note=support_note,
-            score_min=min(all_scores) if all_scores else None,
-            score_max=max(all_scores) if all_scores else None,
-            density_method=lr_settings.density_estimator,
-            smoothing_note=self._likelihood_ratio_smoothing_note(lr_settings),
-        )
-        procedure_details = (
-            "[Calibracao LR] Cada subdiretorio imediato foi tratado como uma identidade rotulada.",
-            "[Calibracao LR] Scores Padrão/Questionado de mesma origem: pares entre faces da mesma identidade.",
-            "[Calibracao LR] Scores Padrão/Questionado de origem distinta: pares entre identidades diferentes.",
-            self._likelihood_ratio_density_procedure_detail(lr_settings),
-        )
-        return FaceSetComparisonCalibration(
-            summary=summary,
-            inputs=inputs,
-            entries=entries,
-            genuine_scores=genuine_scores,
-            impostor_scores=impostor_scores,
-            procedure_details=procedure_details,
-            settings_snapshot=lr_settings,
-        )
-
-    def _estimate_calibration_pair_totals(
-        self,
-        entries_by_identity: dict[str, list[FaceSetComparisonEntry]],
-    ) -> tuple[int, int]:
-        face_counts = [len(entries) for entries in entries_by_identity.values() if entries]
-        genuine_pair_total = sum(count * (count - 1) // 2 for count in face_counts)
-        total_faces = sum(face_counts)
-        all_pairs = total_faces * (total_faces - 1) // 2
-        impostor_pair_total = max(0, all_pairs - genuine_pair_total)
-        return genuine_pair_total, impostor_pair_total
-
-    def _sample_calibration_scores(
-        self,
-        values: Iterable[float],
-        *,
-        max_scores: int,
-        phase_label: str | None = None,
-        distribution_key: str | None = None,
-        expected_total_pairs: int | None = None,
-        progress_callback: ProgressCallback | None = None,
-        progress_current: int | None = None,
-        progress_total: int | None = None,
-        text_logger: logging.Logger | None = None,
-        log_callback: LogCallback | None = None,
-        event_logger: StructuredEventLogger | None = None,
-    ) -> tuple[list[float], int]:
-        rng = np.random.default_rng(20260409)
-        sampled: list[float] = []
-        total_seen = 0
-        heartbeat_interval_pairs = 250000
-        heartbeat_interval_seconds = 5.0
-        last_heartbeat = time.monotonic()
-        expected_display = expected_total_pairs if expected_total_pairs is not None else "-"
-
-        if phase_label and text_logger is not None:
-            self._emit_log(
-                text_logger,
-                log_callback,
-                (
-                    f"[Calibracao LR] {phase_label} | iniciando amostragem | "
-                    f"pares_previstos={expected_display} | limite_amostra={max_scores}"
-                ),
-            )
-        if distribution_key and event_logger is not None:
-            event_logger.write(
-                "comparison_calibration_distribution_started",
-                distribution=distribution_key,
-                expected_pairs=expected_total_pairs,
-                sample_limit=max_scores,
-            )
-
-        for value in values:
-            if len(sampled) < max_scores:
-                sampled.append(value)
-            else:
-                replacement_index = int(rng.integers(0, total_seen + 1))
-                if replacement_index < max_scores:
-                    sampled[replacement_index] = value
-            total_seen += 1
-
-            should_emit_heartbeat = (
-                phase_label is not None
-                and total_seen != expected_total_pairs
-                and (
-                    total_seen % heartbeat_interval_pairs == 0
-                    or (time.monotonic() - last_heartbeat) >= heartbeat_interval_seconds
-                )
-            )
-            if should_emit_heartbeat:
-                progress_message = (
-                    f"Calibracao LR: {phase_label.lower()} {total_seen}/{expected_display} pares"
-                )
-                if (
-                    progress_callback is not None
-                    and progress_current is not None
-                    and progress_total is not None
-                ):
-                    self._emit_progress(
-                        progress_callback,
-                        progress_current,
-                        progress_total,
-                        progress_message,
-                    )
-                if text_logger is not None:
-                    coverage_text = ""
-                    if expected_total_pairs:
-                        coverage_text = f" | cobertura={((total_seen / expected_total_pairs) * 100.0):.1f}%"
-                    self._emit_log(
-                        text_logger,
-                        log_callback,
-                        (
-                            f"[Calibracao LR] {phase_label} em andamento | "
-                            f"pares={total_seen}/{expected_display} | amostrados={len(sampled)}"
-                            f"{coverage_text}"
-                        ),
-                    )
-                if distribution_key and event_logger is not None:
-                    event_logger.write(
-                        "comparison_calibration_distribution_progress",
-                        distribution=distribution_key,
-                        processed_pairs=total_seen,
-                        expected_pairs=expected_total_pairs,
-                        sampled_scores=len(sampled),
-                    )
-                last_heartbeat = time.monotonic()
-
-        if phase_label and text_logger is not None:
-            self._emit_log(
-                text_logger,
-                log_callback,
-                (
-                    f"[Calibracao LR] {phase_label} concluida | "
-                    f"pares={total_seen}/{expected_display} | amostrados={len(sampled)}"
-                ),
-            )
-        if distribution_key and event_logger is not None:
-            event_logger.write(
-                "comparison_calibration_distribution_completed",
-                distribution=distribution_key,
-                processed_pairs=total_seen,
-                expected_pairs=expected_total_pairs,
-                sampled_scores=len(sampled),
-            )
-        return sampled, total_seen
-
-    def _iter_same_source_scores(
-        self,
-        entries_by_identity: dict[str, list[FaceSetComparisonEntry]],
-    ) -> Iterable[float]:
-        for entries in entries_by_identity.values():
-            if len(entries) < 2:
-                continue
-            for index, left in enumerate(entries):
-                for right in entries[index + 1 :]:
-                    yield cosine_similarity(left.embedding, right.embedding)
-
-    def _iter_different_source_scores(
-        self,
-        entries_by_identity: dict[str, list[FaceSetComparisonEntry]],
-    ) -> Iterable[float]:
-        identity_labels = sorted(entries_by_identity)
-        for index, left_label in enumerate(identity_labels):
-            left_entries = entries_by_identity[left_label]
-            for right_label in identity_labels[index + 1 :]:
-                right_entries = entries_by_identity[right_label]
-                for left in left_entries:
-                    for right in right_entries:
-                        yield cosine_similarity(left.embedding, right.embedding)
-
-    def _has_likelihood_ratio_support(
-        self,
-        *,
-        genuine_scores: list[float],
-        impostor_scores: list[float],
-        identities_with_faces: int,
-    ) -> tuple[bool, str | None]:
-        settings = self._config.likelihood_ratio
-        if identities_with_faces < settings.minimum_identities_with_faces:
-            return (
-                False,
-                "Sao necessarias ao menos "
-                f"{settings.minimum_identities_with_faces} identidades com faces selecionadas na base de calibracao.",
-            )
-        if len(genuine_scores) < settings.minimum_same_source_scores:
-            return (
-                False,
-                "A base de calibracao nao gerou scores Padrão/Questionado de mesma origem "
-                f"suficientes para ajustar a densidade (minimo={settings.minimum_same_source_scores}).",
-            )
-        if len(impostor_scores) < settings.minimum_different_source_scores:
-            return (
-                False,
-                "A base de calibracao nao gerou scores Padrão/Questionado de origem distinta "
-                f"suficientes para ajustar a densidade (minimo={settings.minimum_different_source_scores}).",
-            )
-        if len({round(value, 8) for value in genuine_scores}) < settings.minimum_unique_scores_per_distribution:
-            return (
-                False,
-                "Os scores Padrão/Questionado de mesma origem nao apresentam variabilidade suficiente "
-                f"(minimo de valores distintos={settings.minimum_unique_scores_per_distribution}).",
-            )
-        if len({round(value, 8) for value in impostor_scores}) < settings.minimum_unique_scores_per_distribution:
-            return (
-                False,
-                "Os scores Padrão/Questionado de origem distinta nao apresentam variabilidade suficiente "
-                f"(minimo de valores distintos={settings.minimum_unique_scores_per_distribution}).",
-            )
-        return True, None
-
-    def _calibration_summary_log_lines(
-        self,
-        summary: FaceSetComparisonCalibrationSummary,
-    ) -> list[str]:
-        lines = [
-            (
-                f"[Calibracao LR] Resumo | identidades={summary.identity_count} | "
-                f"faces={summary.selected_faces} | mesma_origem={summary.genuine_score_count}/{summary.genuine_pair_total} | "
-                f"origem_distinta={summary.impostor_score_count}/{summary.impostor_pair_total}"
-            )
-        ]
-        if summary.support_ready:
-            lines.append(
-                (
-                    f"[Calibracao LR] Ajuste pronto | metodo={summary.density_method} | "
-                    f"faixa=[{summary.score_min if summary.score_min is not None else '-'}, "
-                    f"{summary.score_max if summary.score_max is not None else '-'}]"
-                )
-            )
-        else:
-            lines.append(
-                f"[Calibracao LR] Ajuste indisponivel | motivo={summary.support_note or 'amostra insuficiente'}"
-            )
-        return lines
-
-    def _apply_face_set_likelihood_ratio_calibration(
-        self,
-        matches: list[FaceSetComparisonMatch],
-        calibration: FaceSetComparisonCalibration,
-        *,
-        progress_callback: ProgressCallback | None = None,
-        progress_current: int | None = None,
-        progress_total: int | None = None,
-        text_logger: logging.Logger | None = None,
-        log_callback: LogCallback | None = None,
-        event_logger: StructuredEventLogger | None = None,
-    ) -> list[FaceSetComparisonMatch]:
-        summary = calibration.summary
-        if not summary.support_ready:
-            return matches
-
-        settings = calibration.settings_snapshot or self._config.likelihood_ratio
-        total_matches = len(matches)
-        heartbeat_interval_pairs = 5000
-        heartbeat_interval_seconds = 5.0
-        last_heartbeat = time.monotonic()
-        if text_logger is not None:
-            self._emit_log(
-                text_logger,
-                log_callback,
-                (
-                    f"[Calibracao LR] Ajustando densidades | "
-                    f"mesma_origem={len(calibration.genuine_scores)} | "
-                    f"origem_distinta={len(calibration.impostor_scores)} | "
-                    f"metodo={settings.density_estimator} | "
-                    f"banda_x={settings.kde_bandwidth_scale:.3f}"
-                ),
-            )
-        if (
-            progress_callback is not None
-            and progress_current is not None
-            and progress_total is not None
-        ):
-            self._emit_progress(
-                progress_callback,
-                progress_current,
-                progress_total,
-                f"Calibracao LR: ajustando densidades ({settings.density_estimator})",
-            )
-        if event_logger is not None:
-            event_logger.write(
-                "comparison_calibration_application_started",
-                match_count=total_matches,
-                genuine_scores=len(calibration.genuine_scores),
-                impostor_scores=len(calibration.impostor_scores),
-            )
-
-        genuine_array = np.asarray(calibration.genuine_scores, dtype=np.float64)
-        impostor_array = np.asarray(calibration.impostor_scores, dtype=np.float64)
-        same_source_density_model = self._build_score_density_model(genuine_array, settings=settings)
-        different_source_density_model = self._build_score_density_model(impostor_array, settings=settings)
-
-        calibrated_matches: list[FaceSetComparisonMatch] = []
-        for index, match in enumerate(matches, start=1):
-            same_source_density = self._stabilized_score_density(
-                same_source_density_model,
-                match.similarity,
-                settings=settings,
-            )
-            different_source_density = self._stabilized_score_density(
-                different_source_density_model,
-                match.similarity,
-                settings=settings,
-            )
-            likelihood_ratio = same_source_density / different_source_density
-            log10_likelihood_ratio = math.log10(likelihood_ratio)
-            calibrated_matches.append(
-                replace(
-                    match,
-                    likelihood_ratio=likelihood_ratio,
-                    log10_likelihood_ratio=log10_likelihood_ratio,
-                    same_source_density=same_source_density,
-                    different_source_density=different_source_density,
-                    evidence_label=self._likelihood_ratio_evidence_label(log10_likelihood_ratio),
-                )
-            )
-            should_emit_heartbeat = (
-                index < total_matches
-                and (
-                    index % heartbeat_interval_pairs == 0
-                    or (time.monotonic() - last_heartbeat) >= heartbeat_interval_seconds
-                )
-            )
-            if should_emit_heartbeat:
-                if (
-                    progress_callback is not None
-                    and progress_current is not None
-                    and progress_total is not None
-                ):
-                    self._emit_progress(
-                        progress_callback,
-                        progress_current,
-                        progress_total,
-                        f"Calibracao LR: aplicando densidades ({index}/{total_matches} pares)",
-                    )
-                if text_logger is not None:
-                    self._emit_log(
-                        text_logger,
-                        log_callback,
-                        f"[Calibracao LR] Aplicacao em andamento | pares_calibrados={index}/{total_matches}",
-                    )
-                if event_logger is not None:
-                    event_logger.write(
-                        "comparison_calibration_application_progress",
-                        calibrated_pairs=index,
-                        match_count=total_matches,
-                    )
-                last_heartbeat = time.monotonic()
-        if text_logger is not None:
-            self._emit_log(
-                text_logger,
-                log_callback,
-                f"[Calibracao LR] Aplicacao de LR concluida | pares_calibrados={len(calibrated_matches)}",
-            )
-        if event_logger is not None:
-            event_logger.write(
-                "comparison_calibration_application_completed",
-                calibrated_pairs=len(calibrated_matches),
-                match_count=total_matches,
-            )
-        return calibrated_matches
-
-    def _build_score_density_model(
-        self,
-        values: np.ndarray,
-        *,
-        settings: LikelihoodRatioSettings,
-    ):
-        return fit_score_density_model(
-            values,
-            method=settings.density_estimator,
-            bandwidth_scale=settings.kde_bandwidth_scale,
-        )
-
-    def _stabilized_score_density(
-        self,
-        model,
-        score: float,
-        *,
-        settings: LikelihoodRatioSettings | None = None,
-    ) -> float:
-        lr_settings = settings or self._config.likelihood_ratio
-        clipped_score = max(-1.0, min(1.0, score))
-        raw_density = float(model.evaluate_raw([clipped_score])[0])
-        stabilized = stabilize_score_density(
-            raw_density,
-            uniform_floor_weight=lr_settings.kde_uniform_floor_weight,
-            min_density=lr_settings.kde_min_density,
-        )
-        return float(stabilized[0])
-
-    def _likelihood_ratio_evidence_label(self, log10_likelihood_ratio: float) -> str:
-        if log10_likelihood_ratio >= 3.0:
-            return "Suporte extremamente forte para mesma origem"
-        if log10_likelihood_ratio >= 2.0:
-            return "Suporte muito forte para mesma origem"
-        if log10_likelihood_ratio >= 1.0:
-            return "Suporte forte para mesma origem"
-        if log10_likelihood_ratio >= 0.5:
-            return "Suporte moderado para mesma origem"
-        if log10_likelihood_ratio > -0.5:
-            return "Evidencia limitada ou inconclusiva"
-        if log10_likelihood_ratio > -1.0:
-            return "Suporte moderado para origem diferente"
-        if log10_likelihood_ratio > -2.0:
-            return "Suporte forte para origem diferente"
-        return "Suporte muito forte para origem diferente"
 
     def _process_file_bundle(
         self,
@@ -3495,59 +1344,28 @@ class InventoryService:
         text_logger: logging.Logger,
         log_callback: LogCallback | None,
     ) -> tuple[Path, str, Path | None]:
-        if not self._config.app.use_local_temp_copy or media_type not in {MediaType.IMAGE, MediaType.VIDEO}:
-            sha512 = self._hashing_service.sha512(file_path)
-            self._emit_log(
-                text_logger,
-                log_callback,
-                (
-                    f"{file_prefix} Entrada original mantida | "
-                    f"origem={file_path} | sha512={sha512[:16]}..."
-                ),
-            )
-            return file_path, sha512, None
-
-        temporary_directory = Path(tempfile.mkdtemp(prefix="inventario_faces_media_"))
-        temporary_path = temporary_directory / file_path.name
-        sha512 = self._copy_file_with_sha512(file_path, temporary_path)
-        self._emit_log(
-            text_logger,
-            log_callback,
-            (
-                f"{file_prefix} Copia temporaria local preparada | "
-                f"origem={file_path} | copia_local={temporary_path}"
-            ),
+        return prepare_processing_input(
+            config=self._config,
+            hashing_service=self._hashing_service,
+            file_path=file_path,
+            media_type=media_type,
+            file_prefix=file_prefix,
+            text_logger=text_logger,
+            log_callback=log_callback,
         )
-        return temporary_path, sha512, temporary_directory
 
     def _copy_file_with_sha512(self, source_path: Path, target_path: Path, chunk_size: int = 1024 * 1024) -> str:
-        import hashlib
-
-        hasher = hashlib.sha512()
-        ensure_directory(target_path.parent)
-        with open(file_io_path(source_path), "rb") as source_stream, open(file_io_path(target_path), "wb") as target_stream:
-            while True:
-                chunk = source_stream.read(chunk_size)
-                if not chunk:
-                    break
-                hasher.update(chunk)
-                target_stream.write(chunk)
-        return hasher.hexdigest()
+        return copy_file_with_sha512(source_path, target_path, chunk_size)
 
     def _frames_with_original_source(
         self,
         frames: object,
         original_source_path: Path,
     ) -> object:
-        return (
-            replace(frame, source_path=original_source_path)
-            for frame in frames
-        )
+        return frames_with_original_source(frames, original_source_path)
 
     def _cleanup_processing_input(self, cleanup_path: Path | None) -> None:
-        if cleanup_path is None:
-            return
-        shutil.rmtree(cleanup_path, ignore_errors=True)
+        cleanup_processing_input(cleanup_path)
 
     def _serialize_partial_bundle(self, bundle: ProcessedFileBundle) -> dict[str, object]:
         tracking_result = bundle.tracking_result
@@ -3559,6 +1377,32 @@ class InventoryService:
             "raw_face_sizes": list(tracking_result.raw_face_sizes) if tracking_result is not None else [],
             "selected_face_sizes": list(tracking_result.selected_face_sizes) if tracking_result is not None else [],
         }
+
+    def _warn_if_sync_drive(
+        self,
+        labeled_paths: dict[str, Path],
+        text_logger: logging.Logger | None,
+        log_callback: LogCallback | None,
+        event_logger: StructuredEventLogger | None,
+    ) -> None:
+        warned_providers: set[tuple[str, str]] = set()
+        for label, path in labeled_paths.items():
+            provider = detect_sync_provider(path)
+            if provider is None:
+                continue
+            key = (provider, str(path))
+            if key in warned_providers:
+                continue
+            warned_providers.add(key)
+            for line in sync_drive_warning_lines(label, path, provider):
+                self._emit_log(text_logger, log_callback, line)
+            if event_logger is not None:
+                event_logger.write(
+                    "distributed_sync_drive_warning",
+                    label=label,
+                    path=path,
+                    provider=provider,
+                )
 
     def _write_distributed_status_file(
         self,
@@ -3954,184 +1798,40 @@ class InventoryService:
         return result
 
     def _deserialize_partial_payload(self, payload: dict[str, object]) -> dict[str, object]:
-        return {
-            "file_record": self._deserialize_file_record(payload.get("file_record", {})),
-            "occurrences": [self._deserialize_occurrence(item) for item in payload.get("occurrences", [])],
-            "tracks": [self._deserialize_track(item) for item in payload.get("tracks", [])],
-            "keyframes": [self._deserialize_keyframe(item) for item in payload.get("keyframes", [])],
-            "raw_face_sizes": [float(item) for item in payload.get("raw_face_sizes", [])],
-            "selected_face_sizes": [float(item) for item in payload.get("selected_face_sizes", [])],
-        }
+        return deserialize_partial_payload(payload)
 
     def _deserialize_file_record(self, payload: object) -> FileRecord:
-        data = payload if isinstance(payload, dict) else {}
-        return FileRecord(
-            path=Path(str(data.get("path", ""))),
-            media_type=MediaType(str(data.get("media_type", MediaType.OTHER.value))),
-            sha512=str(data.get("sha512", "")),
-            size_bytes=int(data.get("size_bytes", 0)),
-            discovered_at_utc=self._parse_datetime(data.get("discovered_at_utc")),
-            modified_at_utc=self._parse_datetime_optional(data.get("modified_at_utc")),
-            processing_error=(str(data["processing_error"]) if data.get("processing_error") else None),
-            media_info_tracks=tuple(
-                self._deserialize_media_info_track(item) for item in data.get("media_info_tracks", [])
-            ),
-            media_info_error=(str(data["media_info_error"]) if data.get("media_info_error") else None),
-        )
+        return deserialize_file_record(payload)
 
     def _deserialize_occurrence(self, payload: object) -> FaceOccurrence:
-        data = payload if isinstance(payload, dict) else {}
-        return FaceOccurrence(
-            occurrence_id=str(data.get("occurrence_id", "")),
-            source_path=Path(str(data.get("source_path", ""))),
-            sha512=str(data.get("sha512", "")),
-            media_type=MediaType(str(data.get("media_type", MediaType.OTHER.value))),
-            analysis_timestamp_utc=self._parse_datetime(data.get("analysis_timestamp_utc")),
-            frame_index=(None if data.get("frame_index") is None else int(data.get("frame_index"))),
-            frame_timestamp_seconds=(None if data.get("frame_timestamp_seconds") is None else float(data.get("frame_timestamp_seconds"))),
-            bbox=self._deserialize_bbox(data.get("bbox", {})),
-            detection_score=float(data.get("detection_score", 0.0)),
-            crop_path=(Path(str(data["crop_path"])) if data.get("crop_path") else None),
-            embedding=[float(item) for item in data.get("embedding", [])],
-            context_image_path=(Path(str(data["context_image_path"])) if data.get("context_image_path") else None),
-            cluster_id=(str(data["cluster_id"]) if data.get("cluster_id") else None),
-            suggested_cluster_ids=[str(item) for item in data.get("suggested_cluster_ids", [])],
-            track_id=(str(data["track_id"]) if data.get("track_id") else None),
-            keyframe_id=(str(data["keyframe_id"]) if data.get("keyframe_id") else None),
-            quality_metrics=self._deserialize_quality_metrics_optional(data.get("quality_metrics")),
-            enhancement_metadata=self._deserialize_enhancement_optional(data.get("enhancement_metadata")),
-            is_keyframe=bool(data.get("is_keyframe", False)),
-            track_position=(None if data.get("track_position") is None else int(data.get("track_position"))),
-            embedding_source=(str(data["embedding_source"]) if data.get("embedding_source") else None),
-        )
+        return deserialize_occurrence(payload)
 
     def _deserialize_track(self, payload: object) -> FaceTrack:
-        data = payload if isinstance(payload, dict) else {}
-        return FaceTrack(
-            track_id=str(data.get("track_id", "")),
-            source_path=Path(str(data.get("source_path", ""))),
-            video_path=(Path(str(data["video_path"])) if data.get("video_path") else None),
-            media_type=MediaType(str(data.get("media_type", MediaType.OTHER.value))),
-            sha512=str(data.get("sha512", "")),
-            start_frame=(None if data.get("start_frame") is None else int(data.get("start_frame"))),
-            end_frame=(None if data.get("end_frame") is None else int(data.get("end_frame"))),
-            start_time=(None if data.get("start_time") is None else float(data.get("start_time"))),
-            end_time=(None if data.get("end_time") is None else float(data.get("end_time"))),
-            occurrence_ids=[str(item) for item in data.get("occurrence_ids", [])],
-            keyframe_ids=[str(item) for item in data.get("keyframe_ids", [])],
-            representative_embeddings=[
-                [float(value) for value in embedding]
-                for embedding in data.get("representative_embeddings", [])
-            ],
-            average_embedding=[float(item) for item in data.get("average_embedding", [])],
-            best_occurrence_id=(str(data["best_occurrence_id"]) if data.get("best_occurrence_id") else None),
-            preview_path=(Path(str(data["preview_path"])) if data.get("preview_path") else None),
-            top_crop_paths=[Path(str(item)) for item in data.get("top_crop_paths", [])],
-            quality_statistics=self._deserialize_track_quality_statistics(data.get("quality_statistics")),
-            cluster_id=(str(data["cluster_id"]) if data.get("cluster_id") else None),
-            candidate_cluster_ids=[str(item) for item in data.get("candidate_cluster_ids", [])],
-        )
+        return deserialize_track(payload)
 
     def _deserialize_keyframe(self, payload: object) -> KeyFrame:
-        data = payload if isinstance(payload, dict) else {}
-        return KeyFrame(
-            keyframe_id=str(data.get("keyframe_id", "")),
-            track_id=str(data.get("track_id", "")),
-            occurrence_id=str(data.get("occurrence_id", "")),
-            source_path=Path(str(data.get("source_path", ""))),
-            frame_index=(None if data.get("frame_index") is None else int(data.get("frame_index"))),
-            timestamp_seconds=(None if data.get("timestamp_seconds") is None else float(data.get("timestamp_seconds"))),
-            selection_reasons=tuple(str(item) for item in data.get("selection_reasons", [])),
-            quality_metrics=self._deserialize_quality_metrics_optional(data.get("quality_metrics")),
-            detection_score=float(data.get("detection_score", 0.0)),
-            crop_path=(Path(str(data["crop_path"])) if data.get("crop_path") else None),
-            context_image_path=(Path(str(data["context_image_path"])) if data.get("context_image_path") else None),
-            embedding=[float(item) for item in data.get("embedding", [])],
-            preview_path=(Path(str(data["preview_path"])) if data.get("preview_path") else None),
-        )
+        return deserialize_keyframe(payload)
 
     def _deserialize_media_info_track(self, payload: object) -> MediaInfoTrack:
-        data = payload if isinstance(payload, dict) else {}
-        return MediaInfoTrack(
-            track_type=str(data.get("track_type", "")),
-            attributes=tuple(
-                MediaInfoAttribute(
-                    label=str(item.get("label", "")),
-                    value=str(item.get("value", "")),
-                )
-                for item in data.get("attributes", [])
-                if isinstance(item, dict)
-            ),
-        )
+        return deserialize_media_info_track(payload)
 
     def _deserialize_bbox(self, payload: object) -> BoundingBox:
-        data = payload if isinstance(payload, dict) else {}
-        return BoundingBox(
-            x1=float(data.get("x1", 0.0)),
-            y1=float(data.get("y1", 0.0)),
-            x2=float(data.get("x2", 0.0)),
-            y2=float(data.get("y2", 0.0)),
-        )
+        return deserialize_bbox(payload)
 
     def _deserialize_quality_metrics_optional(self, payload: object) -> FaceQualityMetrics | None:
-        if not isinstance(payload, dict):
-            return None
-        return FaceQualityMetrics(
-            detection_score=float(payload.get("detection_score", 0.0)),
-            sharpness=float(payload.get("sharpness", 0.0)),
-            brightness=float(payload.get("brightness", 0.0)),
-            illumination=float(payload.get("illumination", 0.0)),
-            frontality=float(payload.get("frontality", 0.0)),
-            bbox_pixels=float(payload.get("bbox_pixels", 0.0)),
-            score=float(payload.get("score", 0.0)),
-        )
+        return deserialize_quality_metrics_optional(payload)
 
     def _deserialize_enhancement_optional(self, payload: object) -> EnhancementMetadata | None:
-        if not isinstance(payload, dict):
-            return None
-        return EnhancementMetadata(
-            applied=bool(payload.get("applied", False)),
-            strategy=str(payload.get("strategy", "none")),
-            parameters={
-                str(key): value
-                for key, value in payload.get("parameters", {}).items()
-            },
-            brightness_before=(
-                None if payload.get("brightness_before") is None else float(payload.get("brightness_before"))
-            ),
-            brightness_after=(
-                None if payload.get("brightness_after") is None else float(payload.get("brightness_after"))
-            ),
-            note=(str(payload["note"]) if payload.get("note") else None),
-        )
+        return deserialize_enhancement_optional(payload)
 
     def _deserialize_track_quality_statistics(self, payload: object) -> TrackQualityStatistics:
-        data = payload if isinstance(payload, dict) else {}
-        return TrackQualityStatistics(
-            total_detections=int(data.get("total_detections", 0)),
-            keyframe_count=int(data.get("keyframe_count", 0)),
-            mean_detection_score=float(data.get("mean_detection_score", 0.0)),
-            max_detection_score=float(data.get("max_detection_score", 0.0)),
-            mean_quality_score=float(data.get("mean_quality_score", 0.0)),
-            best_quality_score=float(data.get("best_quality_score", 0.0)),
-            mean_sharpness=float(data.get("mean_sharpness", 0.0)),
-            mean_brightness=float(data.get("mean_brightness", 0.0)),
-            mean_illumination=float(data.get("mean_illumination", 0.0)),
-            mean_frontality=float(data.get("mean_frontality", 0.0)),
-            duration_seconds=float(data.get("duration_seconds", 0.0)),
-        )
+        return deserialize_track_quality_statistics(payload)
 
     def _parse_datetime(self, value: object) -> datetime:
-        if isinstance(value, datetime):
-            return value
-        if isinstance(value, str) and value:
-            return datetime.fromisoformat(value)
-        return utc_now()
+        return parse_datetime(value)
 
     def _parse_datetime_optional(self, value: object) -> datetime | None:
-        if value in (None, ""):
-            return None
-        return self._parse_datetime(value)
+        return parse_datetime_optional(value)
 
     def _propagate_cluster_membership(
         self,
@@ -4178,146 +1878,6 @@ class InventoryService:
             selected_face_sizes=self._calculate_face_size_statistics(selected_face_sizes),
         )
 
-    def _select_query_face(self, tracking_result: TrackingResult) -> tuple[FaceTrack, FaceOccurrence]:
-        if not tracking_result.tracks:
-            raise ValueError("Nenhuma face elegivel foi encontrada na imagem de consulta.")
-        occurrence_map = {
-            occurrence.track_id: occurrence
-            for occurrence in tracking_result.occurrences
-            if occurrence.track_id is not None
-        }
-        ranked_tracks = sorted(
-            tracking_result.tracks,
-            key=lambda track: (
-                track.quality_statistics.best_quality_score,
-                track.quality_statistics.mean_detection_score,
-                len(track.occurrence_ids),
-            ),
-            reverse=True,
-        )
-        for track in ranked_tracks:
-            if not track.average_embedding:
-                continue
-            occurrence = occurrence_map.get(track.track_id)
-            if occurrence is not None:
-                return track, occurrence
-        raise ValueError("A face de consulta nao gerou embedding utilizavel para a busca.")
-
-    def _resolve_face_search_matches(
-        self,
-        result: InventoryResult,
-        query_hit_sets: list[tuple[FaceSearchQuery, dict[str, list[object]]]],
-    ) -> list[FaceSearchMatch]:
-        compatibility_threshold = self._config.clustering.candidate_similarity
-        best_track_hits: dict[str, tuple[float, FaceSearchQuery, dict[str, list[object]]]] = {}
-        for query, raw_hits in query_hit_sets:
-            for hit in raw_hits.get("tracks", []):
-                score = float(getattr(hit, "score", -1.0))
-                if score < compatibility_threshold:
-                    continue
-                current = best_track_hits.get(hit.entity_id)
-                if current is None or score > current[0]:
-                    best_track_hits[hit.entity_id] = (score, query, raw_hits)
-
-        if not best_track_hits:
-            return []
-
-        ranked_track_hits = sorted(
-            best_track_hits.items(),
-            key=lambda item: item[1][0],
-            reverse=True,
-        )[: self._config.search.refine_top_k]
-
-        tracks_by_id = {track.track_id: track for track in result.tracks}
-        occurrences_by_id = {occurrence.occurrence_id: occurrence for occurrence in result.occurrences}
-        keyframes_by_track: dict[str, list[KeyFrame]] = {}
-        for keyframe in result.keyframes:
-            keyframes_by_track.setdefault(keyframe.track_id, []).append(keyframe)
-
-        resolved: list[FaceSearchMatch] = []
-        for rank, (track_id, (track_score, query, raw_hits)) in enumerate(ranked_track_hits, start=1):
-            track = tracks_by_id.get(track_id)
-            if track is None:
-                continue
-            cluster_scores = {
-                hit.entity_id: hit.score
-                for hit in raw_hits.get("clusters", [])
-                if getattr(hit, "score", -1.0) >= compatibility_threshold
-            }
-            occurrence_hits = {
-                hit.entity_id: hit
-                for hit in raw_hits.get("occurrences", [])
-                if getattr(hit, "score", -1.0) >= compatibility_threshold
-            }
-            occurrence = self._best_match_occurrence(track, occurrences_by_id, occurrence_hits)
-            keyframe = self._representative_keyframe(track, keyframes_by_track)
-            crop_path = (
-                occurrence.crop_path
-                if occurrence is not None and occurrence.crop_path is not None
-                else keyframe.preview_path if keyframe is not None else track.preview_path
-            )
-            context_path = (
-                occurrence.context_image_path
-                if occurrence is not None and occurrence.context_image_path is not None
-                else keyframe.context_image_path if keyframe is not None else None
-            )
-            occurrence_hit = occurrence_hits.get(occurrence.occurrence_id) if occurrence is not None else None
-            resolved.append(
-                FaceSearchMatch(
-                    rank=rank,
-                    cluster_id=track.cluster_id,
-                    track_id=track.track_id,
-                    occurrence_id=occurrence.occurrence_id if occurrence is not None else None,
-                    cluster_score=cluster_scores.get(track.cluster_id or ""),
-                    track_score=track_score,
-                    occurrence_score=occurrence_hit.score if occurrence_hit is not None else None,
-                    source_path=track.source_path,
-                    frame_index=(
-                        occurrence.frame_index
-                        if occurrence is not None
-                        else keyframe.frame_index if keyframe is not None else None
-                    ),
-                    timestamp_seconds=(
-                        occurrence.frame_timestamp_seconds
-                        if occurrence is not None
-                        else keyframe.timestamp_seconds if keyframe is not None else None
-                    ),
-                    track_start_time=track.start_time,
-                    track_end_time=track.end_time,
-                    crop_path=crop_path,
-                    context_image_path=context_path,
-                    query_source_path=query.source_path,
-                    query_selected_track_id=query.selected_track_id,
-                    query_selected_occurrence_id=query.selected_occurrence_id,
-                )
-            )
-        return resolved
-
-    def _best_match_occurrence(
-        self,
-        track: FaceTrack,
-        occurrences_by_id: dict[str, FaceOccurrence],
-        occurrence_hits: dict[str, object],
-    ) -> FaceOccurrence | None:
-        ranked_hits = sorted(
-            (
-                occurrence_hits[occurrence_id]
-                for occurrence_id in track.occurrence_ids
-                if occurrence_id in occurrence_hits
-            ),
-            key=lambda item: item.score,
-            reverse=True,
-        )
-        if ranked_hits:
-            return occurrences_by_id.get(ranked_hits[0].entity_id)
-        if track.best_occurrence_id is not None:
-            return occurrences_by_id.get(track.best_occurrence_id)
-        for occurrence_id in track.occurrence_ids:
-            occurrence = occurrences_by_id.get(occurrence_id)
-            if occurrence is not None:
-                return occurrence
-        return None
-
     def _representative_keyframe(
         self,
         track: FaceTrack,
@@ -4343,8 +1903,7 @@ class InventoryService:
         total: int,
         message: str,
     ) -> None:
-        if progress_callback is not None:
-            progress_callback(current, total, message)
+        emit_progress(progress_callback, current, total, message)
 
     def _emit_log(
         self,
@@ -4352,9 +1911,7 @@ class InventoryService:
         log_callback: LogCallback | None,
         message: str,
     ) -> None:
-        logger.info(message)
-        if log_callback is not None:
-            log_callback(message)
+        emit_log(logger, log_callback, message)
 
     def _emit_exception(
         self,
@@ -4365,96 +1922,16 @@ class InventoryService:
         *,
         include_traceback_in_callback: bool = False,
     ) -> tuple[str, str]:
-        summary = summarize_exception(exc)
-        traceback_text = format_exception_traceback(exc)
-        logger.exception("%s | %s", context_message, summary)
-        if log_callback is not None:
-            log_callback(f"{context_message} | {summary}")
-            if include_traceback_in_callback:
-                log_callback("[Traceback] Inicio")
-                log_callback(traceback_text)
-                log_callback("[Traceback] Fim")
-        return summary, traceback_text
+        return emit_exception(
+            logger,
+            log_callback,
+            context_message,
+            exc,
+            include_traceback_in_callback=include_traceback_in_callback,
+        )
 
     def _configuration_log_lines(self, providers: list[str]) -> list[str]:
-        provider_label = ", ".join(providers) if providers else "selecao automatica"
-        max_frames_label = (
-            "sem limite"
-            if self._config.video.max_frames_per_video is None
-            else str(self._config.video.max_frames_per_video)
-        )
-        image_extensions = ", ".join(self._config.media.image_extensions)
-        video_extensions = ", ".join(self._config.media.video_extensions)
-        return [
-            (
-                "[Configuracao] Midias | "
-                f"imagens={image_extensions} | videos={video_extensions}"
-            ),
-            (
-                "[Configuracao] Video | "
-                f"amostragem={self._config.video.sampling_interval_seconds:.2f}s | "
-                f"max_quadros={max_frames_label} | "
-                f"intervalo de keyframe={self._config.video.keyframe_interval_seconds:.2f}s | "
-                f"mudanca significativa={self._config.video.significant_change_threshold:.2f}"
-            ),
-            (
-                "[Configuracao] Tracking | "
-                f"iou={self._config.tracking.iou_threshold:.2f} | "
-                f"distancia={self._config.tracking.spatial_distance_threshold:.2f} | "
-                f"embedding={self._config.tracking.embedding_similarity_threshold:.2f} | "
-                f"score minimo={self._config.tracking.minimum_total_match_score:.2f} | "
-                f"pesos=geo:{self._config.tracking.geometry_weight:.2f}/emb:{self._config.tracking.embedding_weight:.2f} | "
-                f"perda maxima={self._config.tracking.max_missed_detections}"
-            ),
-            (
-                "[Configuracao] Analise facial | "
-                f"backend={self._config.face_model.backend} | "
-                f"modelo={self._config.face_model.model_name} | "
-                f"qualidade minima={self._config.face_model.minimum_face_quality:.2f} | "
-                f"face minima={self._config.face_model.minimum_face_size_pixels}px | "
-                f"provedores={provider_label}"
-            ),
-            (
-                "[Configuracao] Clustering | "
-                f"atribuicao={self._config.clustering.assignment_similarity:.2f} | "
-                f"sugestao={self._config.clustering.candidate_similarity:.2f} | "
-                f"grupo minimo={self._config.clustering.min_cluster_size} | "
-                f"track minimo={self._config.clustering.min_track_size}"
-            ),
-            (
-                "[Configuracao] Busca | "
-                f"habilitada={'sim' if self._config.search.enabled else 'nao'} | "
-                f"preferir_faiss={'sim' if self._config.search.prefer_faiss else 'nao'} | "
-                f"coarse={self._config.search.coarse_top_k} | "
-                f"refino={self._config.search.refine_top_k}"
-            ),
-            (
-                "[Configuracao] Distribuicao | "
-                f"habilitada={'sim' if self._config.distributed.enabled else 'nao'} | "
-                f"execucao={self._config.distributed.execution_label} | "
-                f"heartbeat={self._config.distributed.heartbeat_interval_seconds}s | "
-                f"timeout_lock={self._config.distributed.stale_lock_timeout_minutes}min | "
-                f"auto_finalizar={'sim' if self._config.distributed.auto_finalize else 'nao'} | "
-                f"validar_parciais={'sim' if self._config.distributed.validate_partial_integrity else 'nao'} | "
-                f"auto_recuperar={'sim' if self._config.distributed.auto_reprocess_invalid_partials else 'nao'}"
-            ),
-            (
-                "[Configuracao] Aprimoramento | "
-                f"pre_processamento={'sim' if self._config.enhancement.enable_preprocessing else 'nao'} | "
-                f"brilho minimo={self._config.enhancement.minimum_brightness_to_enhance:.2f} | "
-                f"gamma={self._config.enhancement.gamma:.2f} | "
-                f"denoise={self._config.enhancement.denoise_strength}"
-            ),
-            (
-                "[Configuracao] Relatorio | "
-                f"pdf={'sim' if self._config.reporting.compile_pdf else 'nao'} | "
-                f"max_tracks_por_grupo={self._config.reporting.max_tracks_per_group}"
-            ),
-            (
-                "[Configuracao] Operacao | "
-                f"copia_temporaria_local={'sim' if self._config.app.use_local_temp_copy else 'nao'}"
-            ),
-        ]
+        return configuration_log_lines(self._config, providers)
 
     def _planned_file_log_lines(self, planned_files: list[tuple[Path, MediaType]]) -> list[str]:
         if not planned_files:

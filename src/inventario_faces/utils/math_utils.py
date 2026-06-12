@@ -34,6 +34,21 @@ def average_embeddings(embeddings: Iterable[Iterable[float]]) -> list[float]:
     return l2_normalize(centroid.tolist())
 
 
+def weighted_average_embeddings(
+    embeddings: Iterable[Iterable[float]],
+    weights: Iterable[float],
+) -> list[float]:
+    rows = [np.asarray(list(embedding), dtype=np.float32) for embedding in embeddings]
+    if not rows:
+        return []
+    weight_array = np.asarray(list(weights), dtype=np.float32)
+    if weight_array.shape[0] != len(rows) or float(weight_array.sum()) <= 0.0:
+        return average_embeddings(rows)
+    matrix = np.vstack(rows)
+    centroid = (matrix * weight_array[:, None]).sum(axis=0) / float(weight_array.sum())
+    return l2_normalize(centroid.tolist())
+
+
 def bbox_iou(left: BoundingBox, right: BoundingBox) -> float:
     x1 = max(left.x1, right.x1)
     y1 = max(left.y1, right.y1)
