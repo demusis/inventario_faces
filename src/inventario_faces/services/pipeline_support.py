@@ -204,14 +204,27 @@ def prefetch_iterator(source: Iterable[Any], buffer_size: int = DEFAULT_VIDEO_PR
     sentinel = object()
     item_queue: "queue.Queue[Any]" = queue.Queue(maxsize=buffer_size)
     error_box: list[BaseException] = []
+    stop_event = threading.Event()
 
     def _produce() -> None:
         try:
             for item in source:
+                if stop_event.is_set():
+                    break
                 item_queue.put(item)
         except BaseException as exc:  # noqa: BLE001 - repropagado no consumidor
             error_box.append(exc)
         finally:
+            # Fecha a fonte explicitamente para liberar recursos subjacentes de forma
+            # deterministica (ex.: cv2.VideoCapture aberto por sample_video), evitando
+            # depender do GC. Imprescindivel porque o consumidor pode apagar o arquivo
+            # temporario logo apos esgotar/abandonar o gerador.
+            close = getattr(source, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
             item_queue.put(sentinel)
 
     worker = threading.Thread(target=_produce, name="video-prefetch", daemon=True)
@@ -225,14 +238,18 @@ def prefetch_iterator(source: Iterable[Any], buffer_size: int = DEFAULT_VIDEO_PR
         if error_box:
             raise error_box[0]
     finally:
-        # Se o consumidor parar cedo (excecao ou break), drena a fila para liberar o
-        # produtor que poderia estar bloqueado em put() numa fila cheia.
+        # Se o consumidor parar cedo (excecao ou break), sinaliza parada e drena a fila
+        # para liberar o produtor que poderia estar bloqueado em put() numa fila cheia.
+        stop_event.set()
         try:
             while item_queue.get_nowait() is not sentinel:
                 continue
         except queue.Empty:
             pass
-        worker.join(timeout=1.0)
+        # join() sem timeout: stop_event + drenagem garantem que o produtor termina
+        # rapidamente, e so retornamos depois que a fonte (e seus recursos) foi fechada.
+        # Assim o cleanup do arquivo temporario nunca corre enquanto a thread ainda le.
+        worker.join()
 
 
 def cleanup_processing_input(cleanup_path: Path | None) -> None:

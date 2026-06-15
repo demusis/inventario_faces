@@ -98,9 +98,10 @@ Os valores padrão atuais foram endurecidos para um uso pericial mais conservado
 - calibração LR com estimador de densidade não paramétrico limitado ao suporte do score;
 - nota institucional explícita sobre a natureza probabilística dos resultados.
 
+- `media`: extensões de imagem (`.jpg`, `.jpeg`, `.png`, `.bmp`, `.tif`, `.tiff`, `.webp`) e de vídeo (`.mp4`, `.avi`, `.mkv`, `.dav`, `.mov`, `.wmv`, `.mpeg`, `.mpg`) reconhecidas pelo scanner.
 - `video`: taxa de amostragem, teto de quadros, intervalo de keyframe e limiar de mudança significativa.
 - `comparison`: teto opcional de quadros por vídeo e intervalo de amostragem próprios da comparação `Padrão` x `Questionado` (nulos por padrão = herdam `video`).
-- `face_model`: backend, modelo, resolução de detecção, qualidade mínima, tamanho mínimo e execution providers. Por padrão, `providers` é vazio (descoberta automática CUDA → DirectML → CPU). Para ativar o `TensorrtExecutionProvider` (opt-in, mais rápido sobre CUDA, porém com warm-up longo de build de engine), liste-o explicitamente em `providers`.
+- `face_model`: backend, modelo, resolução de detecção (`det_size`), qualidade mínima, tamanho mínimo, ID de contexto do dispositivo (`ctx_id`) e execution providers. Por padrão, `providers` é vazio (descoberta automática CUDA → DirectML → CPU). Para ativar o `TensorrtExecutionProvider` (opt-in, mais rápido sobre CUDA, porém com warm-up longo de build de engine), liste-o explicitamente em `providers`.
 - `tracking`: IoU, distância espacial, similaridade de embedding, pesos de associação, tolerância a perda e top crops.
 - `clustering`: limiares de atribuição/sugestão e mínimos de grupo e de track.
 - `enhancement`: pré-processamento, brilho-gatilho, CLAHE, gamma e denoise.
@@ -109,6 +110,7 @@ Os valores padrão atuais foram endurecidos para um uso pericial mais conservado
 - `distributed`: modo compartilhado, identificador do lote, heartbeat do nó, timeout de lock órfão, auto-finalização, validação de integridade dos parciais e recuperação automática de itens ausentes/corrompidos.
 - `app`: nome institucional, pasta derivada de saída, nível de log e uso opcional de cópia temporária local da mídia antes da leitura.
 - `reporting`: compilação do PDF, densidade das seções e nota de cadeia de custódia.
+- `forensics`: nota obrigatória de cadeia de custódia incluída em todos os relatórios.
 
 Por padrão, o scanner já considera extensões usuais de vídeo como `.mp4`, `.avi`, `.mkv`, `.mov`, `.wmv`, `.mpeg`, `.mpg` e `.dav`. Para `.dav`, a leitura efetiva continua dependendo do suporte de codec disponível no ambiente OpenCV/FFmpeg da estação.
 
@@ -190,13 +192,13 @@ Na janela principal, `Busca por faces` aceita uma ou mais imagens de consulta.
 
 ## Comparação entre grupos faciais e LR
 
-A ação `Comparar conjuntos` foi desenhada para confrontar um grupo `Padrão` contra um grupo `Questionado`.
+A ação `Comparar conjuntos` foi desenhada para o fluxo **1:N de identificação**: o grupo `Padrão` é o conjunto de **referência**, contendo um **único indivíduo** (normalmente várias imagens dele), e o grupo `Questionado` reúne as mídias onde se quer **localizar esse indivíduo**.
 
-- cada grupo aceita **imagens e vídeos misturados**; vídeos passam pela mesma amostragem temporal, detecção, tracking e seleção de faces do inventário;
-- antes da comparação, cada grupo é **inventariado por indivíduo**: as faces são agrupadas (mesmo agrupamento determinístico do inventário) para consolidar repetições da mesma pessoa dentro do grupo. O resumo informa quantos indivíduos distintos há em cada conjunto e quantos aparecem mais de uma vez (`individual_id` também é exportado por face);
-- esse inventário por indivíduo é uma **camada informativa aditiva**: a comparação continua sendo feita par-a-par entre as faces selecionadas e a razão de verossimilhança (LR) é calculada exatamente como antes, sem alteração da evidência;
-- o sistema compara todas as faces elegíveis do Padrão contra todas as faces elegíveis do Questionado;
-- o resumo estatístico descreve o conjunto inteiro de pares, não apenas o primeiro item do ranking;
+- o `Questionado` aceita **imagens e vídeos misturados** (inclusive `.dav`); vídeos passam pela mesma amostragem temporal, detecção, tracking e seleção de faces do inventário;
+- o `Padrão` é consolidado como **referência de um único indivíduo**. Um agrupamento de **controle de qualidade** é aplicado apenas ao Padrão para detectar contaminação: se ele se dividir em mais de um agrupamento, o relatório emite um **alerta** de que pode haver imagem de outra pessoa ou faces de baixa qualidade na referência;
+- o `Questionado` **não é agrupado por indivíduo** — não interessa quantas pessoas há nele, e sim em quais mídias a referência aparece. Cada face/mídia do Questionado é confrontada diretamente contra a referência;
+- a comparação é **par-a-par** entre todas as faces elegíveis do Padrão e do Questionado, com ranking e faixas decisórias (`atribuição`/`candidata`/`abaixo do limiar`) e razão de verossimilhança (LR) opcional — esse núcleo evidencial é inalterado;
+- o resumo e o `run.log` relacionam, por **mídia do Questionado**, quais atingiram a faixa de atribuição e quais ficaram somente como candidatas, respondendo objetivamente se (e onde) o indivíduo de referência aparece;
 - a janela de LR pode usar uma base rotulada com uma subpasta por identidade ou um modelo LR já salvo em JSON;
 - quando a calibração é calculada na execução, o modelo é salvo automaticamente para reaproveitamento posterior.
 

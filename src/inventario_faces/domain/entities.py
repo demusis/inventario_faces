@@ -449,6 +449,10 @@ class FaceSetComparisonSummary:
     set_b_individuals: int = 0
     set_a_repeated_individuals: int = 0
     set_b_repeated_individuals: int = 0
+    reference_is_homogeneous: bool = True
+    questionado_media_total: int = 0
+    questionado_media_with_assignment: int = 0
+    questionado_media_with_candidate: int = 0
     total_pair_comparisons: int = 0
     assignment_matches: int = 0
     candidate_matches: int = 0

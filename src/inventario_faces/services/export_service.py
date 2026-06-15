@@ -584,8 +584,11 @@ class ExportService:
             f"Questionado - faces selecionadas: {summary.set_b_selected_faces}",
             f"Padrão - imagens sem face valida: {summary.set_a_images_without_faces}",
             f"Questionado - imagens sem face valida: {summary.set_b_images_without_faces}",
-            f"Padrão - individuos distintos: {summary.set_a_individuals} (com repeticao: {summary.set_a_repeated_individuals})",
-            f"Questionado - individuos distintos: {summary.set_b_individuals} (com repeticao: {summary.set_b_repeated_individuals})",
+            f"Referência (Padrão) - agrupamentos: {summary.set_a_individuals} (esperado 1) | "
+            f"homogênea: {'sim' if summary.reference_is_homogeneous else 'NÃO - revisar'}",
+            f"Questionado - mídias analisadas: {summary.questionado_media_total}",
+            f"Questionado - mídias com correspondência por atribuição: {summary.questionado_media_with_assignment}",
+            f"Questionado - mídias somente candidatas: {summary.questionado_media_with_candidate}",
             f"Comparacoes par-a-par: {summary.total_pair_comparisons}",
             f"Compatibilidades por atribuicao: {summary.assignment_matches}",
             f"Compatibilidades candidatas: {summary.candidate_matches}",

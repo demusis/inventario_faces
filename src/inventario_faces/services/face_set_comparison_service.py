@@ -315,14 +315,13 @@ class FaceSetComparisonService:
             if not set_b_faces:
                 raise RuntimeError("Nenhuma face valida foi selecionada no grupo Questionado.")
 
-            # Camada aditiva de inventario: agrupa as faces de cada conjunto por individuo
-            # (consolidando repeticoes da mesma pessoa) sem alterar a comparacao par-a-par
-            # nem a calibracao LR aplicadas adiante.
+            # Camada aditiva: consolida o conjunto de REFERENCIA (Padrao), que deve conter
+            # um unico individuo, agrupando suas faces por individuo apenas como controle de
+            # qualidade (deteccao de imagem contaminante). O conjunto Questionado NAO e
+            # agrupado: cada face/midia e confrontada diretamente contra a referencia. Nada
+            # disso altera a comparacao par-a-par nem a calibracao LR aplicadas adiante.
             set_a_faces = self._assign_individuals(set_a_faces, "A")
-            set_b_faces = self._assign_individuals(set_b_faces, "B")
-            for line in self._individual_inventory_log_lines(set_a_faces, "A"):
-                emit_log(text_logger, log_callback, line)
-            for line in self._individual_inventory_log_lines(set_b_faces, "B"):
+            for line in self._reference_inventory_log_lines(set_a_faces):
                 emit_log(text_logger, log_callback, line)
 
             calibration: FaceSetComparisonCalibration | None = loaded_calibration
@@ -472,6 +471,8 @@ class FaceSetComparisonService:
 
             for line in self._comparison_summary_log_lines(summary):
                 emit_log(text_logger, log_callback, line)
+            for line in self._questionado_verdict_log_lines(set_b_faces, matches):
+                emit_log(text_logger, log_callback, line)
 
             event_logger.write(
                 "face_set_comparison_finished",
@@ -590,24 +591,73 @@ class FaceSetComparisonService:
         repeated = sum(1 for value in counts.values() if value > 1)
         return distinct, repeated
 
-    def _individual_inventory_log_lines(
-        self, entries: list[FaceSetComparisonEntry], set_label: str
-    ) -> list[str]:
-        label = self._comparison_group_label(set_label)
-        distinct, repeated = self._count_individuals(entries)
+    def _reference_inventory_log_lines(self, entries: list[FaceSetComparisonEntry]) -> list[str]:
+        """Resumo/QC do conjunto de referencia (Padrao), que deve conter um unico individuo."""
+
+        distinct, _repeated = self._count_individuals(entries)
         media_count = len({str(entry.source_path) for entry in entries})
         lines = [
             (
-                f"[Inventario {label}] midias={media_count} | faces={len(entries)} | "
-                f"individuos_distintos={distinct} | individuos_com_repeticao={repeated}"
+                f"[Referencia Padrão] imagens={media_count} | faces={len(entries)} | "
+                f"agrupamentos={distinct} (esperado=1)"
             )
         ]
-        counts = Counter(entry.individual_id for entry in entries if entry.individual_id is not None)
-        for individual_id, occurrences in sorted(counts.items()):
-            if occurrences > 1:
-                lines.append(
-                    f"[Inventario {label}] {individual_id} aparece {occurrences} vez(es) no grupo."
+        if distinct > 1:
+            lines.append(
+                (
+                    "[Referencia Padrão][ALERTA] O Padrão deveria conter um unico individuo, mas o "
+                    f"agrupamento encontrou {distinct} agrupamentos distintos. Verifique se ha imagem "
+                    "de outra pessoa ou faces de baixa qualidade no conjunto de referencia."
                 )
+            )
+        return lines
+
+    def _questionado_media_verdict(
+        self,
+        set_b_faces: list[FaceSetComparisonEntry],
+        matches: list[FaceSetComparisonMatch],
+    ) -> tuple[set[str], set[str], set[str]]:
+        """Mapeia o veredito por MIDIA do Questionado a partir dos pares ja classificados.
+
+        Retorna (todas_as_midias, midias_com_atribuicao, midias_somente_candidatas). O
+        Questionado nao e agrupado por individuo: o que interessa e em quais midias o
+        individuo de referencia aparece, segundo as faixas decisorias par-a-par.
+        """
+
+        source_by_entry = {entry.entry_id: str(entry.source_path) for entry in set_b_faces}
+        all_media = set(source_by_entry.values())
+        assignment_media: set[str] = set()
+        candidate_media: set[str] = set()
+        for match in matches:
+            media = source_by_entry.get(match.right_entry_id)
+            if media is None:
+                continue
+            if match.classification == "assignment":
+                assignment_media.add(media)
+            elif match.classification == "candidate":
+                candidate_media.add(media)
+        return all_media, assignment_media, candidate_media - assignment_media
+
+    def _questionado_verdict_log_lines(
+        self,
+        set_b_faces: list[FaceSetComparisonEntry],
+        matches: list[FaceSetComparisonMatch],
+    ) -> list[str]:
+        all_media, assignment_media, candidate_only = self._questionado_media_verdict(set_b_faces, matches)
+        lines = [
+            (
+                f"[Busca no Questionado] midias={len(all_media)} | "
+                f"com_atribuicao={len(assignment_media)} | somente_candidatas={len(candidate_only)}"
+            )
+        ]
+        for media in sorted(assignment_media):
+            lines.append(f"[Busca no Questionado][ATRIBUICAO] {Path(media).name}")
+        for media in sorted(candidate_only):
+            lines.append(f"[Busca no Questionado][CANDIDATA] {Path(media).name}")
+        if not assignment_media and not candidate_only:
+            lines.append(
+                "[Busca no Questionado] Nenhuma midia atingiu as faixas de atribuicao ou candidata."
+            )
         return lines
 
     def _normalize_calibration_root(self, calibration_root: Path | None) -> Path | None:
@@ -1290,6 +1340,9 @@ class FaceSetComparisonService:
     ) -> FaceSetComparisonSummary:
         set_a_individuals, set_a_repeated = self._count_individuals(set_a_faces)
         set_b_individuals, set_b_repeated = self._count_individuals(set_b_faces)
+        all_media, assignment_media, candidate_only_media = self._questionado_media_verdict(
+            set_b_faces, matches
+        )
         similarity_values = [item.similarity for item in matches]
         calibrated_values = [item.log10_likelihood_ratio for item in matches if item.log10_likelihood_ratio is not None]
         q1_similarity: float | None = None
@@ -1330,6 +1383,10 @@ class FaceSetComparisonService:
             set_b_individuals=set_b_individuals,
             set_a_repeated_individuals=set_a_repeated,
             set_b_repeated_individuals=set_b_repeated,
+            reference_is_homogeneous=set_a_individuals <= 1,
+            questionado_media_total=len(all_media),
+            questionado_media_with_assignment=len(assignment_media),
+            questionado_media_with_candidate=len(candidate_only_media),
             total_pair_comparisons=len(matches),
             assignment_matches=len([item for item in matches if item.classification == "assignment"]),
             candidate_matches=len([item for item in matches if item.classification == "candidate"]),
@@ -1366,9 +1423,13 @@ class FaceSetComparisonService:
                 f"questionado={summary.set_b_selected_faces}"
             ),
             (
-                f"[Comparacao] Individuos distintos | "
-                f"padrao={summary.set_a_individuals} (com repeticao={summary.set_a_repeated_individuals}) | "
-                f"questionado={summary.set_b_individuals} (com repeticao={summary.set_b_repeated_individuals})"
+                f"[Comparacao] Referencia Padrão | agrupamentos={summary.set_a_individuals} (esperado=1) | "
+                f"homogenea={'sim' if summary.reference_is_homogeneous else 'NAO'}"
+            ),
+            (
+                f"[Comparacao] Busca no Questionado | midias={summary.questionado_media_total} | "
+                f"com_atribuicao={summary.questionado_media_with_assignment} | "
+                f"somente_candidatas={summary.questionado_media_with_candidate}"
             ),
             (
                 f"[Comparacao] Estatisticas | pares={summary.total_pair_comparisons} | "

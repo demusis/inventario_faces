@@ -4,7 +4,11 @@ import unittest
 from pathlib import Path
 
 from tests._bootstrap import PROJECT_ROOT  # noqa: F401
-from inventario_faces.domain.entities import BoundingBox, FaceSetComparisonEntry
+from inventario_faces.domain.entities import (
+    BoundingBox,
+    FaceSetComparisonEntry,
+    FaceSetComparisonMatch,
+)
 from inventario_faces.infrastructure.config_loader import load_app_config
 from inventario_faces.services.clustering_service import ClusteringService
 from inventario_faces.services.face_set_comparison_service import FaceSetComparisonService
@@ -129,6 +133,79 @@ class AssignIndividualsTests(unittest.TestCase):
         by_id = {item.entry_id: item.individual_id for item in assigned}
         self.assertIsNotNone(by_id["A1"])
         self.assertIsNone(by_id["A2"])
+
+
+def _match(right_entry_id: str, classification: str) -> FaceSetComparisonMatch:
+    return FaceSetComparisonMatch(
+        rank=1,
+        left_entry_id="A1",
+        right_entry_id=right_entry_id,
+        left_track_id="TA1",
+        right_track_id=f"T{right_entry_id}",
+        similarity=0.7,
+        classification=classification,
+    )
+
+
+class ReferenceAndVerdictTests(unittest.TestCase):
+    def setUp(self) -> None:
+        config = load_app_config()
+        self._service = FaceSetComparisonService(
+            config=config,
+            scanner_service=ScannerService(config.media),
+            hashing_service=HashingService(),
+            media_service=VideoService(config.video),
+            tracking_service=object(),
+            face_analyzer_factory=lambda: None,
+            lr_calibrator=LikelihoodRatioCalibrator(config),
+            clustering_service=ClusteringService(config.clustering),
+        )
+
+    def test_reference_log_ok_when_homogeneous(self) -> None:
+        entries = [
+            _entry("A1", "A", [1.0, 0.0, 0.0], "foto1.jpg"),
+            _entry("A2", "A", [0.99, 0.01, 0.0], "foto2.jpg"),
+        ]
+        assigned = self._service._assign_individuals(entries, "A")
+        lines = self._service._reference_inventory_log_lines(assigned)
+        self.assertFalse(any("ALERTA" in line for line in lines))
+
+    def test_reference_log_warns_when_not_homogeneous(self) -> None:
+        entries = [
+            _entry("A1", "A", [1.0, 0.0, 0.0], "foto1.jpg"),
+            _entry("A2", "A", [0.0, 1.0, 0.0], "foto2.jpg"),  # outra pessoa na referencia
+        ]
+        assigned = self._service._assign_individuals(entries, "A")
+        lines = self._service._reference_inventory_log_lines(assigned)
+        self.assertTrue(any("ALERTA" in line for line in lines))
+
+    def test_questionado_verdict_groups_media_by_classification(self) -> None:
+        set_b = [
+            _entry("B1", "B", [1.0, 0.0, 0.0], "video1.mp4"),
+            _entry("B2", "B", [0.0, 1.0, 0.0], "imagem2.jpg"),
+            _entry("B3", "B", [0.0, 0.0, 1.0], "imagem3.jpg"),
+        ]
+        matches = [
+            _match("B1", "assignment"),
+            _match("B2", "candidate"),
+            _match("B3", "below_threshold"),
+        ]
+        all_media, assignment_media, candidate_only = self._service._questionado_media_verdict(
+            set_b, matches
+        )
+        self.assertEqual(len(all_media), 3)
+        self.assertEqual(assignment_media, {"video1.mp4"})
+        self.assertEqual(candidate_only, {"imagem2.jpg"})
+
+    def test_assignment_media_excluded_from_candidate_only(self) -> None:
+        # Mesma midia com par de atribuicao E par candidato: deve contar so como atribuicao.
+        set_b = [_entry("B1", "B", [1.0, 0.0, 0.0], "video1.mp4")]
+        matches = [_match("B1", "assignment"), _match("B1", "candidate")]
+        _all, assignment_media, candidate_only = self._service._questionado_media_verdict(
+            set_b, matches
+        )
+        self.assertEqual(assignment_media, {"video1.mp4"})
+        self.assertEqual(candidate_only, set())
 
 
 if __name__ == "__main__":
