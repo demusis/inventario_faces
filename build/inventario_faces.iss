@@ -1,6 +1,6 @@
 #define MyAppName "Inventario Faces"
 #ifndef MyAppVersion
-  #define MyAppVersion "0.2.3"
+  #define MyAppVersion "0.2.4"
 #endif
 #define MyAppPublisher "Laboratorio de Analise Digital"
 #define MyAppURL "https://github.com/demusis/inventario_faces"
