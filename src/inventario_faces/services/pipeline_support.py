@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import json
 import logging
+import queue
 import shutil
 import tempfile
+import threading
 from dataclasses import replace
 from pathlib import Path
+from typing import Any, Iterable, Iterator
 
 from inventario_faces.domain.config import AppConfig
 from inventario_faces.domain.entities import MediaType
@@ -179,6 +182,57 @@ def frames_with_original_source(
         replace(frame, source_path=original_source_path)
         for frame in frames
     )
+
+
+#: Tamanho padrao do buffer de prefetch de quadros: equilibra sobreposicao decode/inferencia
+#: e uso de memoria (quadros BGR mantidos simultaneamente).
+DEFAULT_VIDEO_PREFETCH_BUFFER = 8
+
+
+def prefetch_iterator(source: Iterable[Any], buffer_size: int = DEFAULT_VIDEO_PREFETCH_BUFFER) -> Iterator[Any]:
+    """Consome ``source`` em uma thread de fundo, sobrepondo a decodificacao (CPU) com o
+    trabalho do consumidor (ex.: inferencia em GPU).
+
+    A ordem dos itens e preservada integralmente (produtor unico + fila FIFO), portanto os
+    resultados sao identicos aos da iteracao sequencial -- a unica diferenca e temporal.
+    Excecoes levantadas pelo produtor sao repropagadas ao consumidor na mesma posicao.
+    """
+
+    if buffer_size < 1:
+        raise ValueError("buffer_size deve ser >= 1.")
+
+    sentinel = object()
+    item_queue: "queue.Queue[Any]" = queue.Queue(maxsize=buffer_size)
+    error_box: list[BaseException] = []
+
+    def _produce() -> None:
+        try:
+            for item in source:
+                item_queue.put(item)
+        except BaseException as exc:  # noqa: BLE001 - repropagado no consumidor
+            error_box.append(exc)
+        finally:
+            item_queue.put(sentinel)
+
+    worker = threading.Thread(target=_produce, name="video-prefetch", daemon=True)
+    worker.start()
+    try:
+        while True:
+            item = item_queue.get()
+            if item is sentinel:
+                break
+            yield item
+        if error_box:
+            raise error_box[0]
+    finally:
+        # Se o consumidor parar cedo (excecao ou break), drena a fila para liberar o
+        # produtor que poderia estar bloqueado em put() numa fila cheia.
+        try:
+            while item_queue.get_nowait() is not sentinel:
+                continue
+        except queue.Empty:
+            pass
+        worker.join(timeout=1.0)
 
 
 def cleanup_processing_input(cleanup_path: Path | None) -> None:

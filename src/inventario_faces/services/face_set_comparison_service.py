@@ -5,6 +5,7 @@ import math
 import shutil
 import statistics
 import time
+from collections import Counter
 from dataclasses import replace
 from pathlib import Path
 from typing import Callable
@@ -39,6 +40,7 @@ from inventario_faces.infrastructure.logging_setup import (
     build_file_logger,
     close_file_logger,
 )
+from inventario_faces.services.clustering_service import ClusteringService
 from inventario_faces.services.export_service import ExportService
 from inventario_faces.services.hashing_service import HashingService
 from inventario_faces.services.lr_calibration import LikelihoodRatioCalibrator
@@ -49,11 +51,12 @@ from inventario_faces.services.pipeline_support import (
     emit_log,
     emit_progress,
     frames_with_original_source,
+    prefetch_iterator,
     prepare_processing_input,
 )
 from inventario_faces.services.scanner_service import ScannerService
 from inventario_faces.services.tracking_service import FaceTrackingService
-from inventario_faces.services.video_service import VideoService
+from inventario_faces.services.video_service import VideoSamplingInfo, VideoService
 from inventario_faces.utils.math_utils import cosine_similarity
 from inventario_faces.utils.path_utils import ensure_directory, file_io_path, safe_stem
 from inventario_faces.utils.time_utils import utc_now
@@ -71,6 +74,7 @@ class FaceSetComparisonService:
         tracking_service: FaceTrackingService,
         face_analyzer_factory: Callable[[], FaceAnalyzer],
         lr_calibrator: LikelihoodRatioCalibrator,
+        clustering_service: ClusteringService,
         media_info_extractor: MediaInfoExtractor | None = None,
     ) -> None:
         self._config = config
@@ -80,7 +84,36 @@ class FaceSetComparisonService:
         self._tracking_service = tracking_service
         self._face_analyzer_factory = face_analyzer_factory
         self._lr_calibrator = lr_calibrator
+        self._clustering_service = clustering_service
         self._media_info_extractor = media_info_extractor
+        self._comparison_media_service = self._build_comparison_media_service(config, media_service)
+
+    def _build_comparison_media_service(
+        self, config: AppConfig, default_media_service: VideoService
+    ) -> VideoService:
+        """Cria um VideoService dedicado quando a comparacao define teto/intervalo proprios.
+
+        Sem override (padrao), reutiliza o media service global -- a comparacao herda a
+        amostragem de video integral, sem alterar o comportamento atual.
+        """
+
+        comparison = config.comparison
+        if comparison.max_frames_per_video is None and comparison.sampling_interval_seconds is None:
+            return default_media_service
+        overridden_video = replace(
+            config.video,
+            max_frames_per_video=(
+                comparison.max_frames_per_video
+                if comparison.max_frames_per_video is not None
+                else config.video.max_frames_per_video
+            ),
+            sampling_interval_seconds=(
+                comparison.sampling_interval_seconds
+                if comparison.sampling_interval_seconds is not None
+                else config.video.sampling_interval_seconds
+            ),
+        )
+        return VideoService(overridden_video)
 
     def compare_face_sets(
         self,
@@ -134,8 +167,8 @@ class FaceSetComparisonService:
                 text_logger,
                 log_callback,
                 (
-                    f"[Comparacao] Padrão={len(normalized_a)} imagem(ns) | "
-                    f"Questionado={len(normalized_b)} imagem(ns)"
+                    f"[Comparacao] Padrão={len(normalized_a)} midia(s) | "
+                    f"Questionado={len(normalized_b)} midia(s)"
                 ),
             )
             loaded_calibration: FaceSetComparisonCalibration | None = None
@@ -282,6 +315,16 @@ class FaceSetComparisonService:
             if not set_b_faces:
                 raise RuntimeError("Nenhuma face valida foi selecionada no grupo Questionado.")
 
+            # Camada aditiva de inventario: agrupa as faces de cada conjunto por individuo
+            # (consolidando repeticoes da mesma pessoa) sem alterar a comparacao par-a-par
+            # nem a calibracao LR aplicadas adiante.
+            set_a_faces = self._assign_individuals(set_a_faces, "A")
+            set_b_faces = self._assign_individuals(set_b_faces, "B")
+            for line in self._individual_inventory_log_lines(set_a_faces, "A"):
+                emit_log(text_logger, log_callback, line)
+            for line in self._individual_inventory_log_lines(set_b_faces, "B"):
+                emit_log(text_logger, log_callback, line)
+
             calibration: FaceSetComparisonCalibration | None = loaded_calibration
             if calibration_plan:
                 calibration_entry_sequence = [0]
@@ -383,6 +426,8 @@ class FaceSetComparisonService:
             summary = self._build_face_set_comparison_summary(
                 set_a_inputs=set_a_inputs,
                 set_b_inputs=set_b_inputs,
+                set_a_faces=set_a_faces,
+                set_b_faces=set_b_faces,
                 matches=matches,
             )
             finished_at_utc = utc_now()
@@ -466,17 +511,22 @@ class FaceSetComparisonService:
         normalized: list[Path] = []
         seen: set[Path] = set()
         if not paths:
-            raise ValueError(f"{set_name} precisa conter ao menos uma imagem.")
+            raise ValueError(f"{set_name} precisa conter ao menos uma midia (imagem ou video).")
         for raw_path in paths:
             candidate = Path(raw_path).resolve()
             if not candidate.exists():
-                raise FileNotFoundError(f"Imagem nao encontrada em {set_name}: {candidate}")
+                raise FileNotFoundError(f"Midia nao encontrada em {set_name}: {candidate}")
+            media_type = self._scanner_service.classify(candidate)
+            if media_type not in (MediaType.IMAGE, MediaType.VIDEO):
+                raise ValueError(
+                    f"{set_name} contem um arquivo de tipo nao suportado (apenas imagem ou video): {candidate}"
+                )
             if candidate in seen:
                 continue
             seen.add(candidate)
             normalized.append(candidate)
         if not normalized:
-            raise ValueError(f"{set_name} precisa conter ao menos uma imagem valida.")
+            raise ValueError(f"{set_name} precisa conter ao menos uma midia valida.")
         return normalized
 
     def _resolve_comparison_work_directory(
@@ -497,6 +547,68 @@ class FaceSetComparisonService:
         if set_label == "CAL":
             return "Calibração LR"
         return set_label
+
+    def _format_video_sampling_log(self, file_prefix: str, info: VideoSamplingInfo) -> str:
+        total_frames = info.total_frames if info.total_frames is not None else "?"
+        planned = info.planned_sample_count if info.planned_sample_count is not None else "?"
+        cap = info.max_sample_count if info.max_sample_count is not None else "sem teto"
+        return (
+            f"{file_prefix} [Amostragem de video] fps={info.fps:.2f} | quadros_totais={total_frames} | "
+            f"passo={info.frame_step} | amostras_planejadas={planned} | teto={cap}"
+        )
+
+    def _assign_individuals(
+        self, entries: list[FaceSetComparisonEntry], set_label: str
+    ) -> list[FaceSetComparisonEntry]:
+        """Agrupa as faces do conjunto por individuo e devolve novas entries com
+        ``individual_id`` preenchido.
+
+        Camada estritamente aditiva: usa apenas os embeddings ja calculados e o mesmo
+        agrupamento deterministico do inventario; nao toca em similaridades, matches
+        ou na calibracao LR. Faces sem embedding ficam com ``individual_id`` None.
+        """
+
+        if not entries:
+            return entries
+        items = [(entry.entry_id, entry.embedding, 1.0) for entry in entries if entry.embedding]
+        groups = self._clustering_service.cluster_embeddings(items)
+        individual_by_entry: dict[str, str] = {}
+        for group_index, entry_ids in enumerate(groups, start=1):
+            individual_id = f"{set_label}-IND-{group_index:03d}"
+            for entry_id in entry_ids:
+                individual_by_entry[entry_id] = individual_id
+        return [
+            replace(entry, individual_id=individual_by_entry.get(entry.entry_id))
+            for entry in entries
+        ]
+
+    def _count_individuals(self, entries: list[FaceSetComparisonEntry]) -> tuple[int, int]:
+        """Retorna (individuos_distintos, individuos_com_repeticao) do conjunto."""
+
+        counts = Counter(entry.individual_id for entry in entries if entry.individual_id is not None)
+        distinct = len(counts)
+        repeated = sum(1 for value in counts.values() if value > 1)
+        return distinct, repeated
+
+    def _individual_inventory_log_lines(
+        self, entries: list[FaceSetComparisonEntry], set_label: str
+    ) -> list[str]:
+        label = self._comparison_group_label(set_label)
+        distinct, repeated = self._count_individuals(entries)
+        media_count = len({str(entry.source_path) for entry in entries})
+        lines = [
+            (
+                f"[Inventario {label}] midias={media_count} | faces={len(entries)} | "
+                f"individuos_distintos={distinct} | individuos_com_repeticao={repeated}"
+            )
+        ]
+        counts = Counter(entry.individual_id for entry in entries if entry.individual_id is not None)
+        for individual_id, occurrences in sorted(counts.items()):
+            if occurrences > 1:
+                lines.append(
+                    f"[Inventario {label}] {individual_id} aparece {occurrences} vez(es) no grupo."
+                )
+        return lines
 
     def _normalize_calibration_root(self, calibration_root: Path | None) -> Path | None:
         if calibration_root is None:
@@ -549,7 +661,7 @@ class FaceSetComparisonService:
         calibration_model_path: Path | None = None,
     ) -> list[str]:
         lines = [
-            "[Procedimento] Cada imagem e submetida ao mesmo fluxo do inventario: preparo de entrada, deteccao, filtros, tracking e embeddings.",
+            "[Procedimento] Cada midia (imagem ou video) e submetida ao mesmo fluxo do inventario: preparo de entrada, deteccao, filtros, tracking e embeddings.",
             (
                 "[Procedimento] A comparacao final e par-a-par entre as faces selecionadas dos grupos Padrão e Questionado, "
                 "usando similaridade cosseno dos embeddings."
@@ -629,14 +741,19 @@ class FaceSetComparisonService:
         log_callback: LogCallback | None,
     ) -> tuple[FaceSetComparisonInput, list[FaceSetComparisonEntry]]:
         file_prefix = f"[Comparacao {self._comparison_group_label(set_label)} {index}/{total_images}]"
-        emit_log(text_logger, log_callback, f"{file_prefix} Iniciando imagem {image_path}")
+        emit_log(text_logger, log_callback, f"{file_prefix} Iniciando midia {image_path}")
         source_copy_path: Path | None = None
         sha512 = ""
-        current_stage = "preparacao de entrada"
+        current_stage = "classificacao de midia"
         processing_error: str | None = None
         entries: list[FaceSetComparisonEntry] = []
 
         try:
+            media_type = self._scanner_service.classify(image_path)
+            if media_type not in (MediaType.IMAGE, MediaType.VIDEO):
+                raise ValueError(
+                    f"Tipo de midia nao suportado para comparacao: {image_path.suffix or image_path.name}"
+                )
             current_stage = "copia de exportacao"
             source_copy_path = self._copy_comparison_input(export_directory, set_label, index, image_path)
             current_stage = "preparacao de entrada"
@@ -644,20 +761,37 @@ class FaceSetComparisonService:
                 config=self._config,
                 hashing_service=self._hashing_service,
                 file_path=image_path,
-                media_type=MediaType.IMAGE,
+                media_type=media_type,
                 file_prefix=file_prefix,
                 text_logger=text_logger,
                 log_callback=log_callback,
             )
             try:
-                current_stage = "carregamento da imagem"
-                frame = self._media_service.load_image(processing_path)
+                if media_type == MediaType.IMAGE:
+                    current_stage = "carregamento da imagem"
+                    frames = frames_with_original_source(
+                        [self._media_service.load_image(processing_path)],
+                        image_path,
+                    )
+                else:
+                    current_stage = "amostragem do video"
+                    sampled_frames = self._comparison_media_service.sample_video(
+                        processing_path,
+                        metadata_callback=lambda info: emit_log(
+                            text_logger,
+                            log_callback,
+                            self._format_video_sampling_log(file_prefix, info),
+                        ),
+                    )
+                    frames = frames_with_original_source(
+                        prefetch_iterator(sampled_frames), image_path
+                    )
                 current_stage = "deteccao, tracking e embeddings"
                 tracking_result = self._tracking_service.process_media(
                     source_path=image_path,
                     sha512=sha512,
-                    media_type=MediaType.IMAGE,
-                    frames=frames_with_original_source([frame], image_path),
+                    media_type=media_type,
+                    frames=frames,
                     analyzer=analyzer,
                     artifact_store=ArtifactStore(
                         run_directory
@@ -1150,8 +1284,12 @@ class FaceSetComparisonService:
         *,
         set_a_inputs: list[FaceSetComparisonInput],
         set_b_inputs: list[FaceSetComparisonInput],
+        set_a_faces: list[FaceSetComparisonEntry],
+        set_b_faces: list[FaceSetComparisonEntry],
         matches: list[FaceSetComparisonMatch],
     ) -> FaceSetComparisonSummary:
+        set_a_individuals, set_a_repeated = self._count_individuals(set_a_faces)
+        set_b_individuals, set_b_repeated = self._count_individuals(set_b_faces)
         similarity_values = [item.similarity for item in matches]
         calibrated_values = [item.log10_likelihood_ratio for item in matches if item.log10_likelihood_ratio is not None]
         q1_similarity: float | None = None
@@ -1188,6 +1326,10 @@ class FaceSetComparisonService:
             set_b_selected_faces=sum(item.selected_faces for item in set_b_inputs),
             set_a_images_without_faces=len([item for item in set_a_inputs if item.selected_faces == 0]),
             set_b_images_without_faces=len([item for item in set_b_inputs if item.selected_faces == 0]),
+            set_a_individuals=set_a_individuals,
+            set_b_individuals=set_b_individuals,
+            set_a_repeated_individuals=set_a_repeated,
+            set_b_repeated_individuals=set_b_repeated,
             total_pair_comparisons=len(matches),
             assignment_matches=len([item for item in matches if item.classification == "assignment"]),
             candidate_matches=len([item for item in matches if item.classification == "candidate"]),
@@ -1222,6 +1364,11 @@ class FaceSetComparisonService:
             (
                 f"[Comparacao] Faces selecionadas | padrao={summary.set_a_selected_faces} | "
                 f"questionado={summary.set_b_selected_faces}"
+            ),
+            (
+                f"[Comparacao] Individuos distintos | "
+                f"padrao={summary.set_a_individuals} (com repeticao={summary.set_a_repeated_individuals}) | "
+                f"questionado={summary.set_b_individuals} (com repeticao={summary.set_b_repeated_individuals})"
             ),
             (
                 f"[Comparacao] Estatisticas | pares={summary.total_pair_comparisons} | "

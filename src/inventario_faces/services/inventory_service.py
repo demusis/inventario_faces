@@ -86,6 +86,7 @@ from inventario_faces.services.pipeline_support import (
     emit_log,
     emit_progress,
     frames_with_original_source,
+    prefetch_iterator,
     prepare_processing_input,
     write_json_atomic,
 )
@@ -178,6 +179,7 @@ class InventoryService:
             tracking_service=self._tracking_service,
             face_analyzer_factory=face_analyzer_factory,
             lr_calibrator=self._lr_calibrator,
+            clustering_service=self._clustering_service,
             media_info_extractor=media_info_extractor,
         )
 
@@ -1220,7 +1222,9 @@ class InventoryService:
                         self._format_video_sampling_log(file_prefix, info),
                     ),
                 )
-                frames = self._frames_with_original_source(sampled_frames, file_path)
+                frames = self._frames_with_original_source(
+                    prefetch_iterator(sampled_frames), file_path
+                )
 
             if frames is not None:
                 current_stage = "deteccao, tracking e embeddings"

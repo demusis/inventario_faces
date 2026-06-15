@@ -374,6 +374,7 @@ class FaceSetComparisonEntry:
     crop_path: Path | None
     context_image_path: Path | None
     identity_label: str | None = None
+    individual_id: str | None = None
     embedding: list[float] = field(default_factory=list)
     mesh_crop_path: Path | None = None
     mesh_context_path: Path | None = None
@@ -444,6 +445,10 @@ class FaceSetComparisonSummary:
     set_b_selected_faces: int = 0
     set_a_images_without_faces: int = 0
     set_b_images_without_faces: int = 0
+    set_a_individuals: int = 0
+    set_b_individuals: int = 0
+    set_a_repeated_individuals: int = 0
+    set_b_repeated_individuals: int = 0
     total_pair_comparisons: int = 0
     assignment_matches: int = 0
     candidate_matches: int = 0

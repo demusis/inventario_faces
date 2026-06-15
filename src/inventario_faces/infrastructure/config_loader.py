@@ -10,6 +10,7 @@ from inventario_faces.domain.config import (
     AppConfig,
     AppSettings,
     ClusteringSettings,
+    ComparisonSettings,
     DistributedSettings,
     EnhancementSettings,
     FaceModelSettings,
@@ -233,6 +234,18 @@ def load_app_config(config_path: Path | None = None) -> AppConfig:
                 auto_reprocess_invalid_partials=_coerce_bool(
                     merged.get("distributed", {}).get("auto_reprocess_invalid_partials", True),
                     "distributed.auto_reprocess_invalid_partials",
+                ),
+            ),
+            comparison=ComparisonSettings(
+                max_frames_per_video=(
+                    int(merged.get("comparison", {}).get("max_frames_per_video"))
+                    if merged.get("comparison", {}).get("max_frames_per_video") is not None
+                    else None
+                ),
+                sampling_interval_seconds=(
+                    float(merged.get("comparison", {}).get("sampling_interval_seconds"))
+                    if merged.get("comparison", {}).get("sampling_interval_seconds") is not None
+                    else None
                 ),
             ),
         )

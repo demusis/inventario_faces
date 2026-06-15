@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Iterable, Sequence
 
 from inventario_faces.domain.config import ClusteringSettings
 from inventario_faces.domain.entities import FaceCluster, FaceOccurrence, FaceTrack, MediaType
@@ -30,12 +30,48 @@ class ClusteringService:
         original_items = list(items)
         tracks = self._coerce_tracks(original_items)
         eligible = self._eligible_tracks(tracks)
-        memberships = self._greedy_assign(eligible)
-        memberships = self._refine_memberships(eligible, memberships)
-        clusters = self._build_clusters(eligible, memberships)
+        embeddings = [item.embedding for item in eligible]
+        weights = [item.weight for item in eligible]
+        memberships = self._greedy_assign(embeddings, weights)
+        memberships = self._refine_memberships(embeddings, weights, memberships)
+        clusters = self._build_clusters(eligible, embeddings, weights, memberships)
         self._attach_candidate_matches(clusters, tracks)
         self._propagate_occurrence_assignments(original_items, tracks)
         return clusters
+
+    def cluster_embeddings(
+        self, items: Sequence[tuple[str, Sequence[float], float]]
+    ) -> list[list[str]]:
+        """Agrupa itens genericos ``(chave, embedding, peso)`` reutilizando exatamente o
+        mesmo passe guloso + refinamento deterministico do agrupamento principal.
+
+        Diferente de :meth:`cluster`, nao aplica os filtros ``min_track_size`` /
+        ``min_cluster_size``: todo item com embedding vira membro de algum grupo (uma
+        face que aparece uma unica vez ainda e um individuo). Retorna grupos de chaves,
+        numerados de forma estavel pela menor posicao de entrada. Itens sem embedding
+        sao ignorados silenciosamente.
+        """
+
+        prepared = [
+            (key, list(embedding), float(weight) if weight and weight > 0 else 1.0)
+            for key, embedding, weight in items
+            if embedding
+        ]
+        if not prepared:
+            return []
+        # Mesma ordenacao por forca evidencial e desempate por chave de _eligible_tracks,
+        # garantindo determinismo independente da ordem de chegada.
+        order = sorted(range(len(prepared)), key=lambda i: (-prepared[i][2], prepared[i][0]))
+        keys = [prepared[i][0] for i in order]
+        embeddings = [prepared[i][1] for i in order]
+        weights = [prepared[i][2] for i in order]
+        memberships = self._greedy_assign(embeddings, weights)
+        memberships = self._refine_memberships(embeddings, weights, memberships)
+        ordered_memberships = sorted(
+            (members for members in memberships if members),
+            key=lambda members: min(members),
+        )
+        return [[keys[member] for member in members] for members in ordered_memberships]
 
     def _eligible_tracks(self, tracks: list[FaceTrack]) -> list[_EligibleTrack]:
         eligible: list[_EligibleTrack] = []
@@ -58,47 +94,52 @@ class ClusteringService:
         eligible.sort(key=lambda item: (-item.weight, item.track.track_id))
         return eligible
 
-    def _greedy_assign(self, eligible: list[_EligibleTrack]) -> list[list[int]]:
+    def _greedy_assign(
+        self,
+        embeddings: list[list[float]],
+        weights: list[float],
+    ) -> list[list[int]]:
         memberships: list[list[int]] = []
         centroids: list[list[float]] = []
-        for index, item in enumerate(eligible):
+        for index, embedding in enumerate(embeddings):
             best_cluster = -1
             best_score = -1.0
             for cluster_index, centroid in enumerate(centroids):
-                similarity = cosine_similarity(item.embedding, centroid)
+                similarity = cosine_similarity(embedding, centroid)
                 if similarity > best_score:
                     best_cluster = cluster_index
                     best_score = similarity
             if best_cluster >= 0 and best_score >= self._settings.assignment_similarity:
                 memberships[best_cluster].append(index)
-                centroids[best_cluster] = self._centroid(eligible, memberships[best_cluster])
+                centroids[best_cluster] = self._centroid(embeddings, weights, memberships[best_cluster])
             else:
                 memberships.append([index])
-                centroids.append(list(item.embedding))
+                centroids.append(list(embedding))
         return memberships
 
     def _refine_memberships(
         self,
-        eligible: list[_EligibleTrack],
+        embeddings: list[list[float]],
+        weights: list[float],
         memberships: list[list[int]],
     ) -> list[list[int]]:
         for _ in range(self._MAX_REFINEMENT_ITERATIONS):
-            centroids = [self._centroid(eligible, members) for members in memberships]
+            centroids = [self._centroid(embeddings, weights, members) for members in memberships]
             assignment_of = {
                 member: cluster_index
                 for cluster_index, members in enumerate(memberships)
                 for member in members
             }
             moved = False
-            for index in range(len(eligible)):
+            for index in range(len(embeddings)):
                 current = assignment_of[index]
-                current_score = cosine_similarity(eligible[index].embedding, centroids[current])
+                current_score = cosine_similarity(embeddings[index], centroids[current])
                 best_cluster = current
                 best_score = current_score
                 for cluster_index, centroid in enumerate(centroids):
                     if cluster_index == current or not memberships[cluster_index]:
                         continue
-                    similarity = cosine_similarity(eligible[index].embedding, centroid)
+                    similarity = cosine_similarity(embeddings[index], centroid)
                     if similarity >= self._settings.assignment_similarity and similarity > best_score + 1e-6:
                         best_cluster = cluster_index
                         best_score = similarity
@@ -112,15 +153,22 @@ class ClusteringService:
                 break
         return memberships
 
-    def _centroid(self, eligible: list[_EligibleTrack], members: list[int]) -> list[float]:
+    def _centroid(
+        self,
+        embeddings: list[list[float]],
+        weights: list[float],
+        members: list[int],
+    ) -> list[float]:
         return weighted_average_embeddings(
-            [eligible[member].embedding for member in members],
-            [eligible[member].weight for member in members],
+            [embeddings[member] for member in members],
+            [weights[member] for member in members],
         )
 
     def _build_clusters(
         self,
         eligible: list[_EligibleTrack],
+        embeddings: list[list[float]],
+        weights: list[float],
         memberships: list[list[int]],
     ) -> list[FaceCluster]:
         # Numeracao por ordem do track mais forte de cada grupo, mantendo IDs
@@ -154,7 +202,7 @@ class ClusteringService:
                     cluster_id=cluster_id,
                     track_ids=track_ids,
                     occurrence_ids=occurrence_ids,
-                    centroid_embedding=self._centroid(eligible, members),
+                    centroid_embedding=self._centroid(embeddings, weights, members),
                     representative_crop_path=representative_crop_path,
                     representative_track_id=representative_track_id,
                     preview_paths=preview_paths,

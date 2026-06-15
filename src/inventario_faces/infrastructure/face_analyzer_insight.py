@@ -25,6 +25,7 @@ PREFERRED_EXECUTION_PROVIDERS = (
     "CPUExecutionProvider",
 )
 GPU_EXECUTION_PROVIDERS = (
+    "TensorrtExecutionProvider",
     "CUDAExecutionProvider",
     "DmlExecutionProvider",
 )

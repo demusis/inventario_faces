@@ -444,6 +444,7 @@ class ExportService:
                 [
                     "entry_id",
                     "set_label",
+                    "individual_id",
                     "source_path",
                     "sha512",
                     "track_id",
@@ -472,6 +473,7 @@ class ExportService:
                     [
                         item.entry_id,
                         self._comparison_group_label(item.set_label),
+                        item.individual_id or "",
                         str(item.source_path),
                         item.sha512,
                         item.track_id,
@@ -582,6 +584,8 @@ class ExportService:
             f"Questionado - faces selecionadas: {summary.set_b_selected_faces}",
             f"Padrão - imagens sem face valida: {summary.set_a_images_without_faces}",
             f"Questionado - imagens sem face valida: {summary.set_b_images_without_faces}",
+            f"Padrão - individuos distintos: {summary.set_a_individuals} (com repeticao: {summary.set_a_repeated_individuals})",
+            f"Questionado - individuos distintos: {summary.set_b_individuals} (com repeticao: {summary.set_b_repeated_individuals})",
             f"Comparacoes par-a-par: {summary.total_pair_comparisons}",
             f"Compatibilidades por atribuicao: {summary.assignment_matches}",
             f"Compatibilidades candidatas: {summary.candidate_matches}",

@@ -99,7 +99,8 @@ Os valores padrão atuais foram endurecidos para um uso pericial mais conservado
 - nota institucional explícita sobre a natureza probabilística dos resultados.
 
 - `video`: taxa de amostragem, teto de quadros, intervalo de keyframe e limiar de mudança significativa.
-- `face_model`: backend, modelo, resolução de detecção, qualidade mínima, tamanho mínimo e execution providers.
+- `comparison`: teto opcional de quadros por vídeo e intervalo de amostragem próprios da comparação `Padrão` x `Questionado` (nulos por padrão = herdam `video`).
+- `face_model`: backend, modelo, resolução de detecção, qualidade mínima, tamanho mínimo e execution providers. Por padrão, `providers` é vazio (descoberta automática CUDA → DirectML → CPU). Para ativar o `TensorrtExecutionProvider` (opt-in, mais rápido sobre CUDA, porém com warm-up longo de build de engine), liste-o explicitamente em `providers`.
 - `tracking`: IoU, distância espacial, similaridade de embedding, pesos de associação, tolerância a perda e top crops.
 - `clustering`: limiares de atribuição/sugestão e mínimos de grupo e de track.
 - `enhancement`: pré-processamento, brilho-gatilho, CLAHE, gamma e denoise.
@@ -141,6 +142,8 @@ pip install -e .
 ```
 
 No Windows, `requirements.txt` já instala `onnxruntime-gpu[cuda,cudnn]`. O aplicativo tenta usar GPU automaticamente quando houver provider compatível e faz fallback para CPU quando necessário.
+
+Ao processar vídeos, a decodificação de quadros (CPU) é sobreposta à inferência (GPU) por um prefetch determinístico: enquanto a GPU analisa o quadro atual, os próximos já vão sendo decodificados em segundo plano. A ordem dos quadros e os resultados são idênticos aos do processamento sequencial — apenas o tempo total diminui.
 
 Para análise facial, o aplicativo embute dois backends equivalentes:
 
@@ -189,10 +192,15 @@ Na janela principal, `Busca por faces` aceita uma ou mais imagens de consulta.
 
 A ação `Comparar conjuntos` foi desenhada para confrontar um grupo `Padrão` contra um grupo `Questionado`.
 
+- cada grupo aceita **imagens e vídeos misturados**; vídeos passam pela mesma amostragem temporal, detecção, tracking e seleção de faces do inventário;
+- antes da comparação, cada grupo é **inventariado por indivíduo**: as faces são agrupadas (mesmo agrupamento determinístico do inventário) para consolidar repetições da mesma pessoa dentro do grupo. O resumo informa quantos indivíduos distintos há em cada conjunto e quantos aparecem mais de uma vez (`individual_id` também é exportado por face);
+- esse inventário por indivíduo é uma **camada informativa aditiva**: a comparação continua sendo feita par-a-par entre as faces selecionadas e a razão de verossimilhança (LR) é calculada exatamente como antes, sem alteração da evidência;
 - o sistema compara todas as faces elegíveis do Padrão contra todas as faces elegíveis do Questionado;
 - o resumo estatístico descreve o conjunto inteiro de pares, não apenas o primeiro item do ranking;
 - a janela de LR pode usar uma base rotulada com uma subpasta por identidade ou um modelo LR já salvo em JSON;
 - quando a calibração é calculada na execução, o modelo é salvo automaticamente para reaproveitamento posterior.
+
+Para limitar o tempo em vídeos longos, a seção `comparison` da configuração permite um teto opcional de quadros amostrados (`max_frames_per_video`) e/ou um intervalo de amostragem próprio (`sampling_interval_seconds`) **apenas para a comparação**. Por padrão ambos são nulos e a comparação herda a amostragem global de vídeo, preservando a cobertura temporal pericial.
 
 Em execuções desse tipo, a pasta `comparison/` passa a incluir artefatos como:
 

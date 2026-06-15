@@ -131,6 +131,30 @@ class VideoSettings:
 
 
 @dataclass(frozen=True)
+class ComparisonSettings:
+    """Ajustes da comparacao entre conjuntos (Padrao x Questionado).
+
+    Quando ambos os campos sao None, a comparacao herda integralmente a amostragem
+    de video global, preservando a cobertura temporal periciais por padrao. Defina
+    um teto/intervalo aqui apenas para limitar o tempo em videos longos, em troca de
+    menor cobertura -- uma escolha que fica explicita na configuracao e nos relatorios.
+    """
+
+    max_frames_per_video: int | None = None
+    sampling_interval_seconds: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.max_frames_per_video is not None and self.max_frames_per_video <= 0:
+            raise ValueError(
+                "Maximo de quadros por video na comparacao deve ser maior que zero quando informado."
+            )
+        if self.sampling_interval_seconds is not None:
+            _validate_positive_number(
+                self.sampling_interval_seconds, "Intervalo de amostragem da comparacao"
+            )
+
+
+@dataclass(frozen=True)
 class FaceModelSettings:
     """Configuracao do backend de deteccao e extracao de embeddings faciais."""
 
@@ -356,3 +380,4 @@ class AppConfig:
     search: SearchSettings = field(default_factory=SearchSettings)
     likelihood_ratio: LikelihoodRatioSettings = field(default_factory=LikelihoodRatioSettings)
     distributed: DistributedSettings = field(default_factory=DistributedSettings)
+    comparison: ComparisonSettings = field(default_factory=ComparisonSettings)

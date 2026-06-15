@@ -321,7 +321,7 @@ class FaceSetComparisonDialog(QDialog):
         layout.addWidget(list_widget, stretch=1)
 
         controls = QHBoxLayout()
-        add_button = QPushButton("Adicionar imagens")
+        add_button = QPushButton("Adicionar mídias")
         apply_standard_icon(self, add_button, QStyle.SP_DialogOpenButton)
         add_button.clicked.connect(lambda: self._add_images(set_label))
         controls.addWidget(add_button)
@@ -335,7 +335,7 @@ class FaceSetComparisonDialog(QDialog):
         controls.addWidget(clear_button)
         layout.addLayout(controls)
 
-        count_label = QLabel("0 imagem(ns) selecionada(s)")
+        count_label = QLabel("0 arquivo(s) selecionado(s)")
         count_label.setObjectName("SectionHint")
         layout.addWidget(count_label)
 
@@ -371,9 +371,9 @@ class FaceSetComparisonDialog(QDialog):
     def _add_images(self, set_label: str) -> None:
         selected_paths, _ = QFileDialog.getOpenFileNames(
             self,
-            f"Selecionar imagens para {self._group_label(set_label)}",
+            f"Selecionar mídias para {self._group_label(set_label)}",
             str(self._initial_input_directory),
-            self._image_file_filter(),
+            self._media_file_filter(),
         )
         if not selected_paths:
             return
@@ -397,7 +397,7 @@ class FaceSetComparisonDialog(QDialog):
 
     def _update_set_count(self, set_label: str) -> None:
         list_widget = self._list_widget_for_set(set_label)
-        self._count_label_for_set(set_label).setText(f"{list_widget.count()} imagem(ns) selecionada(s)")
+        self._count_label_for_set(set_label).setText(f"{list_widget.count()} arquivo(s) selecionado(s)")
 
     def _select_work_directory(self) -> None:
         selected = QFileDialog.getExistingDirectory(
@@ -435,10 +435,10 @@ class FaceSetComparisonDialog(QDialog):
         set_a_paths = self._selected_paths("A")
         set_b_paths = self._selected_paths("B")
         if not set_a_paths:
-            QMessageBox.warning(self, "Padrão vazio", "Selecione ao menos uma imagem em Padrão.")
+            QMessageBox.warning(self, "Padrão vazio", "Selecione ao menos uma mídia (imagem ou vídeo) em Padrão.")
             return
         if not set_b_paths:
-            QMessageBox.warning(self, "Questionado vazio", "Selecione ao menos uma imagem em Questionado.")
+            QMessageBox.warning(self, "Questionado vazio", "Selecione ao menos uma mídia (imagem ou vídeo) em Questionado.")
             return
 
         work_directory_text = self._work_directory_input.text().strip()
@@ -458,8 +458,8 @@ class FaceSetComparisonDialog(QDialog):
             "[Monitor] O texto exibido nesta janela também é gravado em run.log e events.jsonl da execução."
         )
         self._status_label.setText("Inicializando comparação entre os conjuntos selecionados.")
-        self._append_log(f"Padrão: {len(set_a_paths)} imagem(ns)")
-        self._append_log(f"Questionado: {len(set_b_paths)} imagem(ns)")
+        self._append_log(f"Padrão: {len(set_a_paths)} mídia(s)")
+        self._append_log(f"Questionado: {len(set_b_paths)} mídia(s)")
         self._append_log(f"Diretório de trabalho: {work_directory}")
 
         if calibration_root is not None:
@@ -1371,8 +1371,8 @@ class FaceSetComparisonDialog(QDialog):
             if row < 0 or row >= len(result.matches):
                 left_label.set_image_path(None)
                 right_label.set_image_path(None)
-                left_info.setText("Selecione uma correspondência para visualizar a imagem de Padrão.")
-                right_info.setText("Selecione uma correspondência para visualizar a imagem de Questionado.")
+                left_info.setText("Selecione uma correspondência para visualizar a mídia de Padrão.")
+                right_info.setText("Selecione uma correspondência para visualizar a mídia de Questionado.")
                 return
             match = result.matches[row]
             left_entry = self._entry_by_id.get(match.left_entry_id)
@@ -1552,7 +1552,7 @@ class FaceSetComparisonDialog(QDialog):
         set_label: str,
     ) -> str:
         if entry is None:
-            return f"Selecione uma correspondência para visualizar a imagem de {self._group_label(set_label)}."
+            return f"Selecione uma correspondência para visualizar a mídia de {self._group_label(set_label)}."
         similarity = self._format_optional_float(match.similarity) if match is not None else "-"
         classification = self._classification_label(match.classification) if match is not None else "-"
         return (
@@ -1806,9 +1806,16 @@ class FaceSetComparisonDialog(QDialog):
             self._set_result_buttons_enabled(False)
             self._save_calibration_model_button.setEnabled(False)
 
-    def _image_file_filter(self) -> str:
-        patterns = " ".join(f"*{extension}" for extension in self._config.media.image_extensions)
-        return f"Imagens suportadas ({patterns});;Todos os arquivos (*)"
+    def _media_file_filter(self) -> str:
+        image_patterns = " ".join(f"*{extension}" for extension in self._config.media.image_extensions)
+        video_patterns = " ".join(f"*{extension}" for extension in self._config.media.video_extensions)
+        all_patterns = f"{image_patterns} {video_patterns}".strip()
+        return (
+            f"Mídias suportadas ({all_patterns});;"
+            f"Imagens ({image_patterns});;"
+            f"Vídeos ({video_patterns});;"
+            "Todos os arquivos (*)"
+        )
 
     def request_close(self) -> bool:
         if self._thread is not None:
