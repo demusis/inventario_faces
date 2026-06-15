@@ -612,29 +612,55 @@ class FaceSetComparisonService:
             )
         return lines
 
+    def _verdict_uses_likelihood_ratio(self, matches: list[FaceSetComparisonMatch]) -> bool:
+        """O veredito recai no LR quando ha calibracao aplicada (pares com log10(LR))."""
+
+        return any(match.log10_likelihood_ratio is not None for match in matches)
+
+    def _match_verdict_class(self, match: FaceSetComparisonMatch, use_lr: bool) -> str:
+        """Faixa decisoria de UM par para o veredito por midia.
+
+        Com calibracao, governa a razao de verossimilhanca (log10(LR)) pelos limiares de
+        politica de ``comparison``; sem calibracao, recai na classificacao por similaridade.
+        """
+
+        if not use_lr:
+            return match.classification
+        lr = match.log10_likelihood_ratio
+        if lr is None:
+            return "below_threshold"
+        if lr >= self._config.comparison.verdict_assignment_log10_lr:
+            return "assignment"
+        if lr >= self._config.comparison.verdict_candidate_log10_lr:
+            return "candidate"
+        return "below_threshold"
+
     def _questionado_media_verdict(
         self,
         set_b_faces: list[FaceSetComparisonEntry],
         matches: list[FaceSetComparisonMatch],
     ) -> tuple[set[str], set[str], set[str]]:
-        """Mapeia o veredito por MIDIA do Questionado a partir dos pares ja classificados.
+        """Mapeia o veredito por MIDIA do Questionado a partir dos pares.
 
         Retorna (todas_as_midias, midias_com_atribuicao, midias_somente_candidatas). O
         Questionado nao e agrupado por individuo: o que interessa e em quais midias o
-        individuo de referencia aparece, segundo as faixas decisorias par-a-par.
+        individuo de referencia aparece. Quando ha calibracao LR, o veredito e governado
+        pela razao de verossimilhanca; caso contrario, pelas faixas de similaridade.
         """
 
         source_by_entry = {entry.entry_id: str(entry.source_path) for entry in set_b_faces}
         all_media = set(source_by_entry.values())
+        use_lr = self._verdict_uses_likelihood_ratio(matches)
         assignment_media: set[str] = set()
         candidate_media: set[str] = set()
         for match in matches:
             media = source_by_entry.get(match.right_entry_id)
             if media is None:
                 continue
-            if match.classification == "assignment":
+            verdict = self._match_verdict_class(match, use_lr)
+            if verdict == "assignment":
                 assignment_media.add(media)
-            elif match.classification == "candidate":
+            elif verdict == "candidate":
                 candidate_media.add(media)
         return all_media, assignment_media, candidate_media - assignment_media
 
@@ -644,9 +670,16 @@ class FaceSetComparisonService:
         matches: list[FaceSetComparisonMatch],
     ) -> list[str]:
         all_media, assignment_media, candidate_only = self._questionado_media_verdict(set_b_faces, matches)
+        if self._verdict_uses_likelihood_ratio(matches):
+            basis = (
+                f"LR (log10>=" f"{self._config.comparison.verdict_assignment_log10_lr:g} atribuicao / "
+                f">={self._config.comparison.verdict_candidate_log10_lr:g} candidata)"
+            )
+        else:
+            basis = "similaridade (faixas do agrupamento)"
         lines = [
             (
-                f"[Busca no Questionado] midias={len(all_media)} | "
+                f"[Busca no Questionado] base={basis} | midias={len(all_media)} | "
                 f"com_atribuicao={len(assignment_media)} | somente_candidatas={len(candidate_only)}"
             )
         ]
@@ -1387,6 +1420,7 @@ class FaceSetComparisonService:
             questionado_media_total=len(all_media),
             questionado_media_with_assignment=len(assignment_media),
             questionado_media_with_candidate=len(candidate_only_media),
+            verdict_uses_likelihood_ratio=self._verdict_uses_likelihood_ratio(matches),
             total_pair_comparisons=len(matches),
             assignment_matches=len([item for item in matches if item.classification == "assignment"]),
             candidate_matches=len([item for item in matches if item.classification == "candidate"]),
@@ -1427,7 +1461,8 @@ class FaceSetComparisonService:
                 f"homogenea={'sim' if summary.reference_is_homogeneous else 'NAO'}"
             ),
             (
-                f"[Comparacao] Busca no Questionado | midias={summary.questionado_media_total} | "
+                f"[Comparacao] Busca no Questionado | base={'LR' if summary.verdict_uses_likelihood_ratio else 'similaridade'} | "
+                f"midias={summary.questionado_media_total} | "
                 f"com_atribuicao={summary.questionado_media_with_assignment} | "
                 f"somente_candidatas={summary.questionado_media_with_candidate}"
             ),

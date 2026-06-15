@@ -135,7 +135,9 @@ class AssignIndividualsTests(unittest.TestCase):
         self.assertIsNone(by_id["A2"])
 
 
-def _match(right_entry_id: str, classification: str) -> FaceSetComparisonMatch:
+def _match(
+    right_entry_id: str, classification: str, log10_lr: float | None = None
+) -> FaceSetComparisonMatch:
     return FaceSetComparisonMatch(
         rank=1,
         left_entry_id="A1",
@@ -144,6 +146,7 @@ def _match(right_entry_id: str, classification: str) -> FaceSetComparisonMatch:
         right_track_id=f"T{right_entry_id}",
         similarity=0.7,
         classification=classification,
+        log10_likelihood_ratio=log10_lr,
     )
 
 
@@ -206,6 +209,35 @@ class ReferenceAndVerdictTests(unittest.TestCase):
         )
         self.assertEqual(assignment_media, {"video1.mp4"})
         self.assertEqual(candidate_only, set())
+
+    def test_verdict_governed_by_lr_when_calibrated(self) -> None:
+        # Classificacao por similaridade deliberadamente "below_threshold" para provar que,
+        # com calibracao, quem governa o veredito e o log10(LR) (limiares padrao 4.0/1.0).
+        set_b = [
+            _entry("B1", "B", [1.0, 0.0, 0.0], "video1.mp4"),
+            _entry("B2", "B", [0.0, 1.0, 0.0], "imagem2.jpg"),
+            _entry("B3", "B", [0.0, 0.0, 1.0], "imagem3.jpg"),
+        ]
+        matches = [
+            _match("B1", "below_threshold", log10_lr=5.0),  # >= 4.0 -> atribuicao
+            _match("B2", "below_threshold", log10_lr=2.0),  # >= 1.0 -> candidata
+            _match("B3", "below_threshold", log10_lr=0.5),  # < 1.0 -> abaixo
+        ]
+        self.assertTrue(self._service._verdict_uses_likelihood_ratio(matches))
+        _all, assignment_media, candidate_only = self._service._questionado_media_verdict(
+            set_b, matches
+        )
+        self.assertEqual(assignment_media, {"video1.mp4"})
+        self.assertEqual(candidate_only, {"imagem2.jpg"})
+
+    def test_verdict_falls_back_to_similarity_without_lr(self) -> None:
+        set_b = [_entry("B1", "B", [1.0, 0.0, 0.0], "video1.mp4")]
+        matches = [_match("B1", "assignment")]  # sem LR
+        self.assertFalse(self._service._verdict_uses_likelihood_ratio(matches))
+        _all, assignment_media, _candidate_only = self._service._questionado_media_verdict(
+            set_b, matches
+        )
+        self.assertEqual(assignment_media, {"video1.mp4"})
 
 
 if __name__ == "__main__":

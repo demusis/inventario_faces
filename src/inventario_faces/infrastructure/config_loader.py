@@ -247,6 +247,12 @@ def load_app_config(config_path: Path | None = None) -> AppConfig:
                     if merged.get("comparison", {}).get("sampling_interval_seconds") is not None
                     else None
                 ),
+                verdict_assignment_log10_lr=float(
+                    merged.get("comparison", {}).get("verdict_assignment_log10_lr", 4.0)
+                ),
+                verdict_candidate_log10_lr=float(
+                    merged.get("comparison", {}).get("verdict_candidate_log10_lr", 1.0)
+                ),
             ),
         )
     except (KeyError, TypeError, ValueError) as exc:

@@ -100,7 +100,7 @@ Os valores padrão atuais foram endurecidos para um uso pericial mais conservado
 
 - `media`: extensões de imagem (`.jpg`, `.jpeg`, `.png`, `.bmp`, `.tif`, `.tiff`, `.webp`) e de vídeo (`.mp4`, `.avi`, `.mkv`, `.dav`, `.mov`, `.wmv`, `.mpeg`, `.mpg`) reconhecidas pelo scanner.
 - `video`: taxa de amostragem, teto de quadros, intervalo de keyframe e limiar de mudança significativa.
-- `comparison`: teto opcional de quadros por vídeo e intervalo de amostragem próprios da comparação `Padrão` x `Questionado` (nulos por padrão = herdam `video`).
+- `comparison`: teto opcional de quadros por vídeo e intervalo de amostragem próprios da comparação `Padrão` x `Questionado` (nulos por padrão = herdam `video`); e os limiares de política do veredito por mídia quando há calibração LR — `verdict_assignment_log10_lr` (padrão 4.0, ou seja LR ≥ 10⁴, para atribuição) e `verdict_candidate_log10_lr` (padrão 1.0, LR ≥ 10, para candidata).
 - `face_model`: backend, modelo, resolução de detecção (`det_size`), qualidade mínima, tamanho mínimo, ID de contexto do dispositivo (`ctx_id`) e execution providers. Por padrão, `providers` é vazio (descoberta automática CUDA → DirectML → CPU). Para ativar o `TensorrtExecutionProvider` (opt-in, mais rápido sobre CUDA, porém com warm-up longo de build de engine), liste-o explicitamente em `providers`.
 - `tracking`: IoU, distância espacial, similaridade de embedding, pesos de associação, tolerância a perda e top crops.
 - `clustering`: limiares de atribuição/sugestão e mínimos de grupo e de track.
@@ -198,7 +198,7 @@ A ação `Comparar conjuntos` foi desenhada para o fluxo **1:N de identificaçã
 - o `Padrão` é consolidado como **referência de um único indivíduo**. Um agrupamento de **controle de qualidade** é aplicado apenas ao Padrão para detectar contaminação: se ele se dividir em mais de um agrupamento, o relatório emite um **alerta** de que pode haver imagem de outra pessoa ou faces de baixa qualidade na referência;
 - o `Questionado` **não é agrupado por indivíduo** — não interessa quantas pessoas há nele, e sim em quais mídias a referência aparece. Cada face/mídia do Questionado é confrontada diretamente contra a referência;
 - a comparação é **par-a-par** entre todas as faces elegíveis do Padrão e do Questionado, com ranking e faixas decisórias (`atribuição`/`candidata`/`abaixo do limiar`) e razão de verossimilhança (LR) opcional — esse núcleo evidencial é inalterado;
-- o resumo e o `run.log` relacionam, por **mídia do Questionado**, quais atingiram a faixa de atribuição e quais ficaram somente como candidatas, respondendo objetivamente se (e onde) o indivíduo de referência aparece;
+- o resumo e o `run.log` relacionam, por **mídia do Questionado**, quais atingiram a faixa de atribuição e quais ficaram somente como candidatas, respondendo objetivamente se (e onde) o indivíduo de referência aparece. **Quando há calibração LR, esse veredito por mídia é governado pela razão de verossimilhança** (limiares `comparison.verdict_*_log10_lr`); sem calibração, recai nas faixas de similaridade do agrupamento — a base usada fica registrada no resumo e no log;
 - a janela de LR pode usar uma base rotulada com uma subpasta por identidade ou um modelo LR já salvo em JSON;
 - quando a calibração é calculada na execução, o modelo é salvo automaticamente para reaproveitamento posterior.
 

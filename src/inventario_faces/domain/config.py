@@ -134,14 +134,23 @@ class VideoSettings:
 class ComparisonSettings:
     """Ajustes da comparacao entre conjuntos (Padrao x Questionado).
 
-    Quando ambos os campos sao None, a comparacao herda integralmente a amostragem
-    de video global, preservando a cobertura temporal periciais por padrao. Defina
-    um teto/intervalo aqui apenas para limitar o tempo em videos longos, em troca de
-    menor cobertura -- uma escolha que fica explicita na configuracao e nos relatorios.
+    Quando ``max_frames_per_video`` e ``sampling_interval_seconds`` sao None, a
+    comparacao herda integralmente a amostragem de video global, preservando a
+    cobertura temporal pericial por padrao. Defina um teto/intervalo aqui apenas para
+    limitar o tempo em videos longos, em troca de menor cobertura.
+
+    Os limiares ``verdict_*_log10_lr`` definem a POLITICA do veredito por midia do
+    Questionado QUANDO ha calibracao de razao de verossimilhanca (LR): a midia e
+    atribuida ao individuo de referencia se algum par atinge log10(LR) >=
+    ``verdict_assignment_log10_lr`` (suporte forte) e fica como candidata se atinge
+    ``verdict_candidate_log10_lr`` (suporte moderado). Sem calibracao, o veredito recai
+    nas faixas de similaridade do agrupamento. Sao escolhas periciais ajustaveis.
     """
 
     max_frames_per_video: int | None = None
     sampling_interval_seconds: float | None = None
+    verdict_assignment_log10_lr: float = 4.0
+    verdict_candidate_log10_lr: float = 1.0
 
     def __post_init__(self) -> None:
         if self.max_frames_per_video is not None and self.max_frames_per_video <= 0:
@@ -151,6 +160,10 @@ class ComparisonSettings:
         if self.sampling_interval_seconds is not None:
             _validate_positive_number(
                 self.sampling_interval_seconds, "Intervalo de amostragem da comparacao"
+            )
+        if self.verdict_candidate_log10_lr > self.verdict_assignment_log10_lr:
+            raise ValueError(
+                "Limiar log10(LR) de candidata nao pode ser maior que o de atribuicao no veredito."
             )
 
 

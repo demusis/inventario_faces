@@ -587,6 +587,7 @@ class ExportService:
             f"Referência (Padrão) - agrupamentos: {summary.set_a_individuals} (esperado 1) | "
             f"homogênea: {'sim' if summary.reference_is_homogeneous else 'NÃO - revisar'}",
             f"Questionado - mídias analisadas: {summary.questionado_media_total}",
+            f"Questionado - base do veredito: {'razão de verossimilhança (LR)' if summary.verdict_uses_likelihood_ratio else 'similaridade (faixas do agrupamento)'}",
             f"Questionado - mídias com correspondência por atribuição: {summary.questionado_media_with_assignment}",
             f"Questionado - mídias somente candidatas: {summary.questionado_media_with_candidate}",
             f"Comparacoes par-a-par: {summary.total_pair_comparisons}",

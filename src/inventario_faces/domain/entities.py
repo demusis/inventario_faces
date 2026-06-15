@@ -453,6 +453,7 @@ class FaceSetComparisonSummary:
     questionado_media_total: int = 0
     questionado_media_with_assignment: int = 0
     questionado_media_with_candidate: int = 0
+    verdict_uses_likelihood_ratio: bool = False
     total_pair_comparisons: int = 0
     assignment_matches: int = 0
     candidate_matches: int = 0

@@ -43,6 +43,13 @@ comparison:
   max_frames_per_video: null
   # Intervalo de amostragem (segundos) so para a comparacao. null = herda video.sampling_interval_seconds.
   sampling_interval_seconds: null
+  # Politica do veredito por midia do Questionado QUANDO ha calibracao LR: a midia e
+  # atribuida ao individuo de referencia se algum par atinge log10(LR) >= este valor
+  # (4.0 = LR >= 10^4, suporte forte). Sem calibracao, recai nas faixas de similaridade.
+  verdict_assignment_log10_lr: 4.0
+  # Midia fica como candidata se algum par atinge log10(LR) >= este valor
+  # (1.0 = LR >= 10, suporte moderado). Deve ser <= verdict_assignment_log10_lr.
+  verdict_candidate_log10_lr: 1.0
 
 face_model:
   # Backends aceitos: "insightface" (com fallback automatico para onnx) ou

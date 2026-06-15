@@ -696,8 +696,13 @@ def _summary_popup_html(
         f"Busca no Questionado: de <b>{summary.questionado_media_total}</b> mídia(s) analisada(s), "
         f"<b>{summary.questionado_media_with_assignment}</b> atingiram a faixa de <b>atribuição</b> e "
         f"<b>{summary.questionado_media_with_candidate}</b> ficaram <b>somente como candidatas</b> "
-        "ao indivíduo de referência. A relação nominal das mídias consta do run.log e dos CSV de pares/faces; "
-        "as similaridades e a razão de verossimilhança continuam par-a-par."
+        "ao indivíduo de referência. "
+        + (
+            "O veredito por mídia é governado pela <b>razão de verossimilhança (LR)</b> calibrada."
+            if summary.verdict_uses_likelihood_ratio
+            else "Sem calibração nesta execução, o veredito por mídia recai nas <b>faixas de similaridade</b> do agrupamento."
+        )
+        + " A relação nominal das mídias consta do run.log e dos CSV de pares/faces."
         "</p>"
         "<p>"
         f"O nível de significância adotado nesta leitura foi de <b>{significance_percent:.2f}%</b>; "
