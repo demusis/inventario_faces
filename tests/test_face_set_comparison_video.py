@@ -3,13 +3,15 @@ from __future__ import annotations
 import logging
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 
 from tests._bootstrap import PROJECT_ROOT  # noqa: F401
-from inventario_faces.domain.entities import MediaType, SampledFrame
+from inventario_faces.domain.entities import BoundingBox, FaceOccurrence, MediaType, SampledFrame
+from inventario_faces.infrastructure.face_mesh_renderer import save_bgr_image
 from inventario_faces.infrastructure.config_loader import load_app_config
 from inventario_faces.infrastructure.logging_setup import StructuredEventLogger
 from inventario_faces.services.clustering_service import ClusteringService
@@ -128,6 +130,47 @@ class FaceSetComparisonVideoRoutingTests(unittest.TestCase):
 
     def test_no_comparison_override_reuses_global_media_service(self) -> None:
         self.assertIs(self._service._comparison_media_service, self._media)
+
+    def test_context_mesh_uses_context_image_not_video_source(self) -> None:
+        # Regressao: para video, occurrence.source_path e o proprio .mp4. A malha de
+        # contexto deve ser desenhada sobre o frame salvo (context_image_path), nunca
+        # tentando decodificar o video como imagem (RuntimeError "imagem derivada").
+        export_directory = self._run_directory / "export"
+        frame = np.zeros((20, 20, 3), dtype=np.uint8)
+        context_path = self._run_directory / "context.jpg"
+        crop_path = self._run_directory / "crop.jpg"
+        save_bgr_image(context_path, frame)
+        save_bgr_image(crop_path, frame[2:12, 2:12])
+
+        video_path = self._run_directory / "clipe.mp4"
+        video_path.write_bytes(b"\x00")  # nao e uma imagem decodificavel
+
+        occurrence = FaceOccurrence(
+            occurrence_id="O1",
+            source_path=video_path,
+            sha512="0" * 8,
+            media_type=MediaType.VIDEO,
+            analysis_timestamp_utc=datetime(2026, 6, 16, tzinfo=timezone.utc),
+            frame_index=10,
+            frame_timestamp_seconds=0.5,
+            bbox=BoundingBox(2.0, 2.0, 12.0, 12.0),
+            detection_score=0.9,
+            crop_path=crop_path,
+            context_image_path=context_path,
+            biometric_landmarks=((5.0, 5.0), (9.0, 6.0), (7.0, 10.0)),
+        )
+
+        mesh_crop_path, mesh_context_path = self._service._render_comparison_mesh_artifacts(
+            export_directory=export_directory,
+            set_label="B",
+            entry_id="CB_000001",
+            occurrence=occurrence,
+        )
+
+        self.assertIsNotNone(mesh_context_path)
+        self.assertTrue(mesh_context_path.exists())
+        self.assertIsNotNone(mesh_crop_path)
+        self.assertTrue(mesh_crop_path.exists())
 
     def test_comparison_frame_cap_builds_dedicated_media_service(self) -> None:
         from dataclasses import replace

@@ -1203,7 +1203,7 @@ class FaceSetComparisonService:
 
         if occurrence.context_image_path is not None:
             context_mesh = draw_face_mesh(
-                load_bgr_image(occurrence.source_path),
+                load_bgr_image(occurrence.context_image_path),
                 occurrence.biometric_landmarks,
                 bbox=occurrence.bbox,
                 draw_bbox=False,
