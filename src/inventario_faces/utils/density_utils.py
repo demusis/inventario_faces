@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
 
-import numpy as np
-from scipy.stats import gaussian_kde
+if TYPE_CHECKING:
+    import numpy as np
+    from scipy.stats import gaussian_kde as GaussianKDE
 
 DEFAULT_SCORE_DENSITY_METHOD = "bounded_logit_kde"
 SCORE_DENSITY_METHOD_CHOICES: tuple[tuple[str, str], ...] = (
@@ -16,6 +18,27 @@ _SUPPORT_LOWER = -1.0
 _SUPPORT_UPPER = 1.0
 _SUPPORT_WIDTH = _SUPPORT_UPPER - _SUPPORT_LOWER
 _EPSILON = 1e-6
+
+_NUMPY_MODULE = None
+_GAUSSIAN_KDE = None
+
+
+def _numpy():
+    global _NUMPY_MODULE
+    if _NUMPY_MODULE is None:
+        import numpy as np
+
+        _NUMPY_MODULE = np
+    return _NUMPY_MODULE
+
+
+def _gaussian_kde():
+    global _GAUSSIAN_KDE
+    if _GAUSSIAN_KDE is None:
+        from scipy.stats import gaussian_kde
+
+        _GAUSSIAN_KDE = gaussian_kde
+    return _GAUSSIAN_KDE
 
 
 def normalize_score_density_method(value: str | None) -> str:
@@ -32,6 +55,7 @@ def score_density_method_label(value: str | None) -> str:
 
 
 def _clip_score_array(values: np.ndarray) -> np.ndarray:
+    np = _numpy()
     return np.clip(values, _SUPPORT_LOWER + _EPSILON, _SUPPORT_UPPER - _EPSILON)
 
 
@@ -40,6 +64,7 @@ def _score_to_unit_interval(values: np.ndarray) -> np.ndarray:
 
 
 def _score_to_logit(values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    np = _numpy()
     clipped = _clip_score_array(values)
     unit_values = np.clip(_score_to_unit_interval(clipped), _EPSILON, 1.0 - _EPSILON)
     transformed = np.log(unit_values / (1.0 - unit_values))
@@ -50,11 +75,12 @@ def _score_to_logit(values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 @dataclass(frozen=True)
 class ScoreDensityModel:
     method: str
-    kernel: gaussian_kde
+    kernel: Any
     support_lower: float = _SUPPORT_LOWER
     support_upper: float = _SUPPORT_UPPER
 
     def evaluate_raw(self, values: float | list[float] | tuple[float, ...] | np.ndarray) -> np.ndarray:
+        np = _numpy()
         scores = np.asarray(values, dtype=np.float64)
         if scores.ndim == 0:
             scores = scores.reshape(1)
@@ -90,6 +116,7 @@ class ScoreDensityModel:
         uniform_floor_weight: float = 0.0,
         min_density: float = 0.0,
     ) -> tuple[tuple[float, ...], tuple[float, ...]]:
+        np = _numpy()
         grid_lower = max(self.support_lower + _EPSILON, lower)
         grid_upper = min(self.support_upper - _EPSILON, upper)
         if grid_upper <= grid_lower:
@@ -112,6 +139,8 @@ def fit_score_density_model(
     method: str | None = None,
     bandwidth_scale: float = 1.0,
 ) -> ScoreDensityModel:
+    np = _numpy()
+    gaussian_kde = _gaussian_kde()
     normalized_method = normalize_score_density_method(method)
     array = np.asarray(values, dtype=np.float64)
     if array.ndim != 1 or array.size == 0:
@@ -135,6 +164,7 @@ def stabilize_score_density(
     support_lower: float = _SUPPORT_LOWER,
     support_upper: float = _SUPPORT_UPPER,
 ) -> np.ndarray:
+    np = _numpy()
     values = np.asarray(density, dtype=np.float64)
     if values.ndim == 0:
         values = values.reshape(1)

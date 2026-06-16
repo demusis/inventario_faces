@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 from PySide6.QtCore import QObject, Signal, Slot
 
 from inventario_faces.infrastructure.logging_setup import summarize_exception
-from inventario_faces.services.inventory_service import InventoryService
+
+if TYPE_CHECKING:
+    from inventario_faces.services.inventory_service import InventoryService
 
 
 class _BaseWorker(QObject):

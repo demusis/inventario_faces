@@ -20,3 +20,11 @@ build/*.out
 build/*.err
 dist/installer/
 dist/InventarioFaces/_internal/models/
+
+# Local-only heavy/derived artifacts (baseline repo)
+dist/
+.publish_repo/
+.reference_verificacao_edicao/
+inventario_faces_output/
+models/
+insightface_install.log

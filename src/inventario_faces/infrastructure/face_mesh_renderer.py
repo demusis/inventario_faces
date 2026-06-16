@@ -37,7 +37,12 @@ def draw_face_mesh(
         raise RuntimeError("Imagem invalida para renderizacao da malha facial.")
 
     height, width = canvas.shape[:2]
-    points = _normalize_landmarks(landmarks, width=width, height=height, translate=translate)
+    points, edges = build_face_mesh_geometry(
+        landmarks,
+        width=width,
+        height=height,
+        translate=translate,
+    )
 
     if draw_bbox and bbox is not None:
         top_left = (
@@ -48,25 +53,26 @@ def draw_face_mesh(
             min(width - 1, int(round(bbox.x2 + translate[0]))),
             min(height - 1, int(round(bbox.y2 + translate[1]))),
         )
-        cv2.rectangle(canvas, top_left, bottom_right, (0, 0, 255), 2)
+        cv2.rectangle(canvas, top_left, bottom_right, (0, 0, 255), 1)
 
-    if len(points) >= 3:
-        subdiv = cv2.Subdiv2D((0, 0, width, height))
-        for point in points:
-            subdiv.insert((float(point[0]), float(point[1])))
-        for triangle in subdiv.getTriangleList():
-            p1 = (int(round(triangle[0])), int(round(triangle[1])))
-            p2 = (int(round(triangle[2])), int(round(triangle[3])))
-            p3 = (int(round(triangle[4])), int(round(triangle[5])))
-            if _is_inside_canvas(p1, width, height) and _is_inside_canvas(p2, width, height) and _is_inside_canvas(p3, width, height):
-                cv2.line(canvas, p1, p2, (0, 200, 0), 1, cv2.LINE_AA)
-                cv2.line(canvas, p2, p3, (0, 200, 0), 1, cv2.LINE_AA)
-                cv2.line(canvas, p3, p1, (0, 200, 0), 1, cv2.LINE_AA)
+    for start, end in edges:
+        cv2.line(canvas, start, end, (34, 197, 94), 1, cv2.LINE_AA)
 
-    point_radius = max(1, int(round(min(width, height) / 160)))
+    point_radius = 1
     for point in points:
         cv2.circle(canvas, (int(point[0]), int(point[1])), point_radius, (0, 220, 255), -1, cv2.LINE_AA)
     return canvas
+
+
+def build_face_mesh_geometry(
+    landmarks: Iterable[tuple[float, float]],
+    *,
+    width: int,
+    height: int,
+    translate: tuple[float, float] = (0.0, 0.0),
+) -> tuple[list[tuple[int, int]], list[tuple[tuple[int, int], tuple[int, int]]]]:
+    points = _normalize_landmarks(landmarks, width=width, height=height, translate=translate)
+    return points, _delaunay_edges(points, width=width, height=height)
 
 
 def _normalize_landmarks(
@@ -90,6 +96,36 @@ def _normalize_landmarks(
         seen.add(point)
         normalized.append(point)
     return normalized
+
+
+def _delaunay_edges(
+    points: list[tuple[int, int]],
+    *,
+    width: int,
+    height: int,
+) -> list[tuple[tuple[int, int], tuple[int, int]]]:
+    if len(points) < 3:
+        return []
+
+    subdiv = cv2.Subdiv2D((0, 0, width, height))
+    for point in points:
+        subdiv.insert((float(point[0]), float(point[1])))
+
+    edges: set[tuple[tuple[int, int], tuple[int, int]]] = set()
+    for triangle in subdiv.getTriangleList():
+        p1 = (int(round(triangle[0])), int(round(triangle[1])))
+        p2 = (int(round(triangle[2])), int(round(triangle[3])))
+        p3 = (int(round(triangle[4])), int(round(triangle[5])))
+        if not (
+            _is_inside_canvas(p1, width, height)
+            and _is_inside_canvas(p2, width, height)
+            and _is_inside_canvas(p3, width, height)
+        ):
+            continue
+        for start, end in ((p1, p2), (p2, p3), (p3, p1)):
+            edge = (start, end) if start <= end else (end, start)
+            edges.add(edge)
+    return sorted(edges)
 
 
 def _is_inside_canvas(point: tuple[int, int], width: int, height: int) -> bool:

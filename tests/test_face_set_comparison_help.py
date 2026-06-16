@@ -54,6 +54,9 @@ class FaceSetComparisonHelpTests(unittest.TestCase):
         self.assertIn("0.52", html)
         self.assertIn("0.44", html)
         self.assertIn(".jpg, .png", html)
+        self.assertIn("os conjuntos <b>Padrão</b> e <b>Questionado</b>", html)
+        self.assertNotIn("conjunto A", html)
+        self.assertNotIn("conjunto B", html)
 
 
 if __name__ == "__main__":

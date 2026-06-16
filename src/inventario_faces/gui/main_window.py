@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 from PySide6.QtCore import QThread, QUrl
 from PySide6.QtGui import QDesktopServices
@@ -25,12 +25,13 @@ from PySide6.QtWidgets import (
 from inventario_faces import __version__
 from inventario_faces.app import load_default_runtime_config, persist_runtime_config
 from inventario_faces.domain.config import AppConfig
-from inventario_faces.gui.config_dialog import ConfigDialog
-from inventario_faces.gui.distributed_monitor_dialog import DistributedMonitorDialog
-from inventario_faces.gui.face_set_comparison_dialog import FaceSetComparisonDialog
 from inventario_faces.gui.icon_utils import apply_standard_icon
-from inventario_faces.gui.worker import FaceSearchWorker, InventoryWorker
-from inventario_faces.services.inventory_service import InventoryService
+
+if TYPE_CHECKING:
+    from inventario_faces.gui.distributed_monitor_dialog import DistributedMonitorDialog
+    from inventario_faces.gui.face_set_comparison_dialog import FaceSetComparisonDialog
+    from inventario_faces.gui.worker import FaceSearchWorker, InventoryWorker
+    from inventario_faces.services.inventory_service import InventoryService
 
 
 class MainWindow(QMainWindow):
@@ -126,6 +127,8 @@ class MainWindow(QMainWindow):
             self._folder_input.setText(selected)
 
     def _open_configuration_dialog(self) -> None:
+        from inventario_faces.gui.config_dialog import ConfigDialog
+
         dialog = ConfigDialog(
             self._current_config,
             self,
@@ -144,6 +147,8 @@ class MainWindow(QMainWindow):
             self._append_log(f"Configurações persistidas em: {saved_path}")
 
     def _start_processing(self) -> None:
+        from inventario_faces.gui.worker import InventoryWorker
+
         root_directory = self._require_root_directory()
         if root_directory is None:
             return
@@ -163,6 +168,8 @@ class MainWindow(QMainWindow):
         self._start_worker(InventoryWorker(service, root_directory, work_directory))
 
     def _start_face_search(self) -> None:
+        from inventario_faces.gui.worker import FaceSearchWorker
+
         root_directory = self._require_root_directory()
         if root_directory is None:
             return
@@ -206,6 +213,8 @@ class MainWindow(QMainWindow):
         self._start_worker(FaceSearchWorker(service, root_directory, query_image_paths, work_directory))
 
     def _inspect_distributed_health(self) -> None:
+        from inventario_faces.gui.distributed_monitor_dialog import DistributedMonitorDialog
+
         if not self._current_config.distributed.enabled:
             QMessageBox.warning(
                 self,
@@ -245,6 +254,8 @@ class MainWindow(QMainWindow):
         self._monitor_dialog.activateWindow()
 
     def _open_face_set_comparison_dialog(self) -> None:
+        from inventario_faces.gui.face_set_comparison_dialog import FaceSetComparisonDialog
+
         initial_directory: Path | None = None
         folder = self._folder_input.text().strip()
         if folder:

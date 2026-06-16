@@ -83,7 +83,7 @@ seleciona faces elegíveis, compara as representações faciais e organiza o res
 
 <h2>Objetivo da janela</h2>
 <ul>
-    <li>Comparar diretamente dois grupos de imagens faciais.</li>
+    <li>Comparar diretamente os conjuntos <b>Padrão</b> e <b>Questionado</b>.</li>
     <li>Classificar os pares por nível de interesse: atribuição, candidata ou abaixo do limiar.</li>
     <li>Exibir medidas descritivas e inferenciais quando houver repetição e variabilidade suficientes.</li>
     <li>Aplicar razão de verossimilhança calibrada quando houver base LR ou modelo LR salvo.</li>
@@ -92,8 +92,8 @@ seleciona faces elegíveis, compara as representações faciais e organiza o res
 
 <h2>Fluxo recomendado de uso</h2>
 <ol>
-    <li>Adicione as imagens do grupo <b>Padrão</b>.</li>
-    <li>Adicione as imagens do grupo <b>Questionado</b>.</li>
+    <li>Adicione as imagens em <b>Padrão</b>.</li>
+    <li>Adicione as imagens em <b>Questionado</b>.</li>
     <li>Confirme o <b>Diretório de trabalho</b>.</li>
     <li>Se necessário, informe a <b>Base de calibração LR</b> ou carregue um <b>Modelo de calibração LR</b>.</li>
     <li>Clique em <b>Comparar conjuntos</b>.</li>
@@ -106,17 +106,17 @@ seleciona faces elegíveis, compara as representações faciais e organiza o res
     <tr><th>Controle</th><th>Função</th><th>Orientação</th></tr>
     <tr>
         <td><b>Padrão</b></td>
-        <td>Grupo de referência usado como fonte das faces do conjunto A.</td>
+        <td>Lado de referência da comparação, usado como fonte das faces em Padrão.</td>
         <td>Use imagens representativas e bem documentadas. Extensões aceitas nesta configuração: <code>{escape(image_extensions)}</code>.</td>
     </tr>
     <tr>
         <td><b>Questionado</b></td>
-        <td>Grupo examinado, tratado como conjunto B na comparação.</td>
+        <td>Lado examinado da comparação, usado como fonte das faces em Questionado.</td>
         <td>Mantenha apenas material pertinente à hipótese examinada para evitar inflar o número de pares sem necessidade.</td>
     </tr>
     <tr>
         <td><b>Adicionar imagens</b></td>
-        <td>Inclui novos arquivos no grupo.</td>
+        <td>Inclui novos arquivos em Padrão ou Questionado.</td>
         <td>Ideal para montar o conjunto de forma incremental.</td>
     </tr>
     <tr>
@@ -126,7 +126,7 @@ seleciona faces elegíveis, compara as representações faciais e organiza o res
     </tr>
     <tr>
         <td><b>Limpar</b></td>
-        <td>Esvazia completamente o grupo correspondente.</td>
+        <td>Esvazia completamente Padrão ou Questionado.</td>
         <td>Use quando quiser reiniciar a montagem do conjunto.</td>
     </tr>
     <tr>
@@ -219,7 +219,7 @@ seleciona faces elegíveis, compara as representações faciais e organiza o res
 <h2>Pipeline técnico resumido</h2>
 <h3>1. Preparação e leitura das imagens</h3>
 <p>
-As imagens dos dois grupos são abertas individualmente e registradas como entradas processadas. A comparação não trabalha
+As imagens de Padrão e Questionado são abertas individualmente e registradas como entradas processadas. A comparação não trabalha
 com a “pasta inteira” como uma única unidade, mas com as faces elegíveis encontradas em cada arquivo.
 </p>
 
@@ -239,7 +239,7 @@ Faces inelegíveis podem ser descartadas antes da comparação propriamente dita
 
 <h3>3. Comparação entre Padrão e Questionado</h3>
 <p>
-Depois da seleção das faces válidas, o sistema compara cada face elegível do grupo Padrão com cada face elegível do grupo
+Depois da seleção das faces válidas, o sistema compara cada face elegível de Padrão com cada face elegível de
 Questionado. Em termos práticos, o número de comparações cresce aproximadamente com
 <code>faces_padrão × faces_questionado</code>.
 </p>
@@ -261,12 +261,12 @@ Na configuração carregada nesta sessão, o limiar de atribuição é
 
 <h3>5. Como as estatísticas finais são obtidas quando há várias imagens</h3>
 <p>
-O sistema não escolhe previamente uma “imagem final” do grupo <b>Padrão</b> e outra do grupo <b>Questionado</b>. Primeiro ele
+O sistema não escolhe previamente uma “imagem final” em <b>Padrão</b> e outra em <b>Questionado</b>. Primeiro ele
 reúne todas as faces selecionadas do Padrão e todas as faces selecionadas do Questionado. Depois compara cada face elegível do
 Padrão com cada face elegível do Questionado.
 </p>
 <p>
-Assim, se o grupo Padrão gerar 3 faces selecionadas e o grupo Questionado gerar 4, o resultado final terá
+Assim, se Padrão gerar 3 faces selecionadas e Questionado gerar 4, o resultado final terá
 <code>3 × 4 = 12</code> scores. O resumo estatístico é calculado sobre essa coleção inteira de scores:
 </p>
 <ul>
@@ -297,9 +297,9 @@ os scores observados e extrai os quantis de acordo com a significância configur
 </p>
 <p>
 O mesmo resumo também executa um <b>teste U de Mann-Whitney bilateral</b> para comparar a distribuição de
-<b>qualidade facial</b> das faces selecionadas no grupo Padrão com a do grupo Questionado. Esse teste é
-<b>não paramétrico</b>, trabalha com postos em vez de assumir normalidade e ajuda a verificar se um grupo
-chegou à comparação com material sistematicamente melhor ou pior do que o outro.
+<b>qualidade facial</b> das faces selecionadas em Padrão com a de Questionado. Esse teste é
+<b>não paramétrico</b>, trabalha com postos em vez de assumir normalidade e ajuda a verificar se
+Padrão ou Questionado chegou à comparação com material sistematicamente melhor ou pior do que o outro.
 </p>
 
 <h3>7. Calibração por razão de verossimilhança (LR)</h3>
@@ -361,8 +361,8 @@ representam o conjunto inteiro de pares comparados, e não apenas o melhor item 
 </p>
 <p>
 Além disso, o resumo informa o resultado do <b>U de Mann-Whitney</b> sobre a qualidade facial das faces selecionadas.
-Se o <code>p-valor</code> ficar abaixo da significância configurada, há evidência estatística de que os dois grupos
-não chegaram à comparação com a mesma distribuição de qualidade. Isso é útil para contextualizar assimetrias operacionais
+Se o <code>p-valor</code> ficar abaixo da significância configurada, há evidência estatística de que
+Padrão e Questionado não chegaram à comparação com a mesma distribuição de qualidade. Isso é útil para contextualizar assimetrias operacionais
 entre Padrão e Questionado antes de interpretar os scores e a LR.
 </p>
 
@@ -416,7 +416,7 @@ exatamente nesse ponto do eixo horizontal. Em termos práticos: <code>LR = f(sco
 <ul>
     <li>Quando a base de calibração é a mesma.</li>
     <li>Quando backend, modelo facial, thresholds e condições operacionais continuam compatíveis.</li>
-    <li>Quando o objetivo é comparar novos grupos Padrão/Questionado sem recalcular a calibração inteira.</li>
+    <li>Quando o objetivo é comparar novos conjuntos Padrão e Questionado sem recalcular a calibração inteira.</li>
 </ul>
 <p>
 Se houver mudança material na base rotulada, no pipeline ou na configuração, o mais prudente é recalibrar.
