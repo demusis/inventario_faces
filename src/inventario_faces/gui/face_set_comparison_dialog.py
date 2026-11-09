@@ -484,8 +484,10 @@ class FaceSetComparisonDialog(QDialog):
         self._worker.log_message.connect(self._append_log)
         self._worker.completed.connect(self._on_completed)
         self._worker.failed.connect(self._on_failed)
+        self._worker.rejected.connect(self._on_rejected)
         self._worker.completed.connect(self._thread.quit)
         self._worker.failed.connect(self._thread.quit)
+        self._worker.rejected.connect(self._thread.quit)
         self._thread.finished.connect(self._cleanup_thread)
         self._set_running_state(True)
         self._thread.start()
@@ -560,6 +562,16 @@ class FaceSetComparisonDialog(QDialog):
             "Erro",
             f"{short_error}\n\nConsulte o log exibido na janela para detalhes.",
         )
+
+    def _on_rejected(self, message: str) -> None:
+        """Entrada inadequada (ex.: grupo sem face utilizável): orienta o usuário, sem tom de defeito."""
+
+        self._set_activity_state(
+            "failed",
+            "Comparação não realizada: verifique as mídias informadas (detalhes no log).",
+        )
+        self._status_label.setText("Comparação não realizada.")
+        QMessageBox.warning(self, "Comparação não realizada", message or "Entrada inadequada.")
 
     def _set_result_buttons_enabled(self, enabled: bool) -> None:
         for button in self._result_buttons:

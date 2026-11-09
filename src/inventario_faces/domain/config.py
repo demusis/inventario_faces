@@ -178,9 +178,16 @@ class FaceModelSettings:
     minimum_face_size_pixels: int = 40
     ctx_id: int = 0
     providers: tuple[str, ...] = field(default_factory=tuple)
+    # Margem neutra (fracao do maior lado, em cada borda) usada para repetir a deteccao
+    # de imagens estaticas sem nenhuma face encontrada, tipicamente recortes faciais
+    # justos. 0 desabilita a nova tentativa.
+    still_image_margin_ratio: float = 0.5
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "backend", _normalize_non_empty_text(self.backend, "Backend facial"))
+        object.__setattr__(self, "still_image_margin_ratio", float(self.still_image_margin_ratio))
+        if not 0.0 <= self.still_image_margin_ratio <= 2.0:
+            raise ValueError("Margem para imagens estáticas deve ficar entre 0.0 e 2.0.")
         object.__setattr__(self, "model_name", _normalize_non_empty_text(self.model_name, "Modelo facial"))
         if self.det_size is not None:
             if len(self.det_size) != 2 or any(int(value) <= 0 for value in self.det_size):

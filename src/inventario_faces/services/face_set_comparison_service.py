@@ -23,6 +23,7 @@ from inventario_faces.domain.entities import (
     KeyFrame,
     MediaType,
 )
+from inventario_faces.domain.errors import NoEligibleFacesError
 from inventario_faces.domain.protocols import (
     FaceAnalyzer,
     LogCallback,
@@ -40,6 +41,7 @@ from inventario_faces.infrastructure.logging_setup import (
     build_file_logger,
     close_file_logger,
 )
+from inventario_faces.reporting.face_set_comparison_docx_renderer import FaceSetComparisonDocxReportGenerator
 from inventario_faces.services.clustering_service import ClusteringService
 from inventario_faces.services.export_service import ExportService
 from inventario_faces.services.hashing_service import HashingService
@@ -219,6 +221,7 @@ class FaceSetComparisonService:
                 log_callback,
                 (
                     f"[Backend facial] Modelo pronto | "
+                    f"backend efetivo={getattr(analyzer, 'backend_name', self._config.face_model.backend)} | "
                     f"diretorio={getattr(analyzer, '_model_dir', '-')} | "
                     f"providers={', '.join(providers) if providers else 'desconhecido'} | "
                     f"disponiveis={', '.join(available_providers) if available_providers else 'desconhecido'} | "
@@ -310,10 +313,16 @@ class FaceSetComparisonService:
                     f"Questionado processado ({index}/{len(normalized_b)})",
                 )
 
-            if not set_a_faces:
-                raise RuntimeError("Nenhuma face valida foi selecionada no grupo Padrão.")
-            if not set_b_faces:
-                raise RuntimeError("Nenhuma face valida foi selecionada no grupo Questionado.")
+            empty_groups = [
+                (label, inputs)
+                for label, inputs, faces in (("A", set_a_inputs, set_a_faces), ("B", set_b_inputs, set_b_faces))
+                if not faces
+            ]
+            if empty_groups:
+                raise NoEligibleFacesError(
+                    self._no_eligible_faces_message(empty_groups),
+                    empty_groups=tuple(self._comparison_group_label(label) for label, _ in empty_groups),
+                )
 
             # Camada aditiva: consolida o conjunto de REFERENCIA (Padrao), que deve conter
             # um unico individuo, agrupando suas faces por individuo apenas como controle de
@@ -465,6 +474,15 @@ class FaceSetComparisonService:
                     )
                 export_service.write_face_set_comparison_calibration_scores_csv(calibration)
                 self._lr_calibrator.save_face_set_comparison_calibration_model(calibration, calibration_model_export_path)
+            result = replace(
+                result,
+                report_docx_path=self._write_comparison_report(
+                    result,
+                    export_service.comparison_directory,
+                    text_logger=text_logger,
+                    log_callback=log_callback,
+                ),
+            )
             export_service.write_face_set_comparison_matches_csv(result)
             export_service.write_face_set_comparison_summary_text(result)
             export_service.write_face_set_comparison_json(result)
@@ -488,6 +506,20 @@ class FaceSetComparisonService:
             )
             emit_progress(progress_callback, total_steps, total_steps, "Comparacao concluida")
             return result
+        except NoEligibleFacesError as exc:
+            # Condicao esperada de entrada, nao defeito: registra o diagnostico sem traceback.
+            emit_log(text_logger, log_callback, "[Comparacao] Interrompida: grupo sem face elegível")
+            for line in str(exc).splitlines():
+                emit_log(text_logger, log_callback, f"[Comparacao] {line}" if line.strip() else "[Comparacao]")
+            event_logger.write(
+                "face_set_comparison_failed",
+                error=str(exc),
+                error_type=type(exc).__name__,
+                empty_groups=list(exc.empty_groups),
+                set_a_paths=normalized_a,
+                set_b_paths=normalized_b,
+            )
+            raise
         except Exception as exc:
             error_summary, traceback_text = emit_exception(
                 text_logger,
@@ -539,6 +571,98 @@ class FaceSetComparisonService:
         if work_directory is not None:
             return Path(work_directory).resolve()
         return set_a_paths[0].parent.resolve() if set_a_paths else set_b_paths[0].parent.resolve()
+
+    def _write_comparison_report(
+        self,
+        result: FaceSetComparisonResult,
+        output_directory: Path,
+        *,
+        text_logger: logging.Logger,
+        log_callback: LogCallback | None,
+    ) -> Path | None:
+        """Gera o relatório DOCX; uma falha aqui não invalida a comparação já concluída."""
+
+        _, assignment_media, candidate_media = self._questionado_media_verdict(result.set_b_faces, result.matches)
+        media_verdicts = {
+            str(entry.source_path): "below_threshold" for entry in result.set_b_faces
+        }
+        media_verdicts.update({media: "candidate" for media in candidate_media})
+        media_verdicts.update({media: "assignment" for media in assignment_media})
+        try:
+            report_path = FaceSetComparisonDocxReportGenerator(self._config).generate(
+                result,
+                media_verdicts,
+                output_directory,
+            )
+        except Exception as exc:
+            emit_exception(text_logger, log_callback, "[Comparacao] Falha ao gerar o relatório DOCX", exc)
+            return None
+        emit_log(text_logger, log_callback, f"[Comparacao] Relatório DOCX: {report_path}")
+        return report_path
+
+    def _no_eligible_faces_message(
+        self,
+        empty_groups: list[tuple[str, list[FaceSetComparisonInput]]],
+    ) -> str:
+        """Explica, por mídia, por que o(s) grupo(s) ficaram sem face elegível."""
+
+        min_quality = self._config.face_model.minimum_face_quality
+        min_size = self._config.face_model.minimum_face_size_pixels
+        margin_enabled = self._config.face_model.still_image_margin_ratio > 0
+        names = " e ".join(self._comparison_group_label(label) for label, _ in empty_groups)
+        lines = [
+            (
+                f"Nenhuma face utilizável no grupo {names}; a comparação precisa de ao menos "
+                "uma face em cada grupo."
+            ),
+        ]
+        hints: set[str] = set()
+        for label, inputs in empty_groups:
+            lines.append("")
+            lines.append(f"{self._comparison_group_label(label)}:")
+            if not inputs:
+                lines.append("  - nenhuma mídia informada.")
+                continue
+            for record in inputs:
+                name = record.source_path.name
+                if record.processing_error:
+                    lines.append(f"  - {name}: falha ao processar a mídia ({record.processing_error}).")
+                    hints.add("error")
+                elif record.detected_faces == 0:
+                    lines.append(f"  - {name}: nenhuma face detectada.")
+                    hints.add("undetected")
+                elif record.selected_faces == 0:
+                    lines.append(
+                        f"  - {name}: {record.detected_faces} face(s) detectada(s), todas descartadas pelos "
+                        f"filtros (confiança de detecção < {min_quality:.2f} ou tamanho < {min_size}px)."
+                    )
+                    hints.add("filtered")
+                else:
+                    lines.append(f"  - {name}: faces selecionadas, mas nenhuma trilha (track) consolidada.")
+        lines.append("")
+        lines.append("Como resolver:")
+        if "undetected" in hints:
+            margin_hint = (
+                "Recortes muito justos já são reprocessados automaticamente com margem; se ainda "
+                "assim falhar, use uma imagem com mais contexto ao redor do rosto."
+                if margin_enabled
+                else "A nova tentativa com margem para imagens estáticas está desabilitada em "
+                "Configurações (Margem para imagens estáticas = 0); habilite-a para recortes "
+                "faciais justos."
+            )
+            lines.append(
+                "  - Verifique se a face está visível, razoavelmente frontal e nítida. " + margin_hint
+            )
+        if "filtered" in hints:
+            lines.append(
+                "  - Use uma imagem de melhor qualidade/resolução ou, com a devida justificativa "
+                "técnica, reduza 'Qualidade mínima da face' ou 'Tamanho mínimo da face' em Configurações."
+            )
+        if "error" in hints:
+            lines.append("  - Confira se o arquivo abre normalmente e se o formato é suportado.")
+        if not hints:
+            lines.append("  - Consulte o log da comparação para os detalhes de cada mídia.")
+        return "\n".join(lines)
 
     def _comparison_group_label(self, set_label: str) -> str:
         if set_label == "A":
@@ -898,6 +1022,15 @@ class FaceSetComparisonService:
                 tracks=len(tracking_result.tracks),
                 keyframes=len(tracking_result.keyframes),
                 export_source_copy=source_copy_path,
+                still_image_margin_px=next(
+                    (
+                        int(occurrence.enhancement_metadata.parameters["still_image_margin_px"])
+                        for occurrence in tracking_result.occurrences
+                        if occurrence.enhancement_metadata is not None
+                        and "still_image_margin_px" in occurrence.enhancement_metadata.parameters
+                    ),
+                    None,
+                ),
             )
             emit_log(
                 text_logger,

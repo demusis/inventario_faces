@@ -1,4 +1,5 @@
 numpy>=1.26
+scipy>=1.13
 opencv-python>=4.10
 PySide6>=6.8
 PyYAML>=6.0
@@ -6,7 +7,9 @@ onnxruntime-gpu[cuda,cudnn]>=1.22; platform_system == "Windows"
 onnxruntime>=1.22; platform_system != "Windows"
 python-docx>=1.2
 Pillow>=10.0
-# InsightFace e mais estavel hoje em Python 3.11/3.12.
-insightface>=0.7.3; python_version < "3.13"
+# InsightFace e opcional: o backend "onnx" executa os mesmos modelos (buffalo_l) direto
+# no ONNX Runtime e e usado automaticamente quando o pacote esta ausente. No Windows o
+# insightface exige compilador C++ (Build Tools); instale-o a parte se desejar:
+#   pip install "insightface>=0.7.3"
 # Busca vetorial: opcional, usado automaticamente quando disponivel.
 # faiss-cpu>=1.8

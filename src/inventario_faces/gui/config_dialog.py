@@ -329,6 +329,7 @@ class ConfigDialog(QDialog):
         self._minimum_face_size_spin = QSpinBox(tab)
         self._minimum_face_size_spin.setRange(1, 4096)
         self._minimum_face_size_spin.setSuffix(" px")
+        self._still_image_margin_spin = self._double_spin_box(0.0, 2.0, 2, 0.05)
         self._providers_input = QLineEdit(tab)
         self._providers_input.setPlaceholderText("Em branco = preferir GPU automaticamente")
 
@@ -387,6 +388,13 @@ class ConfigDialog(QDialog):
             definition="Menor lado aceitável, em pixels, para a caixa delimitadora da face.",
             operational_effect="Valores baixos ampliam cobertura, mas aumentam recortes pouco informativos e ruído operacional.",
             recommendation="O padrão pericial usa 48 px. Reduza apenas quando o caso justificar busca deliberada por faces pequenas e potencialmente menos informativas.",
+        )))
+        form.addRow("Margem para imagens estáticas:", self._with_help(self._still_image_margin_spin, "Margem para imagens estáticas", self._help_html(
+            definition="Fração do maior lado da imagem acrescentada como borda neutra em cada lado quando uma imagem estática não apresenta nenhuma face detectada. A detecção é então repetida sobre a imagem com margem.",
+            operational_effect="Recupera recortes faciais justos (por exemplo, foto 3x4 com o rosto ocupando o quadro inteiro), que ficariam maiores que a escala do detector. O conteúdo original não é reamostrado; a nova tentativa e a margem aplicada ficam registradas no log, nos eventos e nos metadados de pré-processamento. Vídeos não são afetados.",
+            recommendation="O padrão pericial usa 0,50 (a imagem passa a ter o dobro de largura e altura). Use 0 para desabilitar a nova tentativa.",
+            caveat="Quando a margem é aplicada, as coordenadas da caixa delimitadora referem-se à imagem com margem; o deslocamento em pixels fica registrado nos metadados.",
+            references=[("SCRFD", SCRFD_URL)],
         )))
         form.addRow("Mecanismos de execução:", self._with_help(self._providers_input, "Mecanismos de execução", self._help_html(
             definition="Lista, em ordem de preferência, dos execution providers do ONNX Runtime.",
@@ -785,6 +793,7 @@ class ConfigDialog(QDialog):
         self._det_height_spin.setDisabled(use_original_resolution)
         self._minimum_face_quality_spin.setValue(config.face_model.minimum_face_quality)
         self._minimum_face_size_spin.setValue(config.face_model.minimum_face_size_pixels)
+        self._still_image_margin_spin.setValue(config.face_model.still_image_margin_ratio)
         self._providers_input.setText(", ".join(config.face_model.providers))
 
         self._tracking_iou_spin.setValue(config.tracking.iou_threshold)
@@ -900,6 +909,7 @@ class ConfigDialog(QDialog):
                 minimum_face_size_pixels=int(self._minimum_face_size_spin.value()),
                 ctx_id=int(self._ctx_id_spin.value()),
                 providers=self._parse_list(self._providers_input.text()),
+                still_image_margin_ratio=float(self._still_image_margin_spin.value()),
             ),
             clustering=ClusteringSettings(
                 assignment_similarity=float(self._assignment_similarity_spin.value()),

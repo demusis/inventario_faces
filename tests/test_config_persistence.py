@@ -349,7 +349,7 @@ forensics:
         self.assertEqual(1.0, loaded.likelihood_ratio.kde_bandwidth_scale)
         self.assertEqual(0.001, loaded.likelihood_ratio.kde_uniform_floor_weight)
         self.assertEqual(1e-12, loaded.likelihood_ratio.kde_min_density)
-        self.assertIn("probabilisticos", loaded.forensics.chain_of_custody_note)
+        self.assertIn("probabilísticos", loaded.forensics.chain_of_custody_note)
 
     def test_packaged_default_config_matches_project_default_config(self) -> None:
         project_defaults = (PROJECT_ROOT / "config" / "defaults.yaml").read_text(encoding="utf-8")

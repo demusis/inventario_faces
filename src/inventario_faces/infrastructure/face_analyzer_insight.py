@@ -330,6 +330,9 @@ def _patch_insightface_face_align() -> None:
 
 @dataclass
 class InsightFaceAnalyzer:
+    # Backend efetivo registrado nos logs (atributo de classe, nao e campo do dataclass).
+    backend_name = "insightface"
+
     settings: FaceModelSettings
 
     def __post_init__(self) -> None:

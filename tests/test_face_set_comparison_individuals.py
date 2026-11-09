@@ -164,6 +164,31 @@ class ReferenceAndVerdictTests(unittest.TestCase):
             clustering_service=ClusteringService(config.clustering),
         )
 
+    def test_no_eligible_faces_message_explains_each_media(self) -> None:
+        from inventario_faces.domain.entities import FaceSetComparisonInput
+
+        def record(name: str, detected: int, selected: int, error: str | None = None) -> FaceSetComparisonInput:
+            return FaceSetComparisonInput(
+                set_label="A",
+                source_path=Path(name),
+                sha512="x",
+                detected_faces=detected,
+                selected_faces=selected,
+                tracks=0,
+                keyframes=0,
+                processing_error=error,
+            )
+
+        message = self._service._no_eligible_faces_message(
+            [("A", [record("sem_face.png", 0, 0), record("pequena.png", 2, 0), record("ruim.png", 0, 0, "erro X")])]
+        )
+        self.assertNotIn("RuntimeError", message)
+        self.assertIn("Nenhuma face utilizável no grupo Padrão", message.splitlines()[0])
+        self.assertIn("sem_face.png: nenhuma face detectada", message)
+        self.assertIn("pequena.png: 2 face(s) detectada(s), todas descartadas", message)
+        self.assertIn("ruim.png: falha ao processar a mídia (erro X)", message)
+        self.assertIn("Como resolver:", message)
+
     def test_reference_log_ok_when_homogeneous(self) -> None:
         entries = [
             _entry("A1", "A", [1.0, 0.0, 0.0], "foto1.jpg"),

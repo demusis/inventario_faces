@@ -351,6 +351,8 @@ class FaceSetComparisonInput:
     identity_label: str | None = None
     processing_error: str | None = None
     export_source_copy: Path | None = None
+    # Margem (px) aplicada na nova tentativa de deteccao de imagem estatica; None se nao aplicada.
+    still_image_margin_px: int | None = None
 
 
 @dataclass(frozen=True)
@@ -493,3 +495,4 @@ class FaceSetComparisonResult:
     summary: FaceSetComparisonSummary = field(default_factory=FaceSetComparisonSummary)
     calibration: FaceSetComparisonCalibration | None = None
     procedure_details: tuple[str, ...] = field(default_factory=tuple)
+    report_docx_path: Path | None = None

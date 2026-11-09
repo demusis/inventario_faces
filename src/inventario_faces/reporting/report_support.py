@@ -233,9 +233,11 @@ def technical_parameter_items(
             f"mudança significativa={config.video.significant_change_threshold:.2f}."
         ),
         (
-            f"Modelo facial: backend={config.face_model.backend}; modelo={config.face_model.model_name}; "
+            f"Modelo facial: backend configurado={config.face_model.backend} (o backend efetivo, inclusive "
+            f"eventual fallback para onnx, fica registrado no log da execução); modelo={config.face_model.model_name}; "
             f"det_size={det_size}; qualidade mínima={config.face_model.minimum_face_quality:.2f}; "
-            f"tamanho mínimo={config.face_model.minimum_face_size_pixels}px; ctx_id={config.face_model.ctx_id}; "
+            f"tamanho mínimo={config.face_model.minimum_face_size_pixels}px; "
+            f"margem para imagens estáticas={config.face_model.still_image_margin_ratio:.2f}; ctx_id={config.face_model.ctx_id}; "
             f"providers={providers}."
         ),
         (

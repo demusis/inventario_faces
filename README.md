@@ -101,7 +101,7 @@ Os valores padrão atuais foram endurecidos para um uso pericial mais conservado
 - `media`: extensões de imagem (`.jpg`, `.jpeg`, `.png`, `.bmp`, `.tif`, `.tiff`, `.webp`) e de vídeo (`.mp4`, `.avi`, `.mkv`, `.dav`, `.mov`, `.wmv`, `.mpeg`, `.mpg`) reconhecidas pelo scanner.
 - `video`: taxa de amostragem, teto de quadros, intervalo de keyframe e limiar de mudança significativa.
 - `comparison`: teto opcional de quadros por vídeo e intervalo de amostragem próprios da comparação `Padrão` x `Questionado` (nulos por padrão = herdam `video`); e os limiares de política do veredito por mídia quando há calibração LR — `verdict_assignment_log10_lr` (padrão 4.0, ou seja LR ≥ 10⁴, para atribuição) e `verdict_candidate_log10_lr` (padrão 1.0, LR ≥ 10, para candidata).
-- `face_model`: backend, modelo, resolução de detecção (`det_size`), qualidade mínima, tamanho mínimo, ID de contexto do dispositivo (`ctx_id`) e execution providers. Por padrão, `providers` é vazio (descoberta automática CUDA → DirectML → CPU). Para ativar o `TensorrtExecutionProvider` (opt-in, mais rápido sobre CUDA, porém com warm-up longo de build de engine), liste-o explicitamente em `providers`.
+- `face_model`: backend, modelo, resolução de detecção (`det_size`), qualidade mínima, tamanho mínimo, ID de contexto do dispositivo (`ctx_id`) e execution providers. Por padrão, `providers` é vazio (descoberta automática CUDA → DirectML → CPU). Para ativar o `TensorrtExecutionProvider` (opt-in, mais rápido sobre CUDA, porém com warm-up longo de build de engine), liste-o explicitamente em `providers`. `still_image_margin_ratio` (padrão 0,50) controla a nova tentativa de detecção em imagens estáticas sem nenhuma face encontrada, como recortes 3x4 com o rosto ocupando o quadro inteiro: a imagem recebe uma margem neutra dessa fração do maior lado em cada borda e a detecção é repetida, com registro no log, nos eventos e nos metadados. Use 0 para desabilitar.
 - `tracking`: IoU, distância espacial, similaridade de embedding, pesos de associação, tolerância a perda e top crops.
 - `clustering`: limiares de atribuição/sugestão e mínimos de grupo e de track.
 - `enhancement`: pré-processamento, brilho-gatilho, CLAHE, gamma e denoise.
@@ -211,6 +211,9 @@ Em execuções desse tipo, a pasta `comparison/` passa a incluir artefatos como:
 - `face_set_comparison_summary.txt`
 - `face_set_comparison_calibration_scores.csv`
 - `face_set_comparison_calibration_model.json`
+- `relatorio_comparacao.docx`: relatório da comparação, com o resultado por mídia do Questionado, o material examinado (com SHA-512), as faces selecionadas com malha biométrica, o ranking e o confronto visual dos pares, a estatística, a metodologia e os parâmetros.
+
+Quando algum grupo termina sem face utilizável, a comparação não é tratada como falha do programa: a interface exibe um diagnóstico por mídia (nenhuma face detectada, faces descartadas pelos filtros ou erro de leitura), com orientação de como resolver.
 
 ## Processamento em múltiplos PCs/instâncias
 
@@ -277,6 +280,12 @@ powershell -ExecutionPolicy Bypass -File .\build\build.ps1
 ```
 
 O instalador Windows gerado pelo script aponta para o repositório oficial do projeto como canal de publicação, suporte e atualização.
+
+O instalador **não exige privilégios de administrador**: por padrão instala apenas para o usuário atual (`%LOCALAPPDATA%\Programs\InventarioFaces`). Quem for administrador pode optar, no diálogo inicial, por instalar para todos os usuários. O pacote inclui o ONNX Runtime com as bibliotecas CUDA; em máquinas sem GPU NVIDIA compatível, o processamento cai automaticamente para CPU. O PDF dos relatórios continua dependendo de `pdflatex` instalado na estação; sem ele, são gerados o `.docx` e o `.tex`.
+
+Os artefatos do build ficam **fora da pasta sincronizada**, em `%LOCALAPPDATA%\inventario_faces_build` (`dist\` do PyInstaller e `installer\InventarioFacesSetup-<versão>.exe`). O cliente do Google Drive trava os arquivos do PyInstaller e chegou a remover o instalador recém-gerado dentro do projeto. Use `-BuildRoot` e `-InstallerOutput` para escolher outros locais.
+
+O build empacota o backend `onnx` (o pacote `insightface` é opcional e, no Windows, exige compilador C++). Se o interpretador do `.venv` do projeto não funcionar (por exemplo, um ambiente copiado de outra máquina), o script cria `.venv-build` automaticamente; também é possível indicar um interpretador com `-BuildPythonExe`. Qualquer falha de dependência, teste, PyInstaller ou Inno Setup interrompe o build.
 
 ## Versionamento automático
 

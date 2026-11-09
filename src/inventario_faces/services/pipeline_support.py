@@ -114,6 +114,7 @@ def configuration_log_lines(config: AppConfig, providers: list[str]) -> list[str
             f"modelo={config.face_model.model_name} | "
             f"qualidade minima={config.face_model.minimum_face_quality:.2f} | "
             f"face minima={config.face_model.minimum_face_size_pixels}px | "
+            f"margem imagem estatica={config.face_model.still_image_margin_ratio:.2f} | "
             f"provedores={provider_label}"
         ),
         (

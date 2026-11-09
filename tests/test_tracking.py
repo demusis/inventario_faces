@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -45,7 +46,111 @@ class _ProgrammedAnalyzer:
         return list(self._embeddings.get(key, [1.0, 0.0, 0.0]))
 
 
+class _TightCropAnalyzer:
+    """Simula o detector real: so encontra a face quando ha margem ao redor dela."""
+
+    def __init__(self, original_size: int) -> None:
+        self._original_size = original_size
+        self.calls: list[tuple[int, int]] = []
+
+    def detect(self, frame: SampledFrame) -> list[DetectedFace]:
+        height, width = np.asarray(frame.bgr_pixels).shape[:2]
+        self.calls.append((width, height))
+        if max(width, height) <= self._original_size:
+            return []
+        margin = (width - self._original_size) // 2
+        crop = np.full((self._original_size, self._original_size, 3), 200, dtype=np.uint8)
+        x1, y1 = float(margin), float(margin)
+        x2, y2 = float(margin + self._original_size), float(margin + self._original_size)
+        return [
+            DetectedFace(
+                bbox=BoundingBox(x1, y1, x2, y2),
+                detection_score=0.9,
+                crop_bgr=crop,
+                landmarks=((x1 + 30, y1 + 40), (x1 + 70, y1 + 40), (x1 + 50, y1 + 60), (x1 + 35, y1 + 80), (x1 + 65, y1 + 80)),
+                enhancement_metadata=frame.enhancement_metadata,
+            )
+        ]
+
+    def embed(self, frame: SampledFrame, detection: DetectedFace, reason: str = "keyframe") -> list[float]:
+        return [1.0, 0.0, 0.0]
+
+
 class FaceTrackingServiceTests(unittest.TestCase):
+    def test_still_image_without_detection_is_retried_with_margin(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = FaceTrackingService(
+                config=self._config(),
+                enhancement_service=EnhancementService(self._config().enhancement),
+                quality_service=FaceQualityService(),
+            )
+            source = Path(temp_dir) / "recorte.png"
+            pixels = np.full((100, 100, 3), 180, dtype=np.uint8)
+            frame = SampledFrame(source, "recorte", None, None, pixels, pixels)
+            analyzer = _TightCropAnalyzer(original_size=100)
+            messages: list[str] = []
+
+            result = service.process_media(
+                source_path=source,
+                sha512="hash",
+                media_type=MediaType.IMAGE,
+                frames=[frame],
+                analyzer=analyzer,
+                artifact_store=ArtifactStore(Path(temp_dir) / "run"),
+                text_callback=messages.append,
+            )
+
+            self.assertEqual(analyzer.calls, [(100, 100), (200, 200)])
+            self.assertEqual(result.raw_detection_count, 1)
+            self.assertEqual(len(result.tracks), 1)
+            occurrence = result.occurrences[0]
+            self.assertIsNotNone(occurrence.enhancement_metadata)
+            self.assertIn("still_image_margin", occurrence.enhancement_metadata.strategy)
+            self.assertEqual(occurrence.enhancement_metadata.parameters["still_image_margin_px"], 50)
+            self.assertTrue(any("nova tentativa com margem de 50px" in message for message in messages))
+
+    def test_video_frames_are_not_retried_with_margin(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = FaceTrackingService(
+                config=self._config(),
+                enhancement_service=EnhancementService(self._config().enhancement),
+                quality_service=FaceQualityService(),
+            )
+            analyzer = _TightCropAnalyzer(original_size=100)
+            result = service.process_media(
+                source_path=Path(temp_dir) / "sample.mp4",
+                sha512="hash",
+                media_type=MediaType.VIDEO,
+                frames=self._frames(Path(temp_dir) / "sample.mp4", count=2),
+                analyzer=analyzer,
+                artifact_store=ArtifactStore(Path(temp_dir) / "run"),
+            )
+            self.assertEqual(analyzer.calls, [(100, 100), (100, 100)])
+            self.assertEqual(result.raw_detection_count, 0)
+
+    def test_still_image_margin_retry_can_be_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = self._config()
+            config = replace(base, face_model=replace(base.face_model, still_image_margin_ratio=0.0))
+            service = FaceTrackingService(
+                config=config,
+                enhancement_service=EnhancementService(config.enhancement),
+                quality_service=FaceQualityService(),
+            )
+            source = Path(temp_dir) / "recorte.png"
+            pixels = np.full((100, 100, 3), 180, dtype=np.uint8)
+            analyzer = _TightCropAnalyzer(original_size=100)
+            result = service.process_media(
+                source_path=source,
+                sha512="hash",
+                media_type=MediaType.IMAGE,
+                frames=[SampledFrame(source, "recorte", None, None, pixels, pixels)],
+                analyzer=analyzer,
+                artifact_store=ArtifactStore(Path(temp_dir) / "run"),
+            )
+            self.assertEqual(analyzer.calls, [(100, 100)])
+            self.assertEqual(result.raw_detection_count, 0)
+
     def test_tracking_preserves_persistent_face_and_reduces_redundant_keyframes(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             service = FaceTrackingService(

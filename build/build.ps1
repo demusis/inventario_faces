@@ -1,6 +1,12 @@
 param(
     [string]$PythonExe = "python",
     [string]$BuildPythonExe = "",
+    # Pasta local (fora de Google Drive/OneDrive) para os artefatos intermediarios do
+    # PyInstaller: milhares de arquivos que o cliente de sincronizacao trava e tenta enviar.
+    [string]$BuildRoot = (Join-Path $env:LOCALAPPDATA "inventario_faces_build"),
+    # Saida do instalador (~1,5 GB). Fica fora da pasta sincronizada por padrao: o
+    # cliente do Google Drive chegou a remover o .exe recem-gerado em dist\installer.
+    [string]$InstallerOutput = "",
     [switch]$SkipTests,
     [switch]$SkipInstaller
 )
@@ -16,24 +22,47 @@ $InstallerScript = Join-Path $PSScriptRoot "inventario_faces.iss"
 $SourceRoot = (Join-Path $ProjectRoot "src").Replace("\", "/")
 $VersionScript = "import sys; sys.path.insert(0, r'$SourceRoot'); from inventario_faces import __version__; print(__version__)"
 
+# No Windows PowerShell 5.1, falhas de executaveis nativos (pip, PyInstaller, ISCC)
+# nao disparam $ErrorActionPreference; sem esta verificacao o build seguiria adiante
+# e empacotaria um executavel quebrado.
+function Invoke-Native {
+    param([string]$Description, [scriptblock]$Command)
+    & $Command
+    if ($LASTEXITCODE -ne 0) {
+        throw "$Description falhou (codigo de saida $LASTEXITCODE)."
+    }
+}
+
+function Test-Interpreter {
+    param([string]$Path)
+    if (-not (Test-Path $Path)) {
+        return $false
+    }
+    # Um venv copiado de outra maquina aponta para um Python inexistente.
+    & $Path -c "import sys" 2>$null
+    return ($LASTEXITCODE -eq 0)
+}
+
 Write-Host "Projeto:" $ProjectRoot
 
 if ($BuildPythonExe) {
     $SelectedPython = $BuildPythonExe
     Write-Host "Usando interpretador informado para build:" $SelectedPython
 }
-elseif (Test-Path $ProjectVenvPython) {
+elseif (Test-Interpreter $ProjectVenvPython) {
     $SelectedPython = $ProjectVenvPython
     Write-Host "Reutilizando ambiente virtual do projeto:" $SelectedPython
 }
 else {
-    Write-Host "Criando ambiente virtual de build em" $VenvPath
-    & $PythonExe -m venv $VenvPath
+    if (-not (Test-Interpreter $VenvPython)) {
+        Write-Host "Criando ambiente virtual de build em" $VenvPath
+        Invoke-Native "Criacao do ambiente virtual" { & $PythonExe -m venv --clear $VenvPath }
+    }
     $SelectedPython = $VenvPython
 }
 
-& $SelectedPython -m pip install --upgrade pip
-& $SelectedPython -m pip install -r (Join-Path $ProjectRoot "requirements-dev.txt")
+Invoke-Native "Atualizacao do pip" { & $SelectedPython -m pip install --upgrade pip }
+Invoke-Native "Instalacao das dependencias" { & $SelectedPython -m pip install -r (Join-Path $ProjectRoot "requirements-dev.txt") }
 $VenvPython = $SelectedPython
 $AppVersion = (& $VenvPython -c $VersionScript).Trim()
 Write-Host "Versao detectada:" $AppVersion
@@ -42,17 +71,24 @@ if (-not $SkipTests) {
     Write-Host "Executando testes..."
     Push-Location $ProjectRoot
     try {
-        & $VenvPython -m unittest discover -s tests -v
+        Invoke-Native "Suite de testes" { & $VenvPython -m unittest discover -s tests -v }
     }
     finally {
         Pop-Location
     }
 }
 
-Write-Host "Gerando executavel com PyInstaller..."
+$DistPath = Join-Path $BuildRoot "dist"
+$WorkPath = Join-Path $BuildRoot "work"
+if (-not $InstallerOutput) {
+    $InstallerOutput = Join-Path $BuildRoot "installer"
+}
+New-Item -ItemType Directory -Force -Path $DistPath, $WorkPath, $InstallerOutput | Out-Null
+
+Write-Host "Gerando executavel com PyInstaller em" $DistPath
 Push-Location $ProjectRoot
 try {
-    & $VenvPython -m PyInstaller $SpecPath --noconfirm
+    Invoke-Native "PyInstaller" { & $VenvPython -m PyInstaller $SpecPath --noconfirm --distpath $DistPath --workpath $WorkPath }
 }
 finally {
     Pop-Location
@@ -79,4 +115,8 @@ if ($InnoCandidates.Count -eq 0) {
 
 $IsccPath = $InnoCandidates[0]
 Write-Host "Compilando instalador com" $IsccPath
-& $IsccPath "/DMyAppVersion=$AppVersion" $InstallerScript
+$AppSourceDir = Join-Path $DistPath "InventarioFaces"
+Invoke-Native "Compilacao do instalador" {
+    & $IsccPath "/DMyAppVersion=$AppVersion" "/DAppSourceDir=$AppSourceDir" "/O$InstallerOutput" $InstallerScript
+}
+Write-Host "Instalador gerado em" (Join-Path $InstallerOutput "InventarioFacesSetup-$AppVersion.exe")

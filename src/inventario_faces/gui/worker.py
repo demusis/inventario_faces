@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Callable
 
 from PySide6.QtCore import QObject, Signal, Slot
 
+from inventario_faces.domain.errors import UserFacingError
 from inventario_faces.infrastructure.logging_setup import summarize_exception
 
 if TYPE_CHECKING:
@@ -97,6 +98,8 @@ class FaceSetComparisonWorker(QObject):
     log_message = Signal(str)
     completed = Signal(object)
     failed = Signal(str)
+    # Entrada inadequada (UserFacingError): mensagem ja redigida para o usuario.
+    rejected = Signal(str)
 
     def __init__(
         self,
@@ -132,5 +135,7 @@ class FaceSetComparisonWorker(QObject):
                 log_callback=self.log_message.emit,
             )
             self.completed.emit(result)
+        except UserFacingError as exc:
+            self.rejected.emit(str(exc))
         except Exception as exc:
             self.failed.emit(summarize_exception(exc))

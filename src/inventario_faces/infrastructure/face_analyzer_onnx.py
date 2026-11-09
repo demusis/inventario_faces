@@ -171,6 +171,10 @@ def select_model_files(model_directory: Path) -> tuple[Path, Path, Path | None]:
 class OnnxFaceAnalyzer:
     """Analisador facial compativel com o protocolo FaceAnalyzer usando ONNX puro."""
 
+    # Atributo de classe (sem anotacao, nao vira campo do dataclass): backend efetivo
+    # registrado nos logs, inclusive quando este analisador entra como fallback.
+    backend_name = "onnx"
+
     settings: FaceModelSettings
 
     def __post_init__(self) -> None:

@@ -129,6 +129,7 @@ def load_app_config(config_path: Path | None = None) -> AppConfig:
                 minimum_face_size_pixels=int(merged["face_model"].get("minimum_face_size_pixels", 40)),
                 ctx_id=int(merged["face_model"].get("ctx_id", 0)),
                 providers=tuple(str(item) for item in merged["face_model"].get("providers", [])),
+                still_image_margin_ratio=float(merged["face_model"].get("still_image_margin_ratio", 0.5)),
             ),
             clustering=ClusteringSettings(
                 assignment_similarity=float(merged["clustering"]["assignment_similarity"]),

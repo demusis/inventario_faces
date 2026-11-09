@@ -10,6 +10,7 @@ import numpy as np
 from inventario_faces.domain.config import AppConfig
 from inventario_faces.domain.entities import (
     DetectedFace,
+    EnhancementMetadata,
     FaceOccurrence,
     FaceTrack,
     KeyFrame,
@@ -120,6 +121,10 @@ class _CandidateMatch:
 class FaceTrackingService:
     """Consolida detecções faciais em tracks auditáveis ao longo do tempo."""
 
+    # Cor da margem neutra usada na nova tentativa de detecção de imagens estáticas
+    # (a largura da margem vem de face_model.still_image_margin_ratio).
+    _STILL_IMAGE_MARGIN_COLOR = (127, 127, 127)
+
     def __init__(
         self,
         config: AppConfig,
@@ -162,6 +167,14 @@ class FaceTrackingService:
             sampled_frames += 1
             enhanced_frame = self._enhancement_service.apply(frame)
             detections = self._detect_faces(analyzer, enhanced_frame)
+            if not detections and media_type == MediaType.IMAGE:
+                enhanced_frame, detections = self._retry_still_image_with_margin(
+                    analyzer=analyzer,
+                    frame=enhanced_frame,
+                    source_path=source_path,
+                    event_callback=event_callback,
+                    text_callback=text_callback,
+                )
             raw_detection_count += len(detections)
             raw_face_sizes.extend(
                 min(detection.bbox.width, detection.bbox.height)
@@ -723,6 +736,97 @@ class FaceTrackingService:
             f"ultimo_quadro_real={track.end_frame:06d} | "
             f"ultimo_instante={format_seconds(track.end_time)}"
         )
+
+    def _retry_still_image_with_margin(
+        self,
+        *,
+        analyzer: FaceAnalyzer,
+        frame: SampledFrame,
+        source_path: Path,
+        event_callback: EventCallback | None,
+        text_callback: TextCallback | None,
+    ) -> tuple[SampledFrame, list[DetectedFace]]:
+        """Repete a deteccao de uma imagem estatica com margem neutra ao redor.
+
+        Recortes faciais justos (foto 3x4, rosto ocupando o quadro inteiro) ficam,
+        apos o redimensionamento para ``det_size``, maiores que as ancoras do detector
+        e resultam em zero deteccoes. A margem devolve a face a uma escala detectavel
+        sem reamostrar o conteudo original. Se a nova tentativa encontrar faces, o
+        quadro com margem passa a ser o quadro de trabalho (crops, contexto e bbox
+        ficam no mesmo referencial) e o procedimento fica registrado nos metadados.
+        """
+
+        margin_ratio = self._config.face_model.still_image_margin_ratio
+        pixels = np.asarray(frame.bgr_pixels)
+        height, width = pixels.shape[:2]
+        margin = int(round(max(height, width) * margin_ratio))
+        if margin <= 0:
+            return frame, []
+
+        def pad(image: object) -> np.ndarray:
+            return cv2.copyMakeBorder(
+                np.asarray(image),
+                margin,
+                margin,
+                margin,
+                margin,
+                cv2.BORDER_CONSTANT,
+                value=self._STILL_IMAGE_MARGIN_COLOR,
+            )
+
+        base_metadata = frame.enhancement_metadata or EnhancementMetadata()
+        parameters = dict(base_metadata.parameters)
+        parameters["still_image_margin_px"] = margin
+        parameters["still_image_margin_ratio"] = margin_ratio
+        margin_note = (
+            f"Nenhuma face detectada na imagem original ({width}x{height}); detecção repetida "
+            f"com margem neutra de {margin}px em cada lado. As coordenadas da caixa delimitadora "
+            f"referem-se à imagem com margem (subtrair {margin}px em x e y para o referencial original)."
+        )
+        padded_frame = SampledFrame(
+            source_path=frame.source_path,
+            image_name=frame.image_name,
+            frame_index=frame.frame_index,
+            timestamp_seconds=frame.timestamp_seconds,
+            bgr_pixels=pad(frame.bgr_pixels),
+            original_bgr_pixels=pad(
+                frame.original_bgr_pixels if frame.original_bgr_pixels is not None else frame.bgr_pixels
+            ),
+            enhancement_metadata=EnhancementMetadata(
+                applied=True,
+                strategy=(
+                    f"{base_metadata.strategy}+still_image_margin"
+                    if base_metadata.strategy and base_metadata.strategy != "none"
+                    else "still_image_margin"
+                ),
+                parameters=parameters,
+                brightness_before=base_metadata.brightness_before,
+                brightness_after=base_metadata.brightness_after,
+                note=" ".join(part for part in (base_metadata.note, margin_note) if part),
+            ),
+        )
+        detections = self._detect_faces(analyzer, padded_frame)
+        self._emit_log(
+            text_callback,
+            (
+                f"[Tracking] {source_path.name} | nenhuma face na imagem original; "
+                f"nova tentativa com margem de {margin}px | detecções={len(detections)}"
+            ),
+        )
+        self._emit_event(
+            event_callback,
+            "still_image_margin_retry",
+            {
+                "source_path": source_path,
+                "margin_px": margin,
+                "original_width": width,
+                "original_height": height,
+                "detections": len(detections),
+            },
+        )
+        if not detections:
+            return frame, []
+        return padded_frame, detections
 
     def _detect_faces(self, analyzer: FaceAnalyzer, frame: SampledFrame) -> list[DetectedFace]:
         detect_method = getattr(analyzer, "detect", None)

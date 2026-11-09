@@ -5,6 +5,10 @@
 #define MyAppPublisher "Laboratorio de Analise Digital"
 #define MyAppURL "https://github.com/demusis/inventario_faces"
 #define MyAppExeName "InventarioFaces.exe"
+; Pasta gerada pelo PyInstaller; o build.ps1 informa uma pasta local via /DAppSourceDir.
+#ifndef AppSourceDir
+  #define AppSourceDir "..\dist\InventarioFaces"
+#endif
 
 [Setup]
 AppId={{E75E8D20-2E13-4F9B-B36E-40E19493A1A8}
@@ -14,6 +18,12 @@ AppPublisher={#MyAppPublisher}
 AppPublisherURL={#MyAppURL}
 AppSupportURL={#MyAppURL}
 AppUpdatesURL={#MyAppURL}
+; Instalacao sem privilegios de administrador: por padrao instala apenas para o usuario
+; atual ({autopf} -> %LOCALAPPDATA%\Programs). Um administrador ainda pode optar, no
+; dialogo inicial, por instalar para todos os usuarios.
+PrivilegesRequired=lowest
+PrivilegesRequiredOverridesAllowed=dialog
+UsedUserAreasWarning=no
 DefaultDirName={autopf}\InventarioFaces
 DefaultGroupName={#MyAppName}
 ArchitecturesAllowed=x64compatible
@@ -30,7 +40,7 @@ WizardStyle=modern
 Name: "brazilianportuguese"; MessagesFile: "compiler:Languages\BrazilianPortuguese.isl"
 
 [Files]
-Source: "..\dist\InventarioFaces\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#AppSourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"

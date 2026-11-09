@@ -183,6 +183,7 @@ class FaceSearchService:
                 log_callback,
                 (
                     f"[Backend facial] Modelo pronto | "
+                    f"backend efetivo={getattr(analyzer, 'backend_name', self._config.face_model.backend)} | "
                     f"providers={', '.join(getattr(analyzer, 'providers', [])) or 'desconhecido'} | "
                     f"tempo={analyzer_elapsed:.2f}s"
                 ),

@@ -260,6 +260,7 @@ class InventoryService:
                 log_callback,
                 (
                     f"[Backend facial] Modelo pronto | "
+                    f"backend efetivo={getattr(analyzer, 'backend_name', self._config.face_model.backend)} | "
                     f"diretorio={getattr(analyzer, '_model_dir', '-')} | "
                     f"providers={', '.join(providers) if providers else 'desconhecido'} | "
                     f"disponiveis={', '.join(available_providers) if available_providers else 'desconhecido'} | "
@@ -559,6 +560,7 @@ class InventoryService:
                 log_callback,
                 (
                     f"[Backend facial] Modelo pronto | "
+                    f"backend efetivo={getattr(analyzer, 'backend_name', self._config.face_model.backend)} | "
                     f"providers={', '.join(providers) if providers else 'desconhecido'} | "
                     f"tempo={analyzer_elapsed:.2f}s"
                 ),
